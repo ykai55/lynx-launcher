@@ -98,6 +98,7 @@ target_link_libraries(lynx-launcher PRIVATE
   glfw
   OpenGL::GL
   Threads::Threads
+  X11::X11
   ${CMAKE_DL_LIBS}
   m
 )
@@ -163,6 +164,7 @@ if(BUILD_TESTING)
     tests/x11_click_test_driver.cc
   )
   target_link_libraries(x11_click_test_driver PRIVATE
+    host_support
     X11::X11
   )
 

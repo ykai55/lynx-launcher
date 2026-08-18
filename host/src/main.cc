@@ -1,6 +1,8 @@
 #define GLFW_INCLUDE_NONE
+#define GLFW_EXPOSE_NATIVE_X11
 #include <GL/gl.h>
 #include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>
 
 #include <algorithm>
 #include <atomic>
@@ -128,6 +130,51 @@ RuntimePaths ResolveRuntimePaths(const Options& options, const char* argv0) {
       "ICU data", options.icu, "LYNX_LAUNCHER_ICU",
       {executable_directory / "resources/icudtl.dat"});
   return paths;
+}
+
+float SystemWindowScale() {
+  float content_scale_x = 1.0f;
+  float content_scale_y = 1.0f;
+  if (GLFWmonitor* monitor = glfwGetPrimaryMonitor()) {
+    glfwGetMonitorContentScale(monitor, &content_scale_x, &content_scale_y);
+  }
+  float scale = std::max(content_scale_x, content_scale_y);
+
+  Display* display = glfwGetX11Display();
+  if (!display) {
+    return std::max(1.0f, scale);
+  }
+  const std::string selection_name =
+      "_XSETTINGS_S" + std::to_string(DefaultScreen(display));
+  const Atom selection = XInternAtom(display, selection_name.c_str(), True);
+  const Atom property = XInternAtom(display, "_XSETTINGS_SETTINGS", True);
+  if (selection == None || property == None) {
+    return std::max(1.0f, scale);
+  }
+  const Window owner = XGetSelectionOwner(display, selection);
+  if (owner == None) {
+    return std::max(1.0f, scale);
+  }
+
+  Atom actual_type = None;
+  int actual_format = 0;
+  unsigned long item_count = 0;
+  unsigned long remaining = 0;
+  unsigned char* data = nullptr;
+  const int status = XGetWindowProperty(
+      display, owner, property, 0, 65536, False, property, &actual_type,
+      &actual_format, &item_count, &remaining, &data);
+  if (status == Success && actual_type == property && actual_format == 8 &&
+      remaining == 0 && data) {
+    if (const auto xsettings_scale = launcher_host::XSettingsWindowScale(
+            std::span<const uint8_t>(data, item_count))) {
+      scale = std::max(scale, *xsettings_scale);
+    }
+  }
+  if (data) {
+    XFree(data);
+  }
+  return std::max(1.0f, scale);
 }
 
 std::string SliceString(LynxSlice slice) {
@@ -524,9 +571,10 @@ uint64_t LogicalKey(int key) {
 
 class Host {
  public:
-  Host(GLFWwindow* window, RuntimePaths paths)
+  Host(GLFWwindow* window, RuntimePaths paths, float system_scale)
       : window_(window),
         paths_(std::move(paths)),
+        system_scale_(system_scale),
         platform_thread_(std::this_thread::get_id()) {
     glfwSetWindowUserPointer(window_, this);
     glfwSetCursorPosCallback(window_, CursorPositionCallback);
@@ -961,16 +1009,20 @@ class Host {
     int framebuffer_height = 0;
     glfwGetWindowSize(window_, &window_width, &window_height);
     glfwGetFramebufferSize(window_, &framebuffer_width, &framebuffer_height);
-    if (window_width <= 0 || window_height <= 0 || framebuffer_width <= 0 ||
-        framebuffer_height <= 0) {
+    float content_scale_x = 1.0f;
+    float content_scale_y = 1.0f;
+    glfwGetWindowContentScale(window_, &content_scale_x, &content_scale_y);
+    const auto metrics = launcher_host::CalculateWindowMetrics(
+        window_width, window_height, framebuffer_width, framebuffer_height,
+        std::max({system_scale_, content_scale_x, content_scale_y}));
+    if (!metrics) {
       return;
     }
-    logical_width_ = static_cast<float>(window_width);
-    logical_height_ = static_cast<float>(window_height);
-    const float scale_x = static_cast<float>(framebuffer_width) / window_width;
-    const float scale_y =
-        static_cast<float>(framebuffer_height) / window_height;
-    dpr_ = std::max(0.1f, std::max(scale_x, scale_y));
+    logical_width_ = metrics->logical_width;
+    logical_height_ = metrics->logical_height;
+    dpr_ = metrics->pixel_ratio;
+    framebuffer_scale_x_ = metrics->framebuffer_scale_x;
+    framebuffer_scale_y_ = metrics->framebuffer_scale_y;
     if (view_) {
       lynx_view_update_screen_metrics(view_, logical_width_, logical_height_,
                                       dpr_);
@@ -996,8 +1048,8 @@ class Host {
         std::chrono::duration_cast<std::chrono::microseconds>(
             Clock::now().time_since_epoch())
             .count());
-    event.x = cursor_x_ * dpr_;
-    event.y = cursor_y_ * dpr_;
+    event.x = cursor_x_ * framebuffer_scale_x_;
+    event.y = cursor_y_ * framebuffer_scale_y_;
     event.device = 0;
     event.signal_kind = signal;
     event.scroll_delta_x = scroll_x * dpr_;
@@ -1216,6 +1268,7 @@ class Host {
 
   GLFWwindow* window_ = nullptr;
   RuntimePaths paths_;
+  float system_scale_ = 1.0f;
   std::thread::id platform_thread_;
   LynxLauncher* launcher_ = nullptr;
   lynx_windowless_renderer_t* renderer_ = nullptr;
@@ -1234,6 +1287,8 @@ class Host {
   float logical_width_ = kInitialWidth;
   float logical_height_ = kInitialHeight;
   float dpr_ = 1.0f;
+  float framebuffer_scale_x_ = 1.0f;
+  float framebuffer_scale_y_ = 1.0f;
   double cursor_x_ = 0;
   double cursor_y_ = 0;
   int64_t pointer_buttons_ = 0;
@@ -1493,11 +1548,18 @@ int main(int argc, char** argv) {
       ~GlfwGuard() { glfwTerminate(); }
     } glfw_guard;
 
+    const float system_scale = SystemWindowScale();
+    const int initial_width =
+        static_cast<int>(std::lround(kInitialWidth * system_scale));
+    const int initial_height =
+        static_cast<int>(std::lround(kInitialHeight * system_scale));
+    std::cerr << "[host] system window scale: " << system_scale << '\n';
+
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
-    GLFWwindow* window = glfwCreateWindow(kInitialWidth, kInitialHeight,
+    GLFWwindow* window = glfwCreateWindow(initial_width, initial_height,
                                           "Lynx Launcher", nullptr, nullptr);
     if (!window) {
       throw std::runtime_error(
@@ -1522,7 +1584,7 @@ int main(int argc, char** argv) {
               << " via GLFW X11\n";
     glfwMakeContextCurrent(nullptr);
 
-    Host host(window, paths);
+    Host host(window, paths, system_scale);
     host.Initialize();
     return host.Run(options);
   } catch (const std::exception& error) {

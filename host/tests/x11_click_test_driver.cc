@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -16,7 +17,12 @@
 #include <thread>
 #include <vector>
 
+#include "support.h"
+
 namespace {
+
+constexpr int kLauncherLogicalWidth = 1120;
+constexpr int kLauncherLogicalHeight = 760;
 
 enum class Action { kClick, kType, kExpectPixel };
 
@@ -198,6 +204,39 @@ void FindWindows(Display* display, Window parent, Atom pid_atom,
   if (children) {
     XFree(children);
   }
+}
+
+std::optional<float> XSettingsScale(Display* display) {
+  const std::string selection_name =
+      "_XSETTINGS_S" + std::to_string(DefaultScreen(display));
+  const Atom selection = XInternAtom(display, selection_name.c_str(), True);
+  const Atom property = XInternAtom(display, "_XSETTINGS_SETTINGS", True);
+  if (selection == None || property == None) {
+    return std::nullopt;
+  }
+  const Window owner = XGetSelectionOwner(display, selection);
+  if (owner == None) {
+    return std::nullopt;
+  }
+
+  Atom actual_type = None;
+  int actual_format = 0;
+  unsigned long item_count = 0;
+  unsigned long remaining = 0;
+  unsigned char* data = nullptr;
+  const int status = XGetWindowProperty(
+      display, owner, property, 0, 65536, False, property, &actual_type,
+      &actual_format, &item_count, &remaining, &data);
+  std::optional<float> scale;
+  if (status == Success && actual_type == property && actual_format == 8 &&
+      remaining == 0 && data) {
+    scale = launcher_host::XSettingsWindowScale(
+        std::span<const uint8_t>(data, item_count));
+  }
+  if (data) {
+    XFree(data);
+  }
+  return scale;
 }
 
 void RequireSent(int status, const char* event_name) {
@@ -385,17 +424,34 @@ int main(int argc, char** argv) {
       SendText(display, root, window, *options.text);
       return 0;
     }
-    if (*options.x >= attributes.width || *options.y >= attributes.height) {
+
+    Options physical = options;
+    const double inferred_scale = std::min(
+        static_cast<double>(attributes.width) / kLauncherLogicalWidth,
+        static_cast<double>(attributes.height) / kLauncherLogicalHeight);
+    const double scale = XSettingsScale(display).value_or(inferred_scale);
+    const double scale_x = scale;
+    const double scale_y = scale;
+    physical.x = static_cast<int>(std::lround(*options.x * scale_x));
+    physical.y = static_cast<int>(std::lround(*options.y * scale_y));
+    if (*physical.x >= attributes.width || *physical.y >= attributes.height) {
       throw std::runtime_error(
           "coordinates are outside the specified PID window");
     }
     if (options.action == Action::kExpectPixel) {
-      if (*options.width > attributes.width - *options.x ||
-          *options.height > attributes.height - *options.y) {
+      physical.width =
+          std::max(1, static_cast<int>(std::lround(*options.width * scale_x)));
+      physical.height =
+          std::max(1, static_cast<int>(std::lround(*options.height * scale_y)));
+      physical.minimum_matches = std::max(
+          1, static_cast<int>(
+                 std::lround(*options.minimum_matches * scale_x * scale_y)));
+      if (*physical.width > attributes.width - *physical.x ||
+          *physical.height > attributes.height - *physical.y) {
         throw std::runtime_error(
             "pixel region is outside the specified PID window");
       }
-      ExpectPixel(display, window, options);
+      ExpectPixel(display, window, physical);
       return 0;
     }
 
@@ -406,8 +462,8 @@ int main(int argc, char** argv) {
                                &window_root_y, &translated_child)) {
       throw std::runtime_error("could not translate window coordinates");
     }
-    SendClick(display, root, window, window_root_x + *options.x,
-              window_root_y + *options.y, *options.x, *options.y);
+    SendClick(display, root, window, window_root_x + *physical.x,
+              window_root_y + *physical.y, *physical.x, *physical.y);
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "x11_click_test_driver: " << error.what() << '\n';

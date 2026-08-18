@@ -118,6 +118,13 @@ the host. On a Wayland desktop this runs through XWayland and therefore requires
 input/IME, cursor, scale, and context behavior must be validated before the host
 can claim that backend.
 
+At startup the host combines GLFW's X11 content scale with the XSettings
+`Gdk/WindowScalingFactor`. It creates a correspondingly larger physical window
+while keeping the Lynx viewport in logical pixels, passes the scale as the Lynx
+device pixel ratio, and converts pointer coordinates separately through the
+window-to-framebuffer ratio. XSettings scale changes are not observed while the
+process is running.
+
 ## Cross-platform extension points
 
 - Add operating-system discovery and launch implementations behind the Rust

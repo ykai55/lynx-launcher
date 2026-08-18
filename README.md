@@ -30,6 +30,8 @@ bootstrap；显式执行便于首次构建时单独观察 `.logs/bootstrap.log`�
 - 解析绝对图标路径、常见 hicolor 尺寸、scalable 图标和 pixmaps。
 - 在 ReactLynx 中搜索应用，通过真实 N-API Promise 异步报告启动结果。
 - 通过 Lynx windowless API 转发窗口、指针、键盘、滚轮、剪贴板、光标和基础文本输入。
+- 在 X11/XWayland 下读取 GLFW content scale 与 XSettings
+  `Gdk/WindowScalingFactor`，同步原生窗口、Lynx DPR、逻辑 viewport 和输入坐标。
 - 无窗口检查 Rust ABI 与打包运行资源；可选执行首帧图形 smoke。
 - 提供搜索、图标渲染、启动链路 E2E，以及重复退出生命周期 stress。
 
@@ -240,6 +242,8 @@ LYNX_LAUNCHER_TEARDOWN_TIMEOUT=45s ./scripts/teardown-stress.sh
 - 只有 Linux x64 已 bootstrap 并验证。
 - host 固定 `GLFW_USE_WAYLAND=OFF`，要求 X11/XWayland、`DISPLAY` 和 OpenGL 3.3；尚不支持
   native Wayland。
+- XSettings 窗口缩放在启动时读取；运行中修改系统缩放需要重启 launcher，且当前 X11
+  baseline 不提供逐显示器 fractional scaling。
 - 只实现 Desktop Entry specification 的实用子集。Terminal 应用与 file/URI launch
   arguments 被有意忽略，D-Bus activation 当前 fallback 到 `Exec`。
 - icon lookup 不检测当前 theme、不读取 `index.theme` inheritance，也未实现完整 HiDPI
