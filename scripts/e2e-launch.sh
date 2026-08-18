@@ -121,16 +121,22 @@ run_iteration() {
   printf '%s\n' \
     '[Desktop Entry]' \
     'Type=Application' \
+    'Name=中文应用' \
+    'Exec=/bin/true' \
+    >"${data_home}/applications/00-chinese.desktop"
+  printf '%s\n' \
+    '[Desktop Entry]' \
+    'Type=Application' \
     'Name=Archive Utility Fixture' \
     "Exec=${decoy_helper}" \
-    >"${data_home}/applications/00-decoy.desktop"
+    >"${data_home}/applications/10-decoy.desktop"
   printf '%s\n' \
     '[Desktop Entry]' \
     'Type=Application' \
     'Name=Cobalt Target Fixture' \
     'Icon=lynx-e2e-target' \
     "Exec=${target_helper}" \
-    >"${data_home}/applications/10-target.desktop"
+    >"${data_home}/applications/20-target.desktop"
   printf '%s\n' \
     '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">' \
     '  <rect width="64" height="64" fill="#00ff00"/>' \
@@ -149,7 +155,7 @@ run_iteration() {
   [[ "${host_identity}" == "${expected_host}:${host_pid}:"* ]] ||
     die "launched host did not create the expected process group"
 
-  if ! wait_for_log '[host] Launcher.getApplications resolved 2 applications' ||
+  if ! wait_for_log '[host] Launcher.getApplications resolved 3 applications' ||
     ! wait_for_log '[host] first GL frame presented'; then
     printf 'launch E2E iteration %s: host did not become ready\n' "${iteration}" >&2
     dump_log
@@ -157,6 +163,10 @@ run_iteration() {
   fi
   sleep 0.25
 
+  "${click_driver}" --pid "${host_pid}" expect-regions-differ \
+    --x 125 --y 310 --other-x 140 --other-y 310 --width 15 --height 18 \
+    --red 241 --green 234 --blue 217 --tolerance 40 \
+    --minimum-differences 10 --timeout-ms 3000
   "${click_driver}" --pid "${host_pid}" click --x 220 --y 160
   sleep 0.2
   "${click_driver}" --pid "${host_pid}" type --text cobalt

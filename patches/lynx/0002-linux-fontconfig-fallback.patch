@@ -1,0 +1,38 @@
+From: Lynx Launcher maintainers
+Subject: [PATCH] Enable fontconfig fallback in the Linux SDK
+
+Use Skia's fontconfig font manager for the Linux Clay build so unresolved
+glyphs can fall back to installed system and user fonts. Add the missing GN
+wrapper for the system fontconfig library used by both Skia and txt.
+
+This is a narrow integration patch for the pinned Linux windowless SDK.
+
+diff --git a/build/secondary/third_party/fontconfig/BUILD.gn b/build/secondary/third_party/fontconfig/BUILD.gn
+new file mode 100644
+--- /dev/null
++++ b/build/secondary/third_party/fontconfig/BUILD.gn
+@@ -0,0 +1,11 @@
++# Copyright 2026 The Lynx Authors. All rights reserved.
++# Licensed under the Apache License Version 2.0 that can be found in the
++# LICENSE file in the root directory of this source tree.
++
++config("fontconfig_config") {
++  libs = [ "fontconfig" ]
++}
++
++group("fontconfig") {
++  public_configs = [ ":fontconfig_config" ]
++}
+diff --git a/platform/linux/build_release.py b/platform/linux/build_release.py
+--- a/platform/linux/build_release.py
++++ b/platform/linux/build_release.py
+@@ -26,7 +26,8 @@ COMMON_GN_ARGS = [
+     'skia_use_x11 = false',
+     'skia_use_wuffs = true',
+     'skia_use_expat = true',
+-    'skia_use_fontconfig = false',
++    'skia_use_fontconfig = true',
++    'flutter_use_fontconfig = true',
+     'clay_enable_skshaper = true',
+     'skia_use_icu = true',
+     'skia_gl_standard = ""',

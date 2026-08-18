@@ -56,7 +56,8 @@ Rust platform / XDG discovery / icon lookup / process launch
 - `third_party/lynx` 当前 gitlink 是
   `a573c3b8280180b59ca3da3e33d7a50192334cce`；该 checkout 提供 Habitat `0.3.149` 和
   pinned DEPS graph。
-- host 使用 C++20、CMake 3.16+、verified Lynx SDK 和 pinned Lynx DEPS 中的 GLFW。
+- host 使用 C++20、CMake 3.16+、verified Lynx SDK、系统 fontconfig development files 和
+  pinned Lynx DEPS 中的 GLFW。
 - 不要让脚本运行 `sudo` 或安装系统软件包；缺依赖时报告具体 command。
 
 ## 首选根脚本
@@ -180,6 +181,8 @@ CTest；它不能代替 UI 验证。
   stable log、reverse patch 和最终 clean check；不要缩小 lock critical section。
 - gitlink update 是明确的 dependency upgrade。必须重新评估或删除现有 patch，生成新
   source key，并跑完整 SDK、ABI/resource、首帧和 teardown 门禁。
+- Linux SDK 的 fontconfig patch 使 `liblynx.so` 依赖系统 `libfontconfig.so.1`；不要退回
+  `SkFontMgr_New_Custom_Directory`，它不实现 per-glyph fallback。
 
 ## Resource Provenance
 

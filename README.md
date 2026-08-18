@@ -32,6 +32,7 @@ bootstrap；显式执行便于首次构建时单独观察 `.logs/bootstrap.log`�
 - 通过 Lynx windowless API 转发窗口、指针、键盘、滚轮、剪贴板、光标和基础文本输入。
 - 在 X11/XWayland 下读取 GLFW content scale 与 XSettings
   `Gdk/WindowScalingFactor`，同步原生窗口、Lynx DPR、逻辑 viewport 和输入坐标。
+- 通过 fontconfig 匹配系统与用户字体，为中文及其他缺失 glyph 提供字体回退。
 - 无窗口检查 Rust ABI 与打包运行资源；可选执行首帧图形 smoke。
 - 提供搜索、图标渲染、启动链路 E2E，以及重复退出生命周期 stress。
 
@@ -95,6 +96,8 @@ Rspeedy/Corepack 行为随本机版本漂移。
 - C/C++20 compiler、CMake 3.16+，以及 Ninja 或 Make 等 native build tool。
 - OpenGL development files，以及 GLFW 所需的 X11 development headers；多数发行版对应
   `X11`、`Xrandr`、`Xinerama`、`Xcursor`、`Xi`。
+- fontconfig development files；patched Lynx SDK 构建时需要 headers 与 linker metadata，
+  运行时需要 `libfontconfig.so.1` 和至少一款覆盖所需字符的已安装字体。
 - Rustup；它读取 `rust-toolchain.toml` 并提供 rustfmt、Clippy 和 Cargo。
 - 支持 `.nvmrc` 的 Node version manager 和 Corepack；本地 Node 可能需要先启用 Corepack。
 - 图形运行和图形测试需要 X11 或 XWayland session，并设置 `DISPLAY`。
@@ -174,11 +177,11 @@ LYNX_LAUNCHER_SMOKE=1 LYNX_LAUNCHER_SMOKE_TIMEOUT=45s ./scripts/test.sh
 LYNX_LAUNCHER_E2E_ITERATIONS=10 ./scripts/e2e-launch.sh
 ```
 
-测试创建两个隔离的临时 `.desktop` fixture，不启动已安装应用。它通过 GLFW X11 key
-callbacks 输入 ASCII query，用 `XGetImage` 验证筛选目标的独特色 hicolor SVG 已到达
-最终 icon region，再点击卡片并确认只有目标 desktop ID 的 marker 出现。cleanup 在
-signal 前核对 executable、process group 和 Linux process start identity，并用
-`wait` 回收 child。
+测试创建三个隔离的临时 `.desktop` fixture，不启动已安装应用。它先用 `XGetImage`
+比较两个不同中文 glyph 的渲染区域，拒绝重复缺字方框；再通过 GLFW X11 key callbacks
+输入 ASCII query，验证筛选目标的独特色 hicolor SVG 已到达最终 icon region，点击卡片并
+确认只有目标 desktop ID 的 marker 出现。cleanup 在 signal 前核对 executable、process
+group 和 Linux process start identity，并用 `wait` 回收 child。
 
 ### Teardown stress
 
@@ -199,17 +202,20 @@ LYNX_LAUNCHER_TEARDOWN_TIMEOUT=45s ./scripts/teardown-stress.sh
 - `third_party/lynx` 的 gitlink 固定为
   `a573c3b8280180b59ca3da3e33d7a50192334cce`。bootstrap 只 checkout Git index 中的
   exact SHA，不使用 `git submodule update --remote`，也不跟随 moving `develop`。
-- 固定 allowlist 当前只有
-  `patches/lynx/0001-linux-windowless-teardown.patch`。未知 patch、symlink patch、顺序变化
-  或 submodule 本地修改都会失败，不会被覆盖。
+- 固定 allowlist 当前依次包含
+  `patches/lynx/0001-linux-windowless-teardown.patch` 和
+  `patches/lynx/0002-linux-fontconfig-fallback.patch`。未知 patch、symlink patch、顺序变化或
+  submodule 本地修改都会失败，不会被覆盖。
 - bootstrap 在隔离的 `.build-home/` HOME 内执行 `tools/hab sync . --target clay`，随后
   按固定顺序临时 apply patch，再执行
   `python3 platform/linux/build_release.py --target-cpu x64`。EXIT trap 在成功、失败和
   signal 后都按逆序 reverse patch，并验证 pinned HEAD 与 clean worktree。
-- patch 只修正 Linux windowless teardown：让 service 在 Clay task runners 存活时销毁，
-  并阻止 pending closure cleanup 误判或保留 reentrant work。它不是业务 fork；上游具备
-  等价生命周期保证后应删除。patch 还为 `enable_unittests=true` 定义 Linux-only
+- teardown patch 让 service 在 Clay task runners 存活时销毁，并阻止 pending closure
+  cleanup 误判或保留 reentrant work。它还为 `enable_unittests=true` 定义 Linux-only
   `embedder_task_runner_unittests`，但该 target 不是 packaged SDK dependency。
+- fontconfig patch 同时启用 Skia 与 Clay txt 的 fontconfig backend，并补齐缺失的 GN system
+  library target，使 SkParagraph 的 per-glyph fallback 能匹配系统和用户字体。上游 Linux SDK
+  提供等价 fallback 后应删除该 patch。
 - bootstrap 用 `.build-home/bootstrap.lock` 的 exclusive `flock` 串行保护 submodule、
   shared cache、日志和 reverse cleanup；
   `LYNX_LAUNCHER_BOOTSTRAP_LOCK_TIMEOUT` 是正整数秒数，默认等待 1800 秒。
@@ -249,6 +255,8 @@ LYNX_LAUNCHER_TEARDOWN_TIMEOUT=45s ./scripts/teardown-stress.sh
 - icon lookup 不检测当前 theme、不读取 `index.theme` inheritance，也未实现完整 HiDPI
   algorithm；找不到或加载失败时 UI 显示应用名称首字母。
 - 文本输入只转发 character events，尚无完整 IME composition protocol。
+- 字体回退依赖宿主机 fontconfig 配置和已安装字体；系统没有覆盖目标字符的字体时仍会显示
+  缺字方框。
 - resource fetcher 只提供 packaged local Lynx core，不支持任意 network resources。
 - process-global windowless UI runner 限制每个进程只能有一个 active launcher host。
 - 尚无 installer、desktop integration 或 binary distribution 流程。

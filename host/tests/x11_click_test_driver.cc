@@ -24,13 +24,15 @@ namespace {
 constexpr int kLauncherLogicalWidth = 1120;
 constexpr int kLauncherLogicalHeight = 760;
 
-enum class Action { kClick, kType, kExpectPixel };
+enum class Action { kClick, kType, kExpectPixel, kExpectRegionsDiffer };
 
 struct Options {
   unsigned long pid = 0;
   Action action = Action::kClick;
   std::optional<int> x;
   std::optional<int> y;
+  std::optional<int> other_x;
+  std::optional<int> other_y;
   std::optional<int> width;
   std::optional<int> height;
   std::optional<int> red;
@@ -38,6 +40,7 @@ struct Options {
   std::optional<int> blue;
   std::optional<int> tolerance;
   std::optional<int> minimum_matches;
+  std::optional<int> minimum_differences;
   std::optional<int> timeout_ms;
   std::optional<std::string> text;
 };
@@ -48,7 +51,11 @@ const char* Usage() {
          "  x11_click_test_driver --pid PID type --text ASCII\n"
          "  x11_click_test_driver --pid PID expect-pixel --x X --y Y "
          "--width W --height H --red R --green G --blue B --tolerance N "
-         "--minimum-matches N --timeout-ms N";
+         "--minimum-matches N --timeout-ms N\n"
+         "  x11_click_test_driver --pid PID expect-regions-differ --x X "
+         "--y Y --other-x X --other-y Y --width W --height H --red R "
+         "--green G --blue B --tolerance N --minimum-differences N "
+         "--timeout-ms N";
 }
 
 uint64_t ParseUnsigned(const std::string& value, const std::string& name,
@@ -90,6 +97,8 @@ Options ParseOptions(int argc, char** argv) {
     options.action = Action::kType;
   } else if (action == "expect-pixel") {
     options.action = Action::kExpectPixel;
+  } else if (action == "expect-regions-differ") {
+    options.action = Action::kExpectRegionsDiffer;
   } else {
     throw std::runtime_error("unknown action: " + action + "\n" + Usage());
   }
@@ -105,6 +114,10 @@ Options ParseOptions(int argc, char** argv) {
       SetOnce(options.x, value, name, 100000);
     } else if (name == "--y") {
       SetOnce(options.y, value, name, 100000);
+    } else if (name == "--other-x") {
+      SetOnce(options.other_x, value, name, 100000);
+    } else if (name == "--other-y") {
+      SetOnce(options.other_y, value, name, 100000);
     } else if (name == "--width") {
       SetOnce(options.width, value, name, 10000);
     } else if (name == "--height") {
@@ -119,6 +132,8 @@ Options ParseOptions(int argc, char** argv) {
       SetOnce(options.tolerance, value, name, 255);
     } else if (name == "--minimum-matches") {
       SetOnce(options.minimum_matches, value, name, 100000000);
+    } else if (name == "--minimum-differences") {
+      SetOnce(options.minimum_differences, value, name, 100000000);
     } else if (name == "--timeout-ms") {
       SetOnce(options.timeout_ms, value, name, 60000);
     } else if (name == "--text") {
@@ -147,7 +162,7 @@ Options ParseOptions(int argc, char** argv) {
       throw std::runtime_error(
           "type requires 1-128 ASCII letters, digits, or spaces");
     }
-  } else {
+  } else if (options.action == Action::kExpectPixel) {
     if (!options.x || !options.y || !options.width || !options.height ||
         !options.red || !options.green || !options.blue || !options.tolerance ||
         !options.minimum_matches || !options.timeout_ms || argc != 24 ||
@@ -157,6 +172,16 @@ Options ParseOptions(int argc, char** argv) {
             static_cast<uint64_t>(*options.width) * *options.height) {
       throw std::runtime_error(Usage());
     }
+  } else if (!options.x || !options.y || !options.other_x ||
+             !options.other_y || !options.width || !options.height ||
+             !options.red || !options.green || !options.blue ||
+             !options.tolerance || !options.minimum_differences ||
+             !options.timeout_ms || argc != 28 || *options.width == 0 ||
+             *options.height == 0 || *options.minimum_differences == 0 ||
+             *options.timeout_ms == 0 ||
+             static_cast<uint64_t>(*options.minimum_differences) >
+                 static_cast<uint64_t>(*options.width) * *options.height) {
+    throw std::runtime_error(Usage());
   }
   return options;
 }
@@ -390,6 +415,65 @@ void ExpectPixel(Display* display, Window window, const Options& options) {
       ", expected at least " + std::to_string(*options.minimum_matches));
 }
 
+int DifferingPixels(Display* display, Window window, const Options& options) {
+  XImage* first = XGetImage(display, window, *options.x, *options.y,
+                            *options.width, *options.height, AllPlanes, ZPixmap);
+  XImage* second =
+      XGetImage(display, window, *options.other_x, *options.other_y,
+                *options.width, *options.height, AllPlanes, ZPixmap);
+  if (!first || !second) {
+    if (first) {
+      XDestroyImage(first);
+    }
+    if (second) {
+      XDestroyImage(second);
+    }
+    throw std::runtime_error("XGetImage could not read both comparison regions");
+  }
+
+  int differences = 0;
+  for (int y = 0; y < first->height; ++y) {
+    for (int x = 0; x < first->width; ++x) {
+      const auto is_target = [&](XImage* image) {
+        const unsigned long pixel = XGetPixel(image, x, y);
+        return std::abs(PixelChannel(pixel, image->red_mask) - *options.red) <=
+                   *options.tolerance &&
+               std::abs(PixelChannel(pixel, image->green_mask) -
+                        *options.green) <= *options.tolerance &&
+               std::abs(PixelChannel(pixel, image->blue_mask) - *options.blue) <=
+                   *options.tolerance;
+      };
+      if (is_target(first) != is_target(second)) {
+        ++differences;
+      }
+    }
+  }
+  XDestroyImage(first);
+  XDestroyImage(second);
+  return differences;
+}
+
+void ExpectRegionsDiffer(Display* display, Window window,
+                         const Options& options) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(*options.timeout_ms);
+  int best_difference_count = 0;
+  do {
+    best_difference_count = std::max(
+        best_difference_count, DifferingPixels(display, window, options));
+    if (best_difference_count >= *options.minimum_differences) {
+      std::cout << "found " << best_difference_count
+                << " differing rendered text pixels\n";
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  } while (std::chrono::steady_clock::now() < deadline);
+  throw std::runtime_error(
+      "rendered text regions differed at " +
+      std::to_string(best_difference_count) + " pixels, expected at least " +
+      std::to_string(*options.minimum_differences));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -434,24 +518,49 @@ int main(int argc, char** argv) {
     const double scale_y = scale;
     physical.x = static_cast<int>(std::lround(*options.x * scale_x));
     physical.y = static_cast<int>(std::lround(*options.y * scale_y));
+    if (options.other_x) {
+      physical.other_x =
+          static_cast<int>(std::lround(*options.other_x * scale_x));
+      physical.other_y =
+          static_cast<int>(std::lround(*options.other_y * scale_y));
+    }
     if (*physical.x >= attributes.width || *physical.y >= attributes.height) {
       throw std::runtime_error(
           "coordinates are outside the specified PID window");
     }
-    if (options.action == Action::kExpectPixel) {
+    if (options.action == Action::kExpectPixel ||
+        options.action == Action::kExpectRegionsDiffer) {
       physical.width =
           std::max(1, static_cast<int>(std::lround(*options.width * scale_x)));
       physical.height =
           std::max(1, static_cast<int>(std::lround(*options.height * scale_y)));
-      physical.minimum_matches = std::max(
-          1, static_cast<int>(
-                 std::lround(*options.minimum_matches * scale_x * scale_y)));
+      if (options.minimum_matches) {
+        physical.minimum_matches = std::max(
+            1, static_cast<int>(
+                   std::lround(*options.minimum_matches * scale_x * scale_y)));
+      }
+      if (options.minimum_differences) {
+        physical.minimum_differences = std::max(
+            1, static_cast<int>(std::lround(*options.minimum_differences *
+                                            scale_x * scale_y)));
+      }
       if (*physical.width > attributes.width - *physical.x ||
           *physical.height > attributes.height - *physical.y) {
         throw std::runtime_error(
             "pixel region is outside the specified PID window");
       }
-      ExpectPixel(display, window, physical);
+      if (options.action == Action::kExpectPixel) {
+        ExpectPixel(display, window, physical);
+        return 0;
+      }
+      if (*physical.other_x >= attributes.width ||
+          *physical.other_y >= attributes.height ||
+          *physical.width > attributes.width - *physical.other_x ||
+          *physical.height > attributes.height - *physical.other_y) {
+        throw std::runtime_error(
+            "comparison region is outside the specified PID window");
+      }
+      ExpectRegionsDiffer(display, window, physical);
       return 0;
     }
 
