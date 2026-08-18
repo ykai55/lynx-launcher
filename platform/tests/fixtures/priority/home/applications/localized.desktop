@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Fallback name
+Name[fr]=French name
+Name[fr_CA]=Canadian French
+Exec=/bin/true

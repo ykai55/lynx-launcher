@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=D-Bus application
+DBusActivatable=true
+Exec=/bin/true
+Icon=dbus-test
+Path=/tmp

@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Localized base
+Name[fr]=Localized French
+Exec=/bin/true

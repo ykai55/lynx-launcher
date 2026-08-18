@@ -1,0 +1,29 @@
+{
+  "name": "lynx-launcher-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "scripts": {
+    "build": "rspeedy build",
+    "dev": "rspeedy dev",
+    "preview": "rspeedy preview",
+    "test": "tsx --test tests/*.test.ts",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "@lynx-js/react": "0.124.0"
+  },
+  "devDependencies": {
+    "@lynx-js/react-rsbuild-plugin": "0.19.0",
+    "@lynx-js/rspeedy": "0.16.4",
+    "@lynx-js/types": "4.1.0",
+    "@rsbuild/plugin-type-check": "1.6.0",
+    "@types/react": "19.2.18",
+    "tsx": "4.23.12",
+    "typescript": "6.0.3"
+  }
+}

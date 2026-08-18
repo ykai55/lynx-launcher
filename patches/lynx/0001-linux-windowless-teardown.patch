@@ -1,0 +1,272 @@
+From: Lynx Launcher maintainers
+Subject: [PATCH] Fix Linux windowless teardown ordering
+
+Keep service destruction on live task runners and let pending task closures
+finish their own cleanup before the embedder runner is marked unavailable.
+Reject reentrant work during destruction so cleanup cannot strand new tasks.
+
+This is a narrow integration patch for the pinned Linux windowless SDK.
+
+diff --git a/clay/shell/platform/embedder/BUILD.gn b/clay/shell/platform/embedder/BUILD.gn
+--- a/clay/shell/platform/embedder/BUILD.gn
++++ b/clay/shell/platform/embedder/BUILD.gn
+@@ -96,3 +96,21 @@ template("embedder_source_set") {
+ embedder_source_set("embedder") {
+   public_configs = []
+ }
++
++if (enable_unittests && is_linux) {
++  executable("embedder_task_runner_unittests") {
++    testonly = true
++    sources = [ "embedder_task_runner_unittests.cc" ]
++    deps = [
++      ":embedder",
++      "../../../testing",
++      "../../../testing:testing_fixtures",
++      "../../../../base/src:base_static",
++    ]
++
++    libs = [
++      "epoxy",
++      "rt",
++    ]
++  }
++}
+diff --git a/clay/shell/platform/embedder/embedder_engine.cc b/clay/shell/platform/embedder/embedder_engine.cc
+--- a/clay/shell/platform/embedder/embedder_engine.cc
++++ b/clay/shell/platform/embedder/embedder_engine.cc
+@@ -220,8 +220,8 @@ EmbedderEngine::EmbedderEngine(
+     const clay::TaskRunners& task_runners, const clay::Settings& settings,
+     const Shell::CreateCallback<PlatformView>& on_create_platform_view,
+     const Shell::CreateCallbackFnPtr<Rasterizer>& on_create_rasterizer)
+-    : service_manager_(service_manager),
+-      thread_host_(std::move(thread_host)),
++    : thread_host_(std::move(thread_host)),
++      service_manager_(service_manager),
+       task_runners_(task_runners),
+       shell_args_(std::make_unique<ShellArgs>(settings, on_create_platform_view,
+                                               on_create_rasterizer)) {}
+diff --git a/clay/shell/platform/embedder/embedder_engine.h b/clay/shell/platform/embedder/embedder_engine.h
+--- a/clay/shell/platform/embedder/embedder_engine.h
++++ b/clay/shell/platform/embedder/embedder_engine.h
+@@ -102,8 +102,9 @@ class EmbedderEngine {
+   const std::shared_ptr<clay::ServiceManager>& GetServiceManager() const;
+
+  private:
+-  const std::shared_ptr<clay::ServiceManager> service_manager_;
+   const std::unique_ptr<EmbedderThreadHost> thread_host_;
++  // Members are destroyed in reverse order, while task runners are still live.
++  const std::shared_ptr<clay::ServiceManager> service_manager_;
+   TaskRunners task_runners_;
+   std::unique_ptr<ShellArgs> shell_args_;
+   std::unique_ptr<Shell> shell_;
+diff --git a/clay/shell/platform/embedder/embedder_task_runner.h b/clay/shell/platform/embedder/embedder_task_runner.h
+--- a/clay/shell/platform/embedder/embedder_task_runner.h
++++ b/clay/shell/platform/embedder/embedder_task_runner.h
+@@ -82,12 +82,18 @@ class EmbedderTaskRunner final : public fml::TaskRunner {
+  private:
++  enum class State {
++    kActive,
++    kDestroying,
++    kDestroyed,
++  };
++
+   const size_t embedder_identifier_;
+   DispatchTable dispatch_table_;
+   std::recursive_mutex tasks_mutex_;
+   uint64_t last_baton_ = 0;
+   std::unordered_map<uint64_t, std::pair<fml::TimePoint, lynx::base::closure>>
+       pending_tasks_;
+   fml::TaskQueueId placeholder_id_;
+-  bool thread_host_destroyed_ = false;
++  State state_ = State::kActive;
+
+   // |fml::TaskRunner|
+   void PostTaskForTime(lynx::base::closure task,
+diff --git a/clay/shell/platform/embedder/embedder_task_runner.cc b/clay/shell/platform/embedder/embedder_task_runner.cc
+--- a/clay/shell/platform/embedder/embedder_task_runner.cc
++++ b/clay/shell/platform/embedder/embedder_task_runner.cc
+@@ -47,13 +47,11 @@ void EmbedderTaskRunner::PostTaskForTime(lynx::base::closure task,
+   {
+     // Release the lock before the jump via the dispatch table.
+     std::scoped_lock lock(tasks_mutex_);
+-    if (thread_host_destroyed_) {
+-      FML_LOG(ERROR) << "Embedder attempted to post a task to a destroyed "
+-                        "thread host. Maybe leaked.";
++    if (state_ != State::kActive) {
+       return;
+     }
+     baton = ++last_baton_;
+     pending_tasks_[baton] = std::make_pair(target_time, std::move(task));
+     dispatch_table_.post_task_callback(this, baton, target_time);
+   }
+ }
+@@ -67,9 +65,7 @@ bool EmbedderTaskRunner::RunsTasksOnCurrentThread() {
+   std::scoped_lock lock(tasks_mutex_);
+-  if (thread_host_destroyed_) {
+-    FML_LOG(ERROR) << "Embedder attempted to call RunsTasksOnCurrentThread"
+-                      "to a destroyed thread host.";
++  if (state_ != State::kActive) {
+     return false;
+   }
+   return dispatch_table_.runs_task_on_current_thread_callback();
+ }
+
+@@ -77,20 +73,31 @@ void EmbedderTaskRunner::OnThreadHostDestroyed() {
+   std::unordered_map<uint64_t, std::pair<fml::TimePoint, lynx::base::closure>>
+       tasks;
+
+   {
+     std::scoped_lock lock(tasks_mutex_);
+-    thread_host_destroyed_ = true;
++    if (state_ != State::kActive) {
++      return;
++    }
++    state_ = State::kDestroying;
+     tasks = std::move(pending_tasks_);
+   }
+
+   fml::TimePoint now = fml::TimePoint::Now();
+
+   for (auto& it : tasks) {
+     auto& [time, cb] = it.second;
+     if (time <= now) {
+       cb();
+     }
+   }
++
++  // Closure destruction can synchronously consult this task runner.
++  tasks.clear();
++
++  {
++    std::scoped_lock lock(tasks_mutex_);
++    state_ = State::kDestroyed;
++  }
+ }
+
+ bool EmbedderTaskRunner::PostTask(uint64_t baton) {
+@@ -97,27 +104,24 @@ bool EmbedderTaskRunner::PostTask(uint64_t baton) {
+   lynx::base::closure task;
+
+   {
+     std::scoped_lock lock(tasks_mutex_);
++    if (state_ != State::kActive) {
++      return false;
++    }
++
+     const auto& found = pending_tasks_.find(baton);
+     if (found == pending_tasks_.end()) {
+       FML_LOG(ERROR) << "Embedder attempted to post an unknown task.";
+       return false;
+     }
+
+-    if (thread_host_destroyed_) {
+-      FML_LOG(ERROR) << "Embedder attempted to post a task to a destroyed "
+-                        "thread host. Maybe leaked.";
+-      pending_tasks_.erase(found);
+-      return false;
+-    }
+-
+     task = std::move(found->second.second);
+     pending_tasks_.erase(found);
+
+     // Let go of the tasks mutex befor executing the task.
+   }
+
+   FML_DCHECK(task);
+   task();
+   return true;
+ }
+diff --git a/clay/shell/platform/embedder/embedder_task_runner_unittests.cc b/clay/shell/platform/embedder/embedder_task_runner_unittests.cc
+new file mode 100644
+--- /dev/null
++++ b/clay/shell/platform/embedder/embedder_task_runner_unittests.cc
+@@ -0,0 +1,77 @@
++// Copyright 2026 The Lynx Authors. All rights reserved.
++// Licensed under the Apache License Version 2.0 that can be found in the
++// LICENSE file in the root directory of this source tree.
++
++#include "clay/shell/platform/embedder/embedder_task_runner.h"
++
++#include <cstdint>
++#include <memory>
++#include <utility>
++
++#include "third_party/googletest/googletest/include/gtest/gtest.h"
++
++namespace clay {
++namespace {
++
++class ReenterOnDestruction {
++ public:
++  ReenterOnDestruction(EmbedderTaskRunner* runner, uint64_t* baton,
++                       bool* stale_baton_accepted, bool* nested_task_ran)
++      : runner_(runner),
++        baton_(baton),
++        stale_baton_accepted_(stale_baton_accepted),
++        nested_task_ran_(nested_task_ran) {}
++
++  ~ReenterOnDestruction() {
++    *stale_baton_accepted_ = runner_->PostTask(*baton_);
++    runner_->PostTask(
++        [nested_task_ran = nested_task_ran_] { *nested_task_ran = true; });
++  }
++
++ private:
++  EmbedderTaskRunner* runner_;
++  uint64_t* baton_;
++  bool* stale_baton_accepted_;
++  bool* nested_task_ran_;
++};
++
++TEST(EmbedderTaskRunnerTest, RejectsReentrantTasksWhileDestroying) {
++  int dispatch_count = 0;
++  uint64_t outer_baton = 0;
++  bool outer_task_ran = false;
++  bool stale_baton_accepted = true;
++  bool nested_task_ran = false;
++
++  EmbedderTaskRunner::DispatchTable table;
++  table.post_task_callback =
++      [&](EmbedderTaskRunner*, uint64_t baton, fml::TimePoint) {
++        ++dispatch_count;
++        outer_baton = baton;
++      };
++  table.runs_task_on_current_thread_callback = [] { return true; };
++
++  EmbedderTaskRunner runner(std::move(table), 1);
++  runner.PostTask(
++      [cleanup = std::make_unique<ReenterOnDestruction>(
++           &runner, &outer_baton, &stale_baton_accepted, &nested_task_ran),
++       &outer_task_ran] { outer_task_ran = true; });
++  ASSERT_EQ(dispatch_count, 1);
++
++  runner.OnThreadHostDestroyed();
++
++  EXPECT_TRUE(outer_task_ran);
++  EXPECT_FALSE(stale_baton_accepted);
++  EXPECT_FALSE(nested_task_ran);
++  EXPECT_EQ(dispatch_count, 1);
++
++  bool task_after_destroyed_ran = false;
++  runner.PostTask(
++      [&task_after_destroyed_ran] { task_after_destroyed_ran = true; });
++  runner.OnThreadHostDestroyed();
++
++  EXPECT_FALSE(task_after_destroyed_ran);
++  EXPECT_EQ(dispatch_count, 1);
++}
++
++}  // namespace
++}  // namespace clay
+diff --git a/clay/shell/platform/headless/clay_headless_engine.cc b/clay/shell/platform/headless/clay_headless_engine.cc
+--- a/clay/shell/platform/headless/clay_headless_engine.cc
++++ b/clay/shell/platform/headless/clay_headless_engine.cc
+@@ -33,5 +33,7 @@ ClayHeadlessEngine::~ClayHeadlessEngine() {
+   fml::TaskRunner::RunNowOrPostTask(GetTaskRunners().GetRasterTaskRunner(),
+                                     [&] { renderer_->CleanupGPUResources(); });
+
++  // Drop the outer service owner before the engine tears down its runners.
++  service_manager_.reset();
+   StopEngine();
+ }

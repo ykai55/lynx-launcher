@@ -1,0 +1,4 @@
+[Desktop Entry]
+Type=Application
+Name=Masked system application
+Exec=/bin/true

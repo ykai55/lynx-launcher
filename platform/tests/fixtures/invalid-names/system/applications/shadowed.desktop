@@ -1,0 +1,4 @@
+[Desktop Entry]
+Type=Application
+Name=Lower priority must remain shadowed
+Exec=/bin/true

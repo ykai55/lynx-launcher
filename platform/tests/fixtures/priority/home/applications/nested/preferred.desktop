@@ -1,0 +1,4 @@
+[Desktop Entry]
+Type=Application
+Name=Home application
+Exec=/bin/true

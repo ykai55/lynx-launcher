@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Explicit tombstone
+Hidden=true
+Exec=/bin/true

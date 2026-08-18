@@ -1,0 +1,4 @@
+[Desktop Entry]
+Type=Application
+Name=First system application
+Exec=/bin/true

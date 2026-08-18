@@ -1,0 +1,602 @@
+:root {
+  --ink: #0b0e13;
+  --panel: #151a21;
+  --line: #303844;
+  --paper: #f1ead9;
+  --muted: #89929d;
+  --orange: #ff6b3d;
+  --mint: #9fd8c6;
+  background-color: var(--ink);
+}
+
+text {
+  color: var(--paper);
+}
+
+.Root {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background-color: var(--ink);
+}
+
+.Scroller {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.Page {
+  position: relative;
+  width: 100%;
+  min-height: 100vh;
+  padding: 34px 28px 24px;
+}
+
+.Ambient {
+  position: fixed;
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+.Ambient--orange {
+  width: 420px;
+  height: 420px;
+  top: -260px;
+  right: -120px;
+  background: radial-gradient(
+    circle at center,
+    rgba(255, 107, 61, 0.34) 0%,
+    rgba(255, 107, 61, 0) 70%
+  );
+}
+
+.Ambient--mint {
+  width: 360px;
+  height: 360px;
+  bottom: -260px;
+  left: -170px;
+  background: radial-gradient(
+    circle at center,
+    rgba(159, 216, 198, 0.18) 0%,
+    rgba(159, 216, 198, 0) 72%
+  );
+}
+
+.Header {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 34px;
+}
+
+.Brand {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+}
+
+.BrandMark {
+  width: 54px;
+  height: 54px;
+  align-items: center;
+  justify-content: center;
+  margin-right: 15px;
+  background-color: var(--orange);
+  border-radius: 3px 18px 3px 3px;
+  box-shadow: 0 8px 24px rgba(255, 107, 61, 0.22);
+}
+
+.BrandLetter {
+  color: var(--ink);
+  font-size: 29px;
+  font-weight: 900;
+  line-height: 32px;
+}
+
+.BrandCopy {
+  display: flex;
+  flex-direction: column;
+}
+
+.Eyebrow {
+  margin-bottom: 1px;
+  color: var(--orange);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 2.2px;
+}
+
+.Title {
+  color: var(--paper);
+  font-size: 29px;
+  font-weight: 800;
+  letter-spacing: -0.9px;
+  line-height: 34px;
+}
+
+.CountBlock {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding: 10px 13px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  background-color: rgba(21, 26, 33, 0.82);
+}
+
+.StatusDot {
+  width: 8px;
+  height: 8px;
+  margin-right: 9px;
+  border-radius: 50%;
+}
+
+.StatusDot--loading {
+  background-color: #e8bd6c;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.StatusDot--ready {
+  background-color: var(--mint);
+  box-shadow: 0 0 12px rgba(159, 216, 198, 0.55);
+}
+
+.StatusDot--error {
+  background-color: var(--orange);
+}
+
+.Count {
+  color: #b4bbc4;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+}
+
+.SearchPanel {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  width: 100%;
+  height: 76px;
+  margin-bottom: 30px;
+  padding: 0 18px 0 66px;
+  background-color: var(--paper);
+  border-radius: 4px 24px 4px 4px;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.28);
+}
+
+.SearchGlyph {
+  position: absolute;
+  left: 24px;
+  top: 25px;
+  width: 27px;
+  height: 27px;
+}
+
+.SearchGlyphRing {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  left: 0;
+  top: 0;
+  border: 3px solid var(--ink);
+  border-radius: 50%;
+}
+
+.SearchGlyphHandle {
+  position: absolute;
+  width: 10px;
+  height: 3px;
+  left: 16px;
+  top: 19px;
+  background-color: var(--ink);
+  border-radius: 2px;
+  transform: rotate(45deg);
+  transform-origin: left center;
+}
+
+.SearchInput {
+  flex: 1;
+  height: 100%;
+  padding: 0;
+  color: var(--ink);
+  background-color: transparent;
+  font-size: 21px;
+  font-weight: 600;
+  letter-spacing: -0.35px;
+}
+
+.SearchMeta {
+  flex-shrink: 0;
+  margin-left: 14px;
+  padding: 7px 10px;
+  background-color: #ded5c1;
+  border-radius: 3px;
+}
+
+.SearchMetaText {
+  color: #52504b;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 1px;
+}
+
+.ActionError {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  width: 100%;
+  margin: -12px 0 22px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 107, 61, 0.45);
+  background-color: rgba(255, 107, 61, 0.09);
+  border-radius: 4px;
+}
+
+.ActionErrorMark {
+  width: 7px;
+  height: 7px;
+  margin-right: 10px;
+  background-color: var(--orange);
+  transform: rotate(45deg);
+}
+
+.ActionErrorText {
+  color: #ffc0ac;
+  font-size: 12px;
+  line-height: 17px;
+}
+
+.SectionHeader {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  width: 100%;
+  margin-bottom: 14px;
+}
+
+.SectionTitle {
+  color: #aeb5bd;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1.7px;
+}
+
+.SectionRule {
+  flex: 1;
+  height: 1px;
+  margin: 0 12px;
+  background-color: var(--line);
+}
+
+.SectionIndex {
+  color: #626b76;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.Grid {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 12px;
+  width: 100%;
+}
+
+.ApplicationCard {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  width: calc(50% - 6px);
+  min-height: 108px;
+  padding: 17px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 4px 18px 4px 4px;
+  background-color: rgba(21, 26, 33, 0.94);
+  box-shadow: 0 11px 26px rgba(0, 0, 0, 0.16);
+}
+
+.ApplicationCard--hidden {
+  display: none;
+}
+
+.ApplicationCard--launching {
+  border-color: rgba(159, 216, 198, 0.8);
+  background-color: #19231f;
+}
+
+.ApplicationIcon {
+  flex-shrink: 0;
+  width: 64px;
+  height: 64px;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 15px;
+  background-color: #262c34;
+}
+
+.ApplicationImage {
+  width: 100%;
+  height: 100%;
+}
+
+.ApplicationIcon--fallback {
+  border-radius: 15px 15px 15px 4px;
+}
+
+.ApplicationIcon--accent0 {
+  background-color: var(--orange);
+}
+
+.ApplicationIcon--accent1 {
+  background-color: var(--mint);
+}
+
+.ApplicationIcon--accent2 {
+  background-color: #e8bd6c;
+}
+
+.ApplicationIcon--accent3 {
+  background-color: #9da8e8;
+}
+
+.ApplicationInitial {
+  color: var(--ink);
+  font-size: 27px;
+  font-weight: 900;
+}
+
+.ApplicationCopy {
+  flex: 1;
+  min-width: 0;
+  margin-left: 15px;
+  padding-right: 43px;
+}
+
+.ApplicationNumber {
+  margin-bottom: 5px;
+  color: #68727e;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.ApplicationName {
+  color: var(--paper);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 20px;
+}
+
+.LaunchBadge {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  padding: 7px 9px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px 0 0 0;
+  background-color: #1d232b;
+}
+
+.ApplicationCard--launching .LaunchBadge {
+  border-color: var(--mint);
+  background-color: var(--mint);
+}
+
+.LaunchBadgeText {
+  color: #8f99a5;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 1px;
+}
+
+.ApplicationCard--launching .LaunchBadgeText {
+  color: var(--ink);
+}
+
+.StatePanel {
+  width: 100%;
+  min-height: 260px;
+  align-items: center;
+  justify-content: center;
+  padding: 34px 24px;
+  border: 1px solid var(--line);
+  border-radius: 4px 22px 4px 4px;
+  background-color: rgba(21, 26, 33, 0.78);
+}
+
+.StatePanel--error {
+  border-color: rgba(255, 107, 61, 0.35);
+}
+
+.StateSymbol {
+  width: 54px;
+  height: 54px;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 19px;
+  border-radius: 50%;
+  background-color: var(--orange);
+}
+
+.StateSymbol--empty {
+  position: relative;
+  background-color: #252c34;
+}
+
+.StateSymbolText {
+  color: var(--ink);
+  font-size: 27px;
+  font-weight: 900;
+}
+
+.EmptyGlyphLine {
+  position: absolute;
+  width: 24px;
+  height: 3px;
+  left: 15px;
+  background-color: #68727e;
+  border-radius: 2px;
+}
+
+.EmptyGlyphLine--top {
+  top: 20px;
+}
+
+.EmptyGlyphLine--bottom {
+  top: 31px;
+  width: 17px;
+}
+
+.StateSearchRing {
+  left: 14px;
+  top: 13px;
+  border-color: #75808c;
+}
+
+.StateSearchHandle {
+  left: 31px;
+  top: 32px;
+  background-color: #75808c;
+}
+
+.StateKicker {
+  margin-bottom: 8px;
+  color: var(--orange);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 2px;
+}
+
+.StateTitle {
+  margin-bottom: 8px;
+  color: var(--paper);
+  font-size: 21px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.StateBody {
+  max-width: 470px;
+  color: #8e98a3;
+  font-size: 12px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.RetryButton {
+  margin-top: 20px;
+  padding: 11px 17px;
+  border-radius: 3px 10px 3px 3px;
+  background-color: var(--orange);
+}
+
+.RetryButtonText {
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 1.4px;
+}
+
+.Footer {
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+  width: 100%;
+  margin-top: 30px;
+  padding-top: 14px;
+  border-top: 1px solid #272e37;
+}
+
+.FooterText {
+  color: #59636f;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 1.3px;
+}
+
+.FooterText--right {
+  color: var(--mint);
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (min-width: 760px) {
+  .Page {
+    padding: 42px 42px 28px;
+  }
+
+  .ApplicationCard {
+    width: calc(33.333% - 8px);
+  }
+}
+
+@media (min-width: 1120px) {
+  .Page {
+    padding-right: 58px;
+    padding-left: 58px;
+  }
+
+  .ApplicationCard {
+    width: calc(25% - 9px);
+  }
+}
+
+@media (max-width: 540px) {
+  .Page {
+    padding: 24px 18px 20px;
+  }
+
+  .Header {
+    align-items: flex-start;
+    margin-bottom: 25px;
+  }
+
+  .CountBlock {
+    padding: 8px 9px;
+  }
+
+  .Count {
+    max-width: 92px;
+    font-size: 9px;
+  }
+
+  .SearchPanel {
+    height: 68px;
+    padding-right: 14px;
+    padding-left: 56px;
+  }
+
+  .SearchGlyph {
+    left: 19px;
+    top: 22px;
+  }
+
+  .SearchInput {
+    font-size: 17px;
+  }
+
+  .SearchMeta {
+    display: none;
+  }
+
+  .ApplicationCard {
+    width: 100%;
+  }
+}

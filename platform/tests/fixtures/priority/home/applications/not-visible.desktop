@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Hidden from GNOME
+NotShowIn=GNOME;
+Exec=/bin/true
