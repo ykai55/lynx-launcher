@@ -187,11 +187,11 @@ void ConfigurePopupWindow(GLFWwindow* window) {
 
   const Atom window_type =
       XInternAtom(display, "_NET_WM_WINDOW_TYPE", False);
-  const Atom utility_type =
-      XInternAtom(display, "_NET_WM_WINDOW_TYPE_UTILITY", False);
+  const Atom normal_type =
+      XInternAtom(display, "_NET_WM_WINDOW_TYPE_NORMAL", False);
   XChangeProperty(display, native_window, window_type, XA_ATOM, 32,
                   PropModeReplace,
-                  reinterpret_cast<const unsigned char*>(&utility_type), 1);
+                  reinterpret_cast<const unsigned char*>(&normal_type), 1);
 
   const Atom window_state = XInternAtom(display, "_NET_WM_STATE", False);
   const Atom states[] = {
@@ -1594,6 +1594,7 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
     glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
+    glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_TRUE);
     GLFWwindow* window = glfwCreateWindow(initial_width, initial_height,
                                           "Lynx Launcher", nullptr, nullptr);
     if (!window) {
@@ -1620,11 +1621,10 @@ int main(int argc, char** argv) {
               << reinterpret_cast<const char*>(glGetString(GL_VERSION))
               << " via GLFW X11\n";
     glfwMakeContextCurrent(nullptr);
-    glfwShowWindow(window);
-    glfwFocusWindow(window);
-
     Host host(window, paths, system_scale);
     host.Initialize();
+    glfwShowWindow(window);
+    glfwFocusWindow(window);
     return host.Run(options);
   } catch (const std::exception& error) {
     std::cerr << "lynx-launcher: " << error.what() << '\n';

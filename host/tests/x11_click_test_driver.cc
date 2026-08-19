@@ -282,10 +282,9 @@ bool ContainsAtom(const std::vector<Atom>& atoms, Atom expected) {
 
 void ExpectPopup(Display* display, Window window) {
   const auto types = AtomProperty(display, window, "_NET_WM_WINDOW_TYPE");
-  const Atom utility =
-      XInternAtom(display, "_NET_WM_WINDOW_TYPE_UTILITY", True);
-  if (!ContainsAtom(types, utility)) {
-    throw std::runtime_error("window is not an EWMH utility window");
+  const Atom normal = XInternAtom(display, "_NET_WM_WINDOW_TYPE_NORMAL", True);
+  if (!ContainsAtom(types, normal)) {
+    throw std::runtime_error("window is not an EWMH normal window");
   }
 
   const auto states = AtomProperty(display, window, "_NET_WM_STATE");
