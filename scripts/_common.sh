@@ -20,6 +20,7 @@ host_binary="${host_build_dir}/lynx-launcher"
 lynx_patch_relpaths=(
   "patches/lynx/0001-linux-windowless-teardown.patch"
   "patches/lynx/0002-linux-fontconfig-fallback.patch"
+  "patches/lynx/0003-linux-launcher-size-profile.patch"
 )
 
 die() {

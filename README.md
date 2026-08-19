@@ -23,6 +23,9 @@ nvm use
 bootstrap；显式执行便于首次构建时单独观察 `.logs/bootstrap.log`。项目脚本不运行
 `sudo`，也不安装系统软件包。
 
+Linux SDK 的 launcher-specific 体积 profile、实测结果和能力取舍见
+[`LYNX_SDK_SIZE.md`](LYNX_SDK_SIZE.md)。
+
 ## 已实现能力
 
 - 从 XDG data directories 发现 freedesktop `Desktop Entry` 应用。

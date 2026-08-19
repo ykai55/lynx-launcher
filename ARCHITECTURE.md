@@ -148,9 +148,10 @@ The build treats every dependency boundary as an explicit lock:
   `--remote` or follows `develop`.
 - `patches/lynx` contains an explicit allowlist of Linux windowless integration
   patches. Bootstrap rejects unknown patch files, applies the trusted set only
-  around the SDK build, and reverses it from an exit trap. The teardown and
-  fontconfig fixes are integration boundaries, not a business fork; the
-  submodule remains at its pinned, clean source state outside bootstrap.
+  around the SDK build, and reverses it from an exit trap. The teardown,
+  fontconfig fallback, and launcher size profile are integration boundaries,
+  not a business fork; the submodule remains at its pinned, clean source state
+  outside bootstrap.
 - The pinned Lynx checkout supplies Habitat `0.3.149` and its DEPS revisions.
   Habitat runs with `.build-home/` as HOME so its multi-gigabyte cache cannot
   enter Git or depend on unrelated user cache state. Bootstrap serializes the
@@ -175,6 +176,10 @@ The build treats every dependency boundary as an explicit lock:
 - The patched Linux SDK links the system `libfontconfig.so.1`. Source and SDK
   provenance remain locked, while the selected fallback typefaces intentionally
   follow the host's fontconfig configuration and installed font set.
+- The Linux launcher SDK uses hidden-by-default visibility, keeps its static
+  LLVM unwinder local, and excludes Inspector, runtime Lepus compilation, Wuffs,
+  and Skottie. `LYNX_SDK_SIZE.md` records the measured impact and retained
+  runtime capabilities.
 - Runtime resources are refreshed by an always-run target whose operations are
   content-aware `copy_if_different` calls. Correctness does not depend on source
   mtimes, while equal files avoid writes and preserve incremental efficiency.

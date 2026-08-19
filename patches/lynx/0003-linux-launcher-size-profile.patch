@@ -1,0 +1,64 @@
+From: Lynx Launcher maintainers
+Subject: [PATCH] Reduce the Linux launcher SDK size
+
+Restore hidden-by-default symbol visibility for the Linux SDK. Public Lynx
+CAPI, value API, and weak N-API entry points carry explicit default visibility,
+while internal Lynx, Clay, Skia, and C++ runtime symbols do not need to remain
+in the dynamic symbol table used by the launcher.
+
+Keep the statically linked LLVM unwinder local to liblynx. Exporting only the
+unwinder while hiding its matching libc++ ABI runtime lets it interpose on the
+launcher's system libstdc++ exception path and produces recursive termination.
+
+Exclude development and runtime compilation features that the launcher does
+not use: Inspector/LogBox services, the Lepus source compiler, Skottie, and the
+Wuffs GIF decoder. Keep QuickJS, N-API, SVG, text shaping, ICU, and fontconfig
+fallback enabled for the shipped UI and desktop icon formats.
+
+This is a narrow integration patch for the pinned Linux windowless SDK.
+
+diff --git a/platform/linux/BUILD.gn b/platform/linux/BUILD.gn
+--- a/platform/linux/BUILD.gn
++++ b/platform/linux/BUILD.gn
+@@ -12,3 +12,6 @@ shared_library("linux") {
+   deps = [ ":lynx_linux_group" ]
+-
++
++  # Keep the bundled LLVM unwinder paired with Lynx's private C++ runtime.
++  ldflags = [ "-Wl,--exclude-libs=libunwind.a" ]
++
+   libs = [
+diff --git a/platform/linux/build_release.py b/platform/linux/build_release.py
+--- a/platform/linux/build_release.py
++++ b/platform/linux/build_release.py
+@@ -12,6 +12,6 @@ from pathlib import Path
+ COMMON_GN_ARGS = [
+     'enable_clay_standalone = true',
+-    'disable_visibility_hidden = true',
++    'disable_visibility_hidden = false',
+     'use_ndk_static_cxx = false',
+     'enable_linker_map = false',
+     'enable_clay = true',
+@@ -22,7 +22,7 @@ COMMON_GN_ARGS = [
+     'skia_enable_pdf = false',
+     'skia_enable_svg = true',
+     'enable_svg = true',
+-    'skia_enable_skottie = true',
++    'skia_enable_skottie = false',
+     'skia_use_x11 = false',
+-    'skia_use_wuffs = true',
++    'skia_use_wuffs = false',
+     'skia_use_expat = true',
+@@ -34,10 +34,11 @@ COMMON_GN_ARGS = [
+     'stripped_symbols = true',
+     'is_official_build = true',
+     'use_clang_static_analyzer = false',
+     'enable_lto = false',
++    'build_lepus_compile = false',
+     'enable_lepusng_worklet = true',
+     'enable_napi_binding = true',
+-    'enable_inspector = true',
++    'enable_inspector = false',
+     'jsengine_type = "quickjs"',
+     'use_flutter_cxx = true',
+     'is_debug = false',
