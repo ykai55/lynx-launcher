@@ -163,6 +163,7 @@ run_iteration() {
   fi
   sleep 0.25
 
+  "${click_driver}" --pid "${host_pid}" expect-popup
   "${click_driver}" --pid "${host_pid}" expect-regions-differ \
     --x 125 --y 310 --other-x 140 --other-y 310 --width 15 --height 18 \
     --red 241 --green 234 --blue 217 --tolerance 40 \
@@ -199,7 +200,34 @@ run_iteration() {
     return 1
   fi
 
-  stop_host
+  "${click_driver}" --pid "${host_pid}" defocus
+  local exit_deadline=$((SECONDS + 3))
+  while [[ "$(process_identity "${host_pid}" 2>/dev/null || true)" == "${host_identity}" ]] &&
+    ((SECONDS < exit_deadline)); do
+    sleep 0.02
+  done
+  if [[ "$(process_identity "${host_pid}" 2>/dev/null || true)" == "${host_identity}" ]]; then
+    printf 'launch E2E iteration %s: host did not exit after focus loss\n' \
+      "${iteration}" >&2
+    dump_log
+    return 1
+  fi
+  if ! wait "${host_pid}"; then
+    printf 'launch E2E iteration %s: host failed while exiting after focus loss\n' \
+      "${iteration}" >&2
+    dump_log
+    host_pid=""
+    host_identity=""
+    return 1
+  fi
+  host_pid=""
+  host_identity=""
+  if ! grep -Fq -- '[host] window lost focus; exiting' "${host_log}"; then
+    printf 'launch E2E iteration %s: host did not report focus-loss exit\n' \
+      "${iteration}" >&2
+    dump_log
+    return 1
+  fi
   rm -rf -- "${temporary}"
   temporary=""
   printf 'launch E2E iteration %s/%s passed\n' \

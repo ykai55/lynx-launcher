@@ -3,6 +3,7 @@
 #include <GL/gl.h>
 #include <GLFW/glfw3.h>
 #include <GLFW/glfw3native.h>
+#include <X11/Xatom.h>
 
 #include <algorithm>
 #include <atomic>
@@ -175,6 +176,34 @@ float SystemWindowScale() {
     XFree(data);
   }
   return std::max(1.0f, scale);
+}
+
+void ConfigurePopupWindow(GLFWwindow* window) {
+  Display* display = glfwGetX11Display();
+  const Window native_window = glfwGetX11Window(window);
+  if (!display || native_window == None) {
+    throw std::runtime_error("could not access the launcher X11 window");
+  }
+
+  const Atom window_type =
+      XInternAtom(display, "_NET_WM_WINDOW_TYPE", False);
+  const Atom utility_type =
+      XInternAtom(display, "_NET_WM_WINDOW_TYPE_UTILITY", False);
+  XChangeProperty(display, native_window, window_type, XA_ATOM, 32,
+                  PropModeReplace,
+                  reinterpret_cast<const unsigned char*>(&utility_type), 1);
+
+  const Atom window_state = XInternAtom(display, "_NET_WM_STATE", False);
+  const Atom states[] = {
+      XInternAtom(display, "_NET_WM_STATE_ABOVE", False),
+      XInternAtom(display, "_NET_WM_STATE_SKIP_TASKBAR", False),
+      XInternAtom(display, "_NET_WM_STATE_SKIP_PAGER", False),
+  };
+  XChangeProperty(display, native_window, window_state, XA_ATOM, 32,
+                  PropModeReplace,
+                  reinterpret_cast<const unsigned char*>(states),
+                  std::size(states));
+  XFlush(display);
 }
 
 std::string SliceString(LynxSlice slice) {
@@ -1258,6 +1287,8 @@ class Host {
     } else {
       host->CancelInput();
       lynx_view_enter_background(host->view_);
+      std::cerr << "[host] window lost focus; exiting\n";
+      glfwSetWindowShouldClose(window, GLFW_TRUE);
     }
   }
 
@@ -1559,6 +1590,10 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+    glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
     GLFWwindow* window = glfwCreateWindow(initial_width, initial_height,
                                           "Lynx Launcher", nullptr, nullptr);
     if (!window) {
@@ -1569,6 +1604,8 @@ int main(int argc, char** argv) {
       GLFWwindow* window;
       ~WindowGuard() { glfwDestroyWindow(window); }
     } window_guard{window};
+
+    ConfigurePopupWindow(window);
 
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
@@ -1583,6 +1620,8 @@ int main(int argc, char** argv) {
               << reinterpret_cast<const char*>(glGetString(GL_VERSION))
               << " via GLFW X11\n";
     glfwMakeContextCurrent(nullptr);
+    glfwShowWindow(window);
+    glfwFocusWindow(window);
 
     Host host(window, paths, system_scale);
     host.Initialize();

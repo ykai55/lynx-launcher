@@ -30,6 +30,7 @@ bootstrap；显式执行便于首次构建时单独观察 `.logs/bootstrap.log`�
 - 解析绝对图标路径、常见 hicolor 尺寸、scalable 图标和 pixmaps。
 - 在 ReactLynx 中搜索应用，通过真实 N-API Promise 异步报告启动结果。
 - 通过 Lynx windowless API 转发窗口、指针、键盘、滚轮、剪贴板、光标和基础文本输入。
+- 以无边框、置顶且不进入任务栏或分页器的 X11 launcher 弹窗运行，失焦后退出。
 - 在 X11/XWayland 下读取 GLFW content scale 与 XSettings
   `Gdk/WindowScalingFactor`，同步原生窗口、Lynx DPR、逻辑 viewport 和输入坐标。
 - 通过 fontconfig 匹配系统与用户字体，为中文及其他缺失 glyph 提供字体回退。

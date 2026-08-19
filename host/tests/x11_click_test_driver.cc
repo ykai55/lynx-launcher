@@ -24,7 +24,14 @@ namespace {
 constexpr int kLauncherLogicalWidth = 1120;
 constexpr int kLauncherLogicalHeight = 760;
 
-enum class Action { kClick, kType, kExpectPixel, kExpectRegionsDiffer };
+enum class Action {
+  kClick,
+  kDefocus,
+  kExpectPopup,
+  kType,
+  kExpectPixel,
+  kExpectRegionsDiffer,
+};
 
 struct Options {
   unsigned long pid = 0;
@@ -48,6 +55,8 @@ struct Options {
 const char* Usage() {
   return "usage:\n"
          "  x11_click_test_driver --pid PID click --x X --y Y\n"
+         "  x11_click_test_driver --pid PID defocus\n"
+         "  x11_click_test_driver --pid PID expect-popup\n"
          "  x11_click_test_driver --pid PID type --text ASCII\n"
          "  x11_click_test_driver --pid PID expect-pixel --x X --y Y "
          "--width W --height H --red R --green G --blue B --tolerance N "
@@ -93,6 +102,10 @@ Options ParseOptions(int argc, char** argv) {
   const std::string action = argv[3];
   if (action == "click") {
     options.action = Action::kClick;
+  } else if (action == "defocus") {
+    options.action = Action::kDefocus;
+  } else if (action == "expect-popup") {
+    options.action = Action::kExpectPopup;
   } else if (action == "type") {
     options.action = Action::kType;
   } else if (action == "expect-pixel") {
@@ -146,7 +159,12 @@ Options ParseOptions(int argc, char** argv) {
     }
   }
 
-  if (options.action == Action::kClick) {
+  if (options.action == Action::kDefocus ||
+      options.action == Action::kExpectPopup) {
+    if (argc != 4) {
+      throw std::runtime_error(Usage());
+    }
+  } else if (options.action == Action::kClick) {
     if (!options.x || !options.y || argc != 8) {
       throw std::runtime_error(Usage());
     }
@@ -231,6 +249,82 @@ void FindWindows(Display* display, Window parent, Atom pid_atom,
   }
 }
 
+std::vector<Atom> AtomProperty(Display* display, Window window,
+                               const char* name) {
+  const Atom property = XInternAtom(display, name, True);
+  if (property == None) {
+    return {};
+  }
+  Atom actual_type = None;
+  int actual_format = 0;
+  unsigned long count = 0;
+  unsigned long remaining = 0;
+  unsigned char* data = nullptr;
+  const int status = XGetWindowProperty(
+      display, window, property, 0, 64, False, XA_ATOM, &actual_type,
+      &actual_format, &count, &remaining, &data);
+  std::vector<Atom> atoms;
+  if (status == Success && actual_type == XA_ATOM && actual_format == 32 &&
+      remaining == 0 && data) {
+    const auto* values = reinterpret_cast<const Atom*>(data);
+    atoms.assign(values, values + count);
+  }
+  if (data) {
+    XFree(data);
+  }
+  return atoms;
+}
+
+bool ContainsAtom(const std::vector<Atom>& atoms, Atom expected) {
+  return expected != None &&
+         std::find(atoms.begin(), atoms.end(), expected) != atoms.end();
+}
+
+void ExpectPopup(Display* display, Window window) {
+  const auto types = AtomProperty(display, window, "_NET_WM_WINDOW_TYPE");
+  const Atom utility =
+      XInternAtom(display, "_NET_WM_WINDOW_TYPE_UTILITY", True);
+  if (!ContainsAtom(types, utility)) {
+    throw std::runtime_error("window is not an EWMH utility window");
+  }
+
+  const auto states = AtomProperty(display, window, "_NET_WM_STATE");
+  for (const char* name : {"_NET_WM_STATE_ABOVE",
+                           "_NET_WM_STATE_SKIP_TASKBAR",
+                           "_NET_WM_STATE_SKIP_PAGER"}) {
+    if (!ContainsAtom(states, XInternAtom(display, name, True))) {
+      throw std::runtime_error(std::string("window is missing EWMH state ") +
+                               name);
+    }
+  }
+
+  const Atom motif = XInternAtom(display, "_MOTIF_WM_HINTS", True);
+  Atom actual_type = None;
+  int actual_format = 0;
+  unsigned long count = 0;
+  unsigned long remaining = 0;
+  unsigned char* data = nullptr;
+  const int status =
+      motif == None
+          ? BadAtom
+          : XGetWindowProperty(display, window, motif, 0, 5, False, motif,
+                               &actual_type, &actual_format, &count, &remaining,
+                               &data);
+  const auto* hints = reinterpret_cast<const unsigned long*>(data);
+  constexpr unsigned long kMotifDecorationsHint = 1UL << 1;
+  const bool undecorated =
+      status == Success && actual_type == motif && actual_format == 32 &&
+      count >= 3 && remaining == 0 && data &&
+      (hints[0] & kMotifDecorationsHint) != 0 && hints[2] == 0;
+  if (data) {
+    XFree(data);
+  }
+  if (!undecorated) {
+    throw std::runtime_error("window is missing the undecorated Motif hint");
+  }
+  std::cout << "window has popup-like X11 properties\n";
+}
+
 std::optional<float> XSettingsScale(Display* display) {
   const std::string selection_name =
       "_XSETTINGS_S" + std::to_string(DefaultScreen(display));
@@ -269,6 +363,18 @@ void RequireSent(int status, const char* event_name) {
     throw std::runtime_error(std::string("XSendEvent failed for ") +
                              event_name);
   }
+}
+
+void SendFocusOut(Display* display, Window window) {
+  XEvent event{};
+  event.xfocus.type = FocusOut;
+  event.xfocus.display = display;
+  event.xfocus.window = window;
+  event.xfocus.mode = NotifyNormal;
+  event.xfocus.detail = NotifyNonlinear;
+  RequireSent(XSendEvent(display, window, False, FocusChangeMask, &event),
+              "FocusOut");
+  XSync(display, False);
 }
 
 void SendClick(Display* display, Window root, Window window, int root_x,
@@ -502,6 +608,15 @@ int main(int argc, char** argv) {
     XWindowAttributes attributes{};
     if (!XGetWindowAttributes(display, window, &attributes)) {
       throw std::runtime_error("could not read X11 window attributes");
+    }
+
+    if (options.action == Action::kExpectPopup) {
+      ExpectPopup(display, window);
+      return 0;
+    }
+    if (options.action == Action::kDefocus) {
+      SendFocusOut(display, window);
+      return 0;
     }
 
     if (options.action == Action::kType) {
