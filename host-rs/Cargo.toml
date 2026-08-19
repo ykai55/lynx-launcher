@@ -1,0 +1,13 @@
+[package]
+name = "lynx-launcher-host"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[[bin]]
+name = "lynx-launcher-rs"
+path = "src/main.rs"
+
+[dependencies]
+lynx-launcher-platform = { path = "../platform" }
+lynx-sys = { path = "../lynx-sys" }

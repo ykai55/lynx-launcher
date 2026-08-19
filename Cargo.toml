@@ -1,0 +1,3 @@
+[workspace]
+members = ["host-rs", "lynx-sys", "platform"]
+resolver = "2"

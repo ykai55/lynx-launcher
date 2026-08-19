@@ -20,6 +20,10 @@ set(GLFW_SOURCE_DIR "${LAUNCHER_ROOT}/third_party/lynx/third_party/glfw"
     CACHE PATH "Vendored GLFW source directory")
 set(PLATFORM_DIR "${LAUNCHER_ROOT}/platform"
     CACHE PATH "Rust platform crate directory")
+set(HOST_RS_DIR "${LAUNCHER_ROOT}/host-rs"
+    CACHE PATH "Rust host tracer crate directory")
+set(LYNX_SYS_DIR "${LAUNCHER_ROOT}/lynx-sys"
+    CACHE PATH "Rust Lynx bindings crate directory")
 
 foreach(required_path
         "${LYNX_SDK_DIR}/lib/liblynx.so"
@@ -27,7 +31,11 @@ foreach(required_path
         "${LYNX_SDK_DIR}/data/icudtl.dat"
         "${LYNX_SDK_DIR}/lynx_core.js"
         "${GLFW_SOURCE_DIR}/CMakeLists.txt"
+        "${LAUNCHER_ROOT}/Cargo.toml"
+        "${LAUNCHER_ROOT}/Cargo.lock"
         "${PLATFORM_DIR}/Cargo.toml"
+        "${HOST_RS_DIR}/Cargo.toml"
+        "${LYNX_SYS_DIR}/Cargo.toml"
         "${PLATFORM_DIR}/include/lynx_launcher.h"
         "${LAUNCHER_ROOT}/rust-toolchain.toml"
         "${LAUNCHER_ROOT}/ui/dist/main.lynx.bundle")
@@ -52,24 +60,64 @@ set_target_properties(lynx_sdk PROPERTIES
 
 set(CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/cargo-target")
 set(PLATFORM_STATIC_LIB "${CARGO_TARGET_DIR}/release/liblynx_launcher_platform.a")
+set(RUST_HOST_CARGO_BINARY "${CARGO_TARGET_DIR}/release/lynx-launcher-rs")
+set(RUST_HOST_BINARY "${CMAKE_BINARY_DIR}/lynx-launcher-rs")
 file(GLOB_RECURSE PLATFORM_RUST_SOURCES CONFIGURE_DEPENDS
   "${PLATFORM_DIR}/src/*.rs"
+)
+file(GLOB_RECURSE HOST_RS_RUST_SOURCES CONFIGURE_DEPENDS
+  "${HOST_RS_DIR}/src/*.rs"
+)
+file(GLOB_RECURSE LYNX_SYS_RUST_SOURCES CONFIGURE_DEPENDS
+  "${LYNX_SYS_DIR}/src/*.rs"
 )
 add_custom_command(
   OUTPUT "${PLATFORM_STATIC_LIB}"
   COMMAND "${CMAKE_COMMAND}" -E env
           "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
-          cargo build --release --locked
-  WORKING_DIRECTORY "${PLATFORM_DIR}"
+          cargo build --release --locked -p lynx-launcher-platform
+  WORKING_DIRECTORY "${LAUNCHER_ROOT}"
   DEPENDS
+    "${LAUNCHER_ROOT}/Cargo.toml"
+    "${LAUNCHER_ROOT}/Cargo.lock"
     "${PLATFORM_DIR}/Cargo.toml"
-    "${PLATFORM_DIR}/Cargo.lock"
     "${LAUNCHER_ROOT}/rust-toolchain.toml"
     ${PLATFORM_RUST_SOURCES}
   COMMENT "Building the Rust launcher platform static library"
   VERBATIM
 )
-add_custom_target(platform_staticlib DEPENDS "${PLATFORM_STATIC_LIB}")
+add_custom_command(
+  OUTPUT "${RUST_HOST_CARGO_BINARY}"
+  COMMAND "${CMAKE_COMMAND}" -E env
+          "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
+          "LYNX_SDK_DIR=${LYNX_SDK_DIR}"
+          cargo build --release --locked -p lynx-launcher-host
+          --bin lynx-launcher-rs
+  WORKING_DIRECTORY "${LAUNCHER_ROOT}"
+  DEPENDS
+    "${PLATFORM_STATIC_LIB}"
+    "${LAUNCHER_ROOT}/Cargo.toml"
+    "${LAUNCHER_ROOT}/Cargo.lock"
+    "${HOST_RS_DIR}/Cargo.toml"
+    "${HOST_RS_DIR}/build.rs"
+    "${LYNX_SYS_DIR}/Cargo.toml"
+    "${LYNX_SYS_DIR}/build.rs"
+    "${LAUNCHER_ROOT}/rust-toolchain.toml"
+    ${HOST_RS_RUST_SOURCES}
+    ${LYNX_SYS_RUST_SOURCES}
+  COMMENT "Building the Rust host tracer"
+  VERBATIM
+)
+add_custom_command(
+  OUTPUT "${RUST_HOST_BINARY}"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+          "${RUST_HOST_CARGO_BINARY}" "${RUST_HOST_BINARY}"
+  DEPENDS "${RUST_HOST_CARGO_BINARY}"
+  COMMENT "Staging the Rust host tracer"
+  VERBATIM
+)
+add_custom_target(rust_workspace ALL
+  DEPENDS "${PLATFORM_STATIC_LIB}" "${RUST_HOST_BINARY}")
 add_library(launcher_platform STATIC IMPORTED GLOBAL)
 set_target_properties(launcher_platform PROPERTIES
   IMPORTED_LOCATION "${PLATFORM_STATIC_LIB}"
@@ -83,7 +131,7 @@ target_include_directories(host_support PUBLIC "${CMAKE_CURRENT_LIST_DIR}/src")
 add_executable(lynx-launcher
   src/main.cc
 )
-add_dependencies(lynx-launcher platform_staticlib)
+add_dependencies(lynx-launcher rust_workspace)
 target_compile_definitions(lynx-launcher PRIVATE
   USE_WEAK_SUFFIX_NAPI=1
 )
@@ -153,6 +201,7 @@ add_custom_target(runtime_resources ALL
   VERBATIM
 )
 add_dependencies(lynx-launcher runtime_resources)
+add_dependencies(rust_workspace runtime_resources)
 
 if(BUILD_TESTING)
   add_executable(host_support_test
@@ -175,6 +224,18 @@ if(BUILD_TESTING)
     COMMAND "${CMAKE_COMMAND}"
             "-DLAUNCHER=$<TARGET_FILE:lynx-launcher>"
             "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/empty-icu-test"
+            -P "${CMAKE_CURRENT_LIST_DIR}/cmake/test_empty_icu.cmake")
+  set(RUST_RESOURCE_TEST_WORKING_DIRECTORY
+      "${CMAKE_CURRENT_BINARY_DIR}/rust-resource-smoke-working")
+  file(MAKE_DIRECTORY "${RUST_RESOURCE_TEST_WORKING_DIRECTORY}")
+  add_test(NAME rust_launcher_resource_smoke
+           COMMAND "${RUST_HOST_BINARY}" --check-resources)
+  set_tests_properties(rust_launcher_resource_smoke PROPERTIES
+    WORKING_DIRECTORY "${RUST_RESOURCE_TEST_WORKING_DIRECTORY}")
+  add_test(NAME rust_launcher_rejects_empty_icu
+    COMMAND "${CMAKE_COMMAND}"
+            "-DLAUNCHER=${RUST_HOST_BINARY}"
+            "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/rust-empty-icu-test"
             -P "${CMAKE_CURRENT_LIST_DIR}/cmake/test_empty_icu.cmake")
   add_test(NAME runtime_resource_refresh_older_source
     COMMAND "${CMAKE_COMMAND}"

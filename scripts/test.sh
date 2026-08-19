@@ -10,10 +10,16 @@ require_command ctest
 ensure_sdk
 prepare_ui_toolchain
 
-printf 'Checking and testing the Rust platform crate\n'
-cargo fmt --manifest-path "${platform_dir}/Cargo.toml" --all -- --check
-cargo clippy --manifest-path "${platform_dir}/Cargo.toml" --all-targets --all-features --locked -- -D warnings
-cargo test --manifest-path "${platform_dir}/Cargo.toml" --all-targets --all-features --locked
+printf 'Checking and testing the Rust workspace\n'
+(
+  cd -- "${repo_root}"
+  cargo fmt --all -- --check
+  LYNX_SDK_DIR="${verified_sdk_dir}" \
+    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+  LYNX_SDK_DIR="${verified_sdk_dir}" \
+  LD_LIBRARY_PATH="${verified_sdk_dir}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+    cargo test --workspace --all-targets --all-features --locked
+)
 
 printf 'Testing, type-checking, and building the ReactLynx UI\n'
 (
@@ -32,6 +38,7 @@ cmake -S "${host_dir}" -B "${host_build_dir}" \
 cmake --build "${host_build_dir}" --parallel
 ctest --test-dir "${host_build_dir}" --build-config RelWithDebInfo --output-on-failure
 "${host_binary}" --check-resources
+"${rust_host_binary}" --check-resources
 
 case "${LYNX_LAUNCHER_SMOKE:-0}" in
   0|false|no|'')

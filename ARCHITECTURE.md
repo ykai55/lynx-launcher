@@ -21,6 +21,12 @@ host contains embedder and graphics concerns, and Rust owns operating-system
 policy and parsing. `third_party/lynx` is an implementation dependency rather
 than an application layer.
 
+`host-rs/` is currently a side-by-side migration tracer, not another production
+layer. It implements the executable CLI and pure host support behavior, directly
+uses the Rust platform interface for discovery, and verifies that its linked
+`lynx_log_init` symbol resolves to the staged `$ORIGIN/liblynx.so`. It supports
+only `--check-resources`; the C++ binary remains the default windowed host.
+
 ## Layers
 
 ### Rust platform
@@ -49,6 +55,12 @@ into `host/build`, allowing runtime paths to be resolved relative to the
 executable rather than the caller's current directory. Core JS is copied both to
 `resources/lynx_core.js` for the host's explicit path and to `$ORIGIN/lynx_core.js`
 for the engine preloader's default lookup.
+
+`host-rs/src/support.rs` preserves those pure path, file, URI, XSettings, scroll,
+UTF-8, and window-metric semantics as the first migration tracer. `lynx-sys/`
+contains only the verified Lynx logging symbol binding and dynamic-loader path
+probe at this stage. GLFW, rendering, callbacks, weak N-API, task queues, and
+teardown remain exclusively in the C++ host.
 
 ### ReactLynx UI
 
@@ -164,9 +176,10 @@ The build treats every dependency boundary as an explicit lock:
   `lib/`, `include/`, `data/icudtl.dat`, and `lynx_core.js` paths are passed to
   CMake. All extracted entries are compared byte-for-byte with the archive on
   reuse; unverified loose files under `out/Default` are never linked or copied.
-- `rust-toolchain.toml` pins Rust `1.93.0`; `platform/Cargo.lock` is source and is
-  used with locked Cargo commands. The CMake Rust static-library rule depends on
-  both files, so changing the pinned toolchain invalidates that build output.
+- `rust-toolchain.toml` pins Rust `1.93.0`; the root `Cargo.lock` covers
+  `platform`, `lynx-sys`, and `host-rs` and is used with locked workspace
+  commands. Serial CMake Cargo rules build the platform static library before the
+  Rust tracer, avoiding concurrent writers to the shared Cargo target directory.
 - `.nvmrc` pins Node.js `22.14.0`. `ui/package.json` pins pnpm `10.34.5` and every
   direct package version; `ui/pnpm-lock.yaml` locks the full graph. Scripts ask
   Corepack for that exact `packageManager` value and use frozen installs.

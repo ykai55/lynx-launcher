@@ -16,11 +16,12 @@ printf 'Installing locked UI dependencies with %s\n' "${UI_PNPM[*]}"
   "${UI_PNPM[@]}" run build
 )
 
-printf 'Building the C++ host and Rust platform library\n'
+printf 'Building the C++ host and Rust workspace\n'
 cmake -S "${host_dir}" -B "${host_build_dir}" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DBUILD_TESTING=ON \
   -DLYNX_SDK_DIR="${verified_sdk_dir}"
 cmake --build "${host_build_dir}" --parallel
 
-printf 'Build complete: %s\n' "${host_binary}"
+printf 'Build complete: %s (default), %s (resource tracer)\n' \
+  "${host_binary}" "${rust_host_binary}"

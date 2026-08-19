@@ -36,6 +36,8 @@ Rust platform / XDG discovery / icon lookup / process launch
 | `platform/src/ffi.rs` | Rust C ABI implementation、panic containment、opaque handle ownership。 |
 | `platform/include/lynx_launcher.h` | C ABI public contract；必须与 `ffi.rs` 同步。 |
 | `platform/tests/` | discovery、Exec 安全、icon 和 ABI ownership 回归。 |
+| `lynx-sys/` | 最小 Lynx raw binding、native linkage 和后续严格 C shim。 |
+| `host-rs/` | side-by-side Rust host；当前只拥有 CLI、support logic 和无窗口 resource/link check。 |
 | `host/src/main.cc` | Lynx/GLFW host、N-API Promise、线程、输入和 lifecycle。 |
 | `host/src/support.*` | 可独立测试的 path、file、URI、UTF-8 支持逻辑。 |
 | `host/tests/`、`host/cmake/` | native tests、X11 E2E driver、resource refresh checks。 |
@@ -48,8 +50,8 @@ Rust platform / XDG discovery / icon lookup / process launch
 ## 固定工具链
 
 - Linux x86_64 是唯一已 bootstrap 和验证的平台。
-- `rust-toolchain.toml` 固定 Rust `1.93.0`，含 rustfmt 和 Clippy；Cargo 命令使用
-  `platform/Cargo.lock` 与 `--locked`。
+- `rust-toolchain.toml` 固定 Rust `1.93.0`，含 rustfmt 和 Clippy；根 Cargo workspace 使用
+  `Cargo.lock` 与 `--locked`。
 - `.nvmrc` 固定 Node.js `22.14.0`。不要用“兼容的任意 Node”替代 exact pin。
 - `ui/package.json` 固定 `packageManager: pnpm@10.34.5`；通过 Corepack 调用并使用
   `ui/pnpm-lock.yaml` frozen install。不要直接使用系统 `pnpm` 漂移版本。
@@ -155,6 +157,16 @@ CTest；它不能代替 UI 验证。
 - 保持 C++20 和 CMake target dependency；不要从 `third_party/lynx/out/Default` 链接 loose
   SDK files。
 
+## Rust Host Tracer 约束
+
+- `host-rs` 当前是 side-by-side 无窗口 tracer，不是默认 host。`scripts/run.sh`、smoke、E2E
+  和 teardown 继续使用 `host/build/lynx-launcher`，直到独立 parity gate 完成。
+- tracer 必须从 executable 相对位置读取 staged runtime，并核验 `lynx_log_init` 实际来自同目录
+  的 `liblynx.so`；不能用只读资源文件冒充 native linkage 验证。
+- `lynx-sys` 只暴露已核对的窄 binding。五个 C++ float-reference wrapper 属于后续 renderer
+  阶段，必须作为严格 `extern "C"` by-value shim 落在该模块，不能硬编码 C++ reference ABI。
+- Rust host 直接使用 `platform` Rust interface；现有 C ABI 在 C++ host 移除前继续保留并测试。
+
 ## ReactLynx 约束
 
 - 只使用 Lynx elements、events 和 APIs，不引入 browser DOM、`window`、`document` 或 web
@@ -253,7 +265,7 @@ LoadJSSource load js error
 
 - 不提交 `.build-home/`、`.logs/`、`host/build/`、`platform/target/`、`ui/node_modules/`、
   `ui/dist/`、`*.tsbuildinfo`、`quickjs_cache/` 或 submodule `out/Default` 产物。
-- `platform/Cargo.lock`、`ui/pnpm-lock.yaml`、gitlink 和 `patches/lynx/*.patch` 是 source，不是
+- `Cargo.lock`、`ui/pnpm-lock.yaml`、gitlink 和 `patches/lynx/*.patch` 是 source，不是
   cache；有意变更时保留并验证。
 - 未经用户明确授权不得 `git commit`、amend、push 或创建 PR。
 - 不 revert、reset、checkout 或覆盖用户及其他 agent 的无关改动。遇到相关文件并发冲突时

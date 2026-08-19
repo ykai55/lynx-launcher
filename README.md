@@ -60,11 +60,17 @@ UI 不依赖浏览器 DOM；C++ host 拥有 embedder、图形、输入和任务�
 操作系统策略与 `.desktop` 解析。完整边界、数据流和所有权说明见
 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
+迁移中的 `host-rs` 目前只提供 side-by-side `--check-resources` tracer，用于验证 Rust
+CLI、support logic、platform direct interface 和 staged `liblynx.so` linkage；它尚不创建
+窗口，也不替代上图中的 C++ host。
+
 ## 目录
 
 | 路径 | 所有权 |
 | --- | --- |
 | `platform/` | Rust 应用发现、启动、图标解析、稳定 C ABI 及测试。 |
+| `lynx-sys/` | 最小 Lynx raw binding 与 native library path probe。 |
+| `host-rs/` | Rust host 迁移 tracer；当前仅支持无窗口 resource/link check。 |
 | `ui/` | ReactLynx/TypeScript UI，Rspeedy 输出 bundle。 |
 | `host/` | C++20 embedder、GLFW/OpenGL、N-API bridge、CMake 与 native tests。 |
 | `scripts/` | 首选的 bootstrap、构建、测试、运行和图形测试入口。 |
@@ -117,8 +123,9 @@ nvm use
 ./scripts/build.sh
 ```
 
-构建使用 frozen pnpm lockfile 生成 `ui/dist/main.lynx.bundle`，再构建 Rust
-static library 与 C++ host。只会把 verified SDK directory 传给 CMake。
+构建使用 frozen pnpm lockfile 生成 `ui/dist/main.lynx.bundle`，再构建根 Rust workspace
+与 C++ host。workspace 同时产出 platform static library 和 side-by-side Rust tracer；只会
+把 verified SDK directory 传给 CMake/Cargo。
 
 ### 增量构建
 
@@ -151,6 +158,15 @@ older-source/newer-target 回归场景。
 `--lynx-core PATH`、`--icu PATH`、`--run-for SECONDS` 和
 `--exit-after-first-frame`。
 
+迁移 tracer 可单独执行：
+
+```sh
+./host/build/lynx-launcher-rs --check-resources
+```
+
+它会额外确认实际加载的 Lynx symbol 来自 executable 同目录的 staged `liblynx.so`。
+未带 `--check-resources` 时会明确拒绝运行；图形入口仍是 `scripts/run.sh`。
+
 ## 测试
 
 ### 普通测试
@@ -159,9 +175,9 @@ older-source/newer-target 回归场景。
 ./scripts/test.sh
 ```
 
-该入口依次执行 Rust format check、locked Clippy（warnings denied）和全部 Rust
-tests；UI tests、typecheck 和 production build；host build、CTest；最后执行资源与
-ABI 检查。默认路径不需要 display。
+该入口依次执行 Rust workspace format check、locked Clippy（warnings denied）和全部
+Rust tests；UI tests、typecheck 和 production build；host build、CTest；最后执行 C++
+与 Rust 两套资源检查。默认路径不需要 display。
 
 ### 首帧 smoke
 
@@ -238,7 +254,8 @@ LYNX_LAUNCHER_TEARDOWN_TIMEOUT=45s ./scripts/teardown-stress.sh
 | 路径 | 内容 |
 | --- | --- |
 | `ui/dist/main.lynx.bundle` | Rspeedy production bundle。 |
-| `host/build/lynx-launcher` | 可执行文件。 |
+| `host/build/lynx-launcher` | 默认 C++ 可执行文件。 |
+| `host/build/lynx-launcher-rs` | side-by-side Rust resource/link tracer。 |
 | `host/build/liblynx.so` | verified SDK shared library。 |
 | `host/build/lynx_core.js` | engine 默认 `$ORIGIN/lynx_core.js` lookup。 |
 | `host/build/resources/main.lynx.bundle` | host 显式加载的 UI bundle。 |
