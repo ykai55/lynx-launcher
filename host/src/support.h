@@ -26,6 +26,7 @@ std::filesystem::path RequireFile(
 std::vector<uint8_t> ReadFile(const std::filesystem::path& path);
 std::string FileUri(const std::filesystem::path& path);
 std::string Utf8FromCodepoint(uint32_t codepoint);
+double ScrollDeltaLogicalPixels(double offset);
 std::optional<float> XSettingsWindowScale(std::span<const uint8_t> data);
 std::optional<WindowMetrics> CalculateWindowMetrics(
     int window_width, int window_height, int framebuffer_width,

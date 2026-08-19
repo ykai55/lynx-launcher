@@ -1142,11 +1142,11 @@ class Host {
     if (!host) {
       return;
     }
-    constexpr double kPixelsPerScrollStep = 40.0;
     host->SendPointer(
         host->pointer_buttons_ ? kLynxPointerPhaseMove : kLynxPointerPhaseHover,
-        kLynxPointerSignalKindScroll, -x_offset * kPixelsPerScrollStep,
-        -y_offset * kPixelsPerScrollStep);
+        kLynxPointerSignalKindScroll,
+        launcher_host::ScrollDeltaLogicalPixels(x_offset),
+        launcher_host::ScrollDeltaLogicalPixels(y_offset));
   }
 
   void SendKeyEvent(lynx_key_event_type_e type, uint64_t physical,

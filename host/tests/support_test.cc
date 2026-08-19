@@ -51,6 +51,10 @@ int main() {
                    "UTF-16 surrogates are rejected");
   passed &= Expect(launcher_host::Utf8FromCodepoint(0x110000).empty(),
                     "out-of-range Unicode codepoints are rejected");
+  passed &= Expect(launcher_host::ScrollDeltaLogicalPixels(-1.0) == 100.0,
+                   "one wheel step scrolls by 100 logical pixels");
+  passed &= Expect(launcher_host::ScrollDeltaLogicalPixels(-0.5) == 50.0,
+                   "precise fractional wheel offsets remain proportional");
 
   std::vector<uint8_t> xsettings{0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0};
   const std::string scale_name = "Gdk/WindowScalingFactor";

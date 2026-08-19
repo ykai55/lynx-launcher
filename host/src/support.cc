@@ -138,6 +138,8 @@ std::string Utf8FromCodepoint(uint32_t codepoint) {
   return result;
 }
 
+double ScrollDeltaLogicalPixels(double offset) { return -offset * 100.0; }
+
 std::optional<float> XSettingsWindowScale(std::span<const uint8_t> data) {
   if (data.size() < 12 || data[0] > 1) {
     return std::nullopt;
