@@ -21,9 +21,47 @@ iterations="${LYNX_LAUNCHER_RUST_SHELL_ITERATIONS:-1}"
 [[ "${iterations}" =~ ^[1-9][0-9]*$ ]] ||
   die "LYNX_LAUNCHER_RUST_SHELL_ITERATIONS must be a positive integer"
 
-log_root="${repo_root}/.logs/rust-shell-smoke"
+log_root="${repo_root}/.logs/ticket-03/rust-shell-smoke"
 mkdir -p -- "${log_root}"
 run_directory="$(mktemp -d "${log_root}/run.XXXXXX")"
+fixture_root="${run_directory}/fixture"
+data_home="${fixture_root}/data"
+mkdir -p -- \
+  "${data_home}/applications" \
+  "${data_home}/icons/hicolor/64x64/apps" \
+  "${fixture_root}/empty-data"
+printf '%s\n' \
+  '[Desktop Entry]' \
+  'Type=Application' \
+  'Name=Alpha Resolved' \
+  'Icon=lynx-rust-resolved' \
+  'Exec=/bin/true' \
+  >"${data_home}/applications/00-resolved.desktop"
+printf '%s\n' \
+  '[Desktop Entry]' \
+  'Type=Application' \
+  'Name=Bravo Missing' \
+  'Icon=lynx-rust-missing' \
+  'Exec=/bin/true' \
+  >"${data_home}/applications/10-missing.desktop"
+printf '%s\n' \
+  '[Desktop Entry]' \
+  'Type=Application' \
+  'Name=Charlie Third' \
+  'Exec=/bin/true' \
+  >"${data_home}/applications/20-third.desktop"
+printf '%s\n' \
+  '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">' \
+  '  <rect width="64" height="64" fill="#00ff00"/>' \
+  '</svg>' \
+  >"${data_home}/icons/hicolor/64x64/apps/lynx-rust-resolved.svg"
+fixture_environment=(
+  "XDG_DATA_HOME=${data_home}"
+  "XDG_DATA_DIRS=${fixture_root}/empty-data"
+  'XDG_CURRENT_DESKTOP=LYNX_RUST_E2E'
+  'LC_ALL=C'
+  'LYNX_LAUNCHER_E2E_SNAPSHOT_TRACE=1'
+)
 host_pid=""
 host_identity=""
 host_log=""
@@ -117,75 +155,139 @@ wait_for_host_exit() {
 
 assert_clean_host_log() {
   local path="$1" label="$2"
-  if grep -Eq -- 'destroyed thread host|Maybe leaked|post an unknown task|LoadJSSource load js error|\[lynx-error' "${path}"; then
+  if grep -Eq -- 'destroyed thread host|Maybe leaked|post an unknown task|LoadJSSource load js error|\[lynx-error|\[host-rs\] fatal:' "${path}"; then
     dump_log "${path}"
     die "${label} emitted a forbidden lifecycle or Lynx error"
   fi
 }
 
-first_frame_log="${run_directory}/first-frame.log"
-if ! timeout --foreground 10s "${rust_host_binary}" --exit-after-first-frame \
-  >"${first_frame_log}" 2>&1; then
-  dump_log "${first_frame_log}"
-  die "Rust shell first-frame process failed"
-fi
-assert_clean_host_log "${first_frame_log}" "Rust shell first-frame process"
-grep -Fq -- '[host-rs] first shell GL frame presented' "${first_frame_log}" || {
-  dump_log "${first_frame_log}"
-  die "Rust shell first-frame marker was not emitted"
+assert_snapshot_trace() {
+  local path="$1" label="$2" count
+  local -a expected=(
+    '[host-rs] snapshot index=0 id=00-resolved.desktop name=Alpha Resolved icon=present'
+    '[host-rs] snapshot index=1 id=10-missing.desktop name=Bravo Missing icon=missing'
+    '[host-rs] snapshot index=2 id=20-third.desktop name=Charlie Third icon=missing'
+  )
+  count="$(grep -Fc -- '[host-rs] snapshot index=' "${path}" || true)"
+  if [[ "${count}" != 3 ]]; then
+    dump_log "${path}"
+    die "${label} did not emit exactly three snapshot entries"
+  fi
+  for entry in "${expected[@]}"; do
+    if ! grep -Fxq -- "${entry}" "${path}"; then
+      dump_log "${path}"
+      die "${label} emitted an unexpected application snapshot"
+    fi
+  done
 }
-grep -Fq -- '[host-rs] auto-exit after first shell frame' "${first_frame_log}" || {
-  dump_log "${first_frame_log}"
-  die "Rust shell did not auto-exit after its first frame"
-}
-grep -Fq -- '[host-rs] runtime core initialized' "${first_frame_log}" || {
-  dump_log "${first_frame_log}"
-  die "Rust shell first-frame process did not initialize the runtime core"
-}
-grep -Fq -- '[host-rs] runtime core shutdown complete' "${first_frame_log}" || {
-  dump_log "${first_frame_log}"
-  die "Rust shell first-frame process did not release the runtime core"
+
+assert_success_log() {
+  local path="$1" label="$2"
+  assert_clean_host_log "${path}" "${label}"
+  for marker in \
+    '[host-rs] first shell GL frame presented' \
+    '[host-rs] first screen layout completed' \
+    '[host-rs] first GL frame presented' \
+    '[host-rs] Launcher.getApplications resolved 3 applications' \
+    '[host-rs] runtime core initialized' \
+    '[host-rs] runtime core shutdown complete'; do
+    if ! grep -Fq -- "${marker}" "${path}"; then
+      dump_log "${path}"
+      die "${label} did not emit ${marker}"
+    fi
+  done
+  assert_snapshot_trace "${path}" "${label}"
 }
 
 for ((iteration = 1; iteration <= iterations; iteration += 1)); do
+  first_frame_log="${run_directory}/first-frame-${iteration}.log"
+  if ! timeout --foreground 10s env "${fixture_environment[@]}" \
+    "${rust_host_binary}" --exit-after-first-frame \
+    >"${first_frame_log}" 2>&1; then
+    dump_log "${first_frame_log}"
+    die "Rust first-frame iteration ${iteration} failed"
+  fi
+  assert_success_log "${first_frame_log}" "Rust first-frame iteration ${iteration}"
+  grep -Fq -- '[host-rs] auto-exit after first rendered frame' "${first_frame_log}" || {
+    dump_log "${first_frame_log}"
+    die "Rust first-frame iteration ${iteration} did not wait for layout and present"
+  }
+
   host_log="${run_directory}/bounded-${iteration}.log"
-  setsid "${rust_host_binary}" --run-for 12 >"${host_log}" 2>&1 &
+  setsid env "${fixture_environment[@]}" \
+    "${rust_host_binary}" --run-for 12 >"${host_log}" 2>&1 &
   host_pid=$!
   host_identity="$(capture_host_identity)" ||
     die "could not capture the Rust shell process identity"
   [[ "${host_identity}" == "${expected_host}:${host_pid}:"* ]] ||
     die "Rust shell did not create the expected process group"
 
-  if ! wait_for_log '[host-rs] first shell GL frame presented'; then
+  if ! wait_for_log '[host-rs] first shell GL frame presented' ||
+    ! wait_for_log '[host-rs] first screen layout completed' ||
+    ! wait_for_log '[host-rs] first GL frame presented' ||
+    ! wait_for_log '[host-rs] Launcher.getApplications resolved 3 applications' ||
+    ! wait_for_log '[host-rs] snapshot index=2 id=20-third.desktop name=Charlie Third icon=missing'; then
     dump_log "${host_log}"
-    die "Rust shell iteration ${iteration} did not present its shell frame"
+    die "Rust shell iteration ${iteration} did not render the real launcher"
   fi
 
   "${click_driver}" --pid "${host_pid}" expect-popup
   "${click_driver}" --pid "${host_pid}" expect-pixel \
-    --x 100 --y 100 --width 64 --height 64 \
-    --red 9 --green 10 --blue 11 --tolerance 4 \
-    --minimum-matches 4000 --timeout-ms 3000
+    --x 40 --y 265 --width 76 --height 76 \
+    --red 0 --green 255 --blue 0 --tolerance 8 \
+    --minimum-matches 512 --timeout-ms 3000
+  "${click_driver}" --pid "${host_pid}" expect-pixel \
+    --x 550 --y 250 --width 100 --height 120 \
+    --red 232 --green 189 --blue 108 --tolerance 8 \
+    --minimum-matches 800 --timeout-ms 3000
   "${click_driver}" --pid "${host_pid}" defocus
 
   if ! wait_for_host_exit; then
     dump_log "${host_log}"
     die "Rust shell iteration ${iteration} did not exit cleanly after focus loss"
   fi
-  assert_clean_host_log "${host_log}" "Rust shell iteration ${iteration}"
+  assert_success_log "${host_log}" "Rust bounded iteration ${iteration}"
   grep -Fq -- '[host-rs] window lost focus; exiting' "${host_log}" || {
     dump_log "${host_log}"
     die "Rust shell iteration ${iteration} did not handle focus loss"
   }
-  grep -Fq -- '[host-rs] runtime core initialized' "${host_log}" || {
-    dump_log "${host_log}"
-    die "Rust shell iteration ${iteration} did not initialize the runtime core"
-  }
-  grep -Fq -- '[host-rs] runtime core shutdown complete' "${host_log}" || {
-    dump_log "${host_log}"
-    die "Rust shell iteration ${iteration} did not release the runtime core"
-  }
-  printf 'Rust shell smoke iteration %s/%s passed.\n' "${iteration}" "${iterations}"
+  printf 'Rust first-frame and bounded iteration %s/%s passed.\n' \
+    "${iteration}" "${iterations}"
 done
+
+host_log="${run_directory}/native-rejection.log"
+setsid env "${fixture_environment[@]}" \
+  LYNX_LAUNCHER_E2E_FORCE_APPLICATIONS_ERROR=1 \
+  "${rust_host_binary}" --run-for 12 >"${host_log}" 2>&1 &
+host_pid=$!
+host_identity="$(capture_host_identity)" ||
+  die "could not capture the Rust rejection process identity"
+if ! wait_for_log \
+  '[host-rs] Launcher.getApplications rejected: injected native application snapshot failure' ||
+  ! wait_for_log '[host-rs] first screen layout completed' ||
+  ! wait_for_log '[host-rs] first GL frame presented'; then
+  dump_log "${host_log}"
+  die "Rust rejection process did not render the native error state"
+fi
+"${click_driver}" --pid "${host_pid}" expect-popup
+"${click_driver}" --pid "${host_pid}" expect-pixel \
+  --x 510 --y 300 --width 100 --height 120 \
+  --red 255 --green 107 --blue 61 --tolerance 8 \
+  --minimum-matches 800 --timeout-ms 3000
+"${click_driver}" --pid "${host_pid}" defocus
+if ! wait_for_host_exit; then
+  dump_log "${host_log}"
+  die "Rust rejection process did not exit cleanly"
+fi
+assert_clean_host_log "${host_log}" "Rust rejection process"
+grep -Fq -- '[host-rs] runtime core shutdown complete' "${host_log}" || {
+  dump_log "${host_log}"
+  die "Rust rejection process did not shut down cleanly"
+}
+if grep -Fq -- '[host-rs] Launcher.getApplications resolved ' "${host_log}"; then
+  dump_log "${host_log}"
+  die "Rust rejection process unexpectedly resolved the application Promise"
+fi
+printf 'Rust native Promise rejection smoke passed.\n'
 
 printf 'Rust shell smoke passed. Logs: %s\n' "${run_directory}"

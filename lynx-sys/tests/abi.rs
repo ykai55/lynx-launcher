@@ -2,11 +2,13 @@ use std::ffi::{c_char, c_int, c_void};
 use std::mem::{align_of, offset_of, size_of};
 
 use lynx_sys::{
-    LynxGlClearCurrentCallback, LynxGlCreateFboCallback, LynxGlMakeCurrentCallback,
-    LynxGlPresentCallback, LynxGlProcResolverCallback, LynxLogCallback, LynxRendererFinalizer,
-    LynxRendererPostTaskCallback, LynxTask, LynxUiPostTaskCallback,
-    LynxUiRunsOnCurrentThreadCallback, LynxUiTaskRunnerConfig, LYNX_LOG_INFO,
-    LYNX_RENDERER_TYPE_GL_DIRECT,
+    LynxDataDestructor, LynxFetchResourceCallback, LynxGlClearCurrentCallback,
+    LynxGlCreateFboCallback, LynxGlMakeCurrentCallback, LynxGlPresentCallback,
+    LynxGlProcResolverCallback, LynxLogCallback, LynxRendererFinalizer,
+    LynxRendererPostTaskCallback, LynxResourceFetcherFinalizer, LynxTask, LynxUiPostTaskCallback,
+    LynxUiRunsOnCurrentThreadCallback, LynxUiTaskRunnerConfig, LynxViewClientCallback,
+    LynxViewClientErrorCallback, NapiCallback, NapiModuleCreator, LYNX_LOG_INFO,
+    LYNX_RENDERER_TYPE_GL_DIRECT, LYNX_RESOURCE_TYPE_LYNX_CORE_JS, NAPI_AUTO_LENGTH, NAPI_OK,
 };
 
 #[test]
@@ -50,6 +52,30 @@ fn callbacks_and_constants_match_the_verified_sdk() {
     >;
     let _: LynxRendererPostTaskCallback =
         None::<unsafe extern "C" fn(*mut lynx_sys::LynxWindowlessRenderer, LynxTask, u64)>;
+    let _: LynxResourceFetcherFinalizer =
+        None::<unsafe extern "C" fn(*mut lynx_sys::LynxGenericResourceFetcher, *mut c_void)>;
+    let _: LynxFetchResourceCallback = None::<
+        unsafe extern "C" fn(
+            *mut lynx_sys::LynxGenericResourceFetcher,
+            *mut lynx_sys::LynxResourceRequest,
+            *mut lynx_sys::LynxResourceResponse,
+        ),
+    >;
+    let _: LynxDataDestructor = None::<unsafe extern "C" fn(*mut u8, usize, *mut c_void)>;
+    let _: LynxViewClientCallback = None::<unsafe extern "C" fn(*mut lynx_sys::LynxViewClient)>;
+    let _: LynxViewClientErrorCallback =
+        None::<unsafe extern "C" fn(*mut lynx_sys::LynxViewClient, c_int, *const c_char)>;
+    let _: NapiCallback = None::<
+        unsafe extern "C" fn(lynx_sys::NapiEnv, lynx_sys::NapiCallbackInfo) -> lynx_sys::NapiValue,
+    >;
+    let _: NapiModuleCreator = None::<
+        unsafe extern "C" fn(
+            lynx_sys::NapiEnv,
+            lynx_sys::NapiValue,
+            *const c_char,
+            *mut c_void,
+        ) -> lynx_sys::NapiValue,
+    >;
 
     for callback_size in [
         size_of::<LynxLogCallback>(),
@@ -62,12 +88,22 @@ fn callbacks_and_constants_match_the_verified_sdk() {
         size_of::<LynxGlCreateFboCallback>(),
         size_of::<LynxGlProcResolverCallback>(),
         size_of::<LynxRendererPostTaskCallback>(),
+        size_of::<LynxResourceFetcherFinalizer>(),
+        size_of::<LynxFetchResourceCallback>(),
+        size_of::<LynxDataDestructor>(),
+        size_of::<LynxViewClientCallback>(),
+        size_of::<LynxViewClientErrorCallback>(),
+        size_of::<NapiCallback>(),
+        size_of::<NapiModuleCreator>(),
     ] {
         assert_eq!(callback_size, size_of::<*mut c_void>());
     }
     assert_eq!(size_of::<c_int>(), 4);
     assert_eq!(LYNX_LOG_INFO, 2);
     assert_eq!(LYNX_RENDERER_TYPE_GL_DIRECT, 2);
+    assert_eq!(LYNX_RESOURCE_TYPE_LYNX_CORE_JS, 7);
+    assert_eq!(NAPI_OK, 0);
+    assert_eq!(NAPI_AUTO_LENGTH, usize::MAX);
 }
 
 #[test]
@@ -101,6 +137,114 @@ fn runtime_function_declarations_match_the_reviewed_signatures() {
     let _: unsafe extern "C" fn(*mut LynxWindowlessRenderer, LynxTask) =
         lynx_windowless_renderer_run_task;
     let _: unsafe extern "C" fn(*mut LynxWindowlessRenderer) = lynx_windowless_renderer_release;
+
+    let _: unsafe extern "C" fn(
+        *mut c_void,
+        LynxResourceFetcherFinalizer,
+    ) -> *mut LynxGenericResourceFetcher = lynx_generic_resource_fetcher_create_with_finalizer;
+    let _: unsafe extern "C" fn(*mut LynxGenericResourceFetcher) -> *mut c_void =
+        lynx_generic_resource_fetcher_get_user_data;
+    let _: unsafe extern "C" fn(*mut LynxGenericResourceFetcher, LynxFetchResourceCallback) =
+        lynx_generic_resource_fetcher_bind_fetch_resource;
+    let _: unsafe extern "C" fn(*mut LynxGenericResourceFetcher, LynxFetchResourceCallback) =
+        lynx_generic_resource_fetcher_bind_fetch_resource_path;
+    let _: unsafe extern "C" fn(*mut LynxGenericResourceFetcher) =
+        lynx_generic_resource_fetcher_release;
+    let _: unsafe extern "C" fn(*mut LynxResourceRequest) -> c_int = lynx_resource_request_get_type;
+    let _: unsafe extern "C" fn(*mut LynxResourceRequest) -> *const c_char =
+        lynx_resource_request_get_url;
+    let _: unsafe extern "C" fn(*mut LynxResourceRequest) = lynx_resource_request_release;
+    let _: unsafe extern "C" fn(*mut LynxResourceResponse, c_int) = lynx_resource_response_set_code;
+    let _: unsafe extern "C" fn(*mut LynxResourceResponse, *const c_char) =
+        lynx_resource_response_set_error_message;
+    let _: unsafe extern "C" fn(
+        *mut LynxResourceResponse,
+        *mut u8,
+        usize,
+        LynxDataDestructor,
+        *mut c_void,
+    ) = lynx_resource_response_set_data;
+    let _: unsafe extern "C" fn(*mut LynxResourceResponse) = lynx_resource_response_callback;
+    let _: unsafe extern "C" fn(*mut LynxResourceResponse) = lynx_resource_response_release;
+
+    let _: unsafe extern "C" fn() -> *mut LynxViewBuilder = lynx_view_builder_create;
+    let _: unsafe extern "C" fn(*mut LynxViewBuilder, bool) =
+        lynx_view_builder_set_enable_js_runtime;
+    let _: unsafe extern "C" fn(*mut LynxViewBuilder, *const c_char) =
+        lynx_view_builder_set_icu_data_path;
+    let _: unsafe extern "C" fn(*mut LynxViewBuilder, *mut LynxWindowlessRenderer) =
+        lynx_view_builder_set_windowless_renderer;
+    let _: unsafe extern "C" fn(*mut LynxViewBuilder, *mut LynxGenericResourceFetcher) =
+        lynx_view_builder_set_generic_resource_fetcher;
+    let _: unsafe extern "C" fn(
+        *mut LynxViewBuilder,
+        *const c_char,
+        NapiModuleCreator,
+        *mut c_void,
+    ) = lynx_view_builder_register_native_module;
+    let _: unsafe extern "C" fn(*mut LynxViewBuilder) = lynx_view_builder_release;
+    let _: unsafe extern "C" fn(*mut LynxViewBuilder, *mut c_void) -> *mut LynxView =
+        lynx_view_create;
+    let _: unsafe extern "C" fn(*mut LynxView, *mut LynxViewClient) = lynx_view_add_client;
+    let _: unsafe extern "C" fn(*mut LynxView) = lynx_view_enter_foreground;
+    let _: unsafe extern "C" fn(*mut LynxView) = lynx_view_enter_background;
+    let _: unsafe extern "C" fn(*mut LynxView, *mut LynxLoadMeta) = lynx_view_load_template;
+    let _: unsafe extern "C" fn(*mut LynxView) = lynx_view_release;
+    let _: unsafe extern "C" fn(*mut c_void) -> *mut LynxViewClient = lynx_view_client_create;
+    let _: unsafe extern "C" fn(*mut LynxViewClient) -> *mut c_void =
+        lynx_view_client_get_user_data;
+    let _: unsafe extern "C" fn(*mut LynxViewClient, LynxViewClientCallback) =
+        lynx_view_client_bind_on_first_screen;
+    let _: unsafe extern "C" fn(*mut LynxViewClient, LynxViewClientErrorCallback) =
+        lynx_view_client_bind_on_received_error;
+    let _: unsafe extern "C" fn(*mut LynxViewClient) = lynx_view_client_release;
+    let _: unsafe extern "C" fn() -> *mut LynxLoadMeta = lynx_load_meta_create;
+    let _: unsafe extern "C" fn(*mut LynxLoadMeta, *const c_char) = lynx_load_meta_set_url;
+    let _: unsafe extern "C" fn(
+        *mut LynxLoadMeta,
+        *mut u8,
+        usize,
+        LynxDataDestructor,
+        *mut c_void,
+    ) = lynx_load_meta_set_binary_data;
+    let _: unsafe extern "C" fn(*mut LynxLoadMeta) = lynx_load_meta_release;
+
+    let _: unsafe extern "C" fn(NapiEnv, *mut NapiValue) -> c_int = napi_get_undefined_weak;
+    let _: unsafe extern "C" fn(NapiEnv, *mut NapiValue) -> c_int = napi_create_object_weak;
+    let _: unsafe extern "C" fn(NapiEnv, usize, *mut NapiValue) -> c_int =
+        napi_create_array_with_length_weak;
+    let _: unsafe extern "C" fn(NapiEnv, *const c_char, usize, *mut NapiValue) -> c_int =
+        napi_create_string_utf8_weak;
+    let _: unsafe extern "C" fn(
+        NapiEnv,
+        *const c_char,
+        usize,
+        NapiCallback,
+        *mut c_void,
+        *mut NapiValue,
+    ) -> c_int = napi_create_function_weak;
+    let _: unsafe extern "C" fn(NapiEnv, NapiValue, NapiValue, *mut NapiValue) -> c_int =
+        napi_create_error_weak;
+    let _: unsafe extern "C" fn(NapiEnv, NapiValue, *const c_char, NapiValue) -> c_int =
+        napi_set_named_property_weak;
+    let _: unsafe extern "C" fn(NapiEnv, NapiValue, u32, NapiValue) -> c_int =
+        napi_set_element_weak;
+    let _: unsafe extern "C" fn(
+        NapiEnv,
+        NapiCallbackInfo,
+        *mut usize,
+        *mut NapiValue,
+        *mut NapiValue,
+        *mut *mut c_void,
+    ) -> c_int = napi_get_cb_info_weak;
+    let _: unsafe extern "C" fn(NapiEnv, *const c_char, *const c_char) -> c_int =
+        napi_throw_error_weak;
+    let _: unsafe extern "C" fn(NapiEnv, *mut NapiDeferred, *mut NapiValue) -> c_int =
+        napi_create_promise_weak;
+    let _: unsafe extern "C" fn(NapiEnv, NapiDeferred, NapiValue) -> c_int =
+        napi_resolve_deferred_weak;
+    let _: unsafe extern "C" fn(NapiEnv, NapiDeferred, NapiValue) -> c_int =
+        napi_reject_deferred_weak;
 }
 
 #[cfg(lynx_sys_cmake_link)]
@@ -133,6 +277,54 @@ fn declarations_link_against_the_shim_and_verified_sdk() {
         lynx_windowless_renderer_bind_on_post_task as *const (),
         lynx_windowless_renderer_run_task as *const (),
         lynx_windowless_renderer_release as *const (),
+        lynx_generic_resource_fetcher_create_with_finalizer as *const (),
+        lynx_generic_resource_fetcher_get_user_data as *const (),
+        lynx_generic_resource_fetcher_bind_fetch_resource as *const (),
+        lynx_generic_resource_fetcher_bind_fetch_resource_path as *const (),
+        lynx_generic_resource_fetcher_release as *const (),
+        lynx_resource_request_get_type as *const (),
+        lynx_resource_request_get_url as *const (),
+        lynx_resource_request_release as *const (),
+        lynx_resource_response_set_code as *const (),
+        lynx_resource_response_set_error_message as *const (),
+        lynx_resource_response_set_data as *const (),
+        lynx_resource_response_callback as *const (),
+        lynx_resource_response_release as *const (),
+        lynx_view_builder_create as *const (),
+        lynx_view_builder_set_enable_js_runtime as *const (),
+        lynx_view_builder_set_icu_data_path as *const (),
+        lynx_view_builder_set_windowless_renderer as *const (),
+        lynx_view_builder_set_generic_resource_fetcher as *const (),
+        lynx_view_builder_register_native_module as *const (),
+        lynx_view_builder_release as *const (),
+        lynx_view_create as *const (),
+        lynx_view_add_client as *const (),
+        lynx_view_enter_foreground as *const (),
+        lynx_view_enter_background as *const (),
+        lynx_view_load_template as *const (),
+        lynx_view_release as *const (),
+        lynx_view_client_create as *const (),
+        lynx_view_client_get_user_data as *const (),
+        lynx_view_client_bind_on_first_screen as *const (),
+        lynx_view_client_bind_on_received_error as *const (),
+        lynx_view_client_release as *const (),
+        lynx_load_meta_create as *const (),
+        lynx_load_meta_set_url as *const (),
+        lynx_load_meta_set_binary_data as *const (),
+        lynx_load_meta_release as *const (),
+        napi_get_undefined_weak as *const (),
+        napi_create_object_weak as *const (),
+        napi_create_array_with_length_weak as *const (),
+        napi_create_string_utf8_weak as *const (),
+        napi_create_function_weak as *const (),
+        napi_create_error_weak as *const (),
+        napi_set_named_property_weak as *const (),
+        napi_set_element_weak as *const (),
+        napi_get_cb_info_weak as *const (),
+        napi_throw_error_weak as *const (),
+        napi_create_promise_weak as *const (),
+        napi_resolve_deferred_weak as *const (),
+        napi_reject_deferred_weak as *const (),
         lynx_sys_view_builder_set_screen_size as *const (),
         lynx_sys_view_builder_set_frame as *const (),
         lynx_sys_view_builder_set_font_scale as *const (),

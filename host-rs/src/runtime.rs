@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::ffi::{c_char, c_int, c_long, c_void, CStr};
+use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString, OsStr};
 use std::io;
 use std::marker::PhantomData;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,12 +12,19 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use lynx_sys::{
-    LynxTask, LynxUiTaskRunnerConfig, LynxWindowlessRenderer, LYNX_LOG_INFO,
-    LYNX_RENDERER_TYPE_GL_DIRECT,
+    LynxGenericResourceFetcher, LynxLoadMeta, LynxResourceRequest, LynxResourceResponse, LynxTask,
+    LynxUiTaskRunnerConfig, LynxView, LynxViewClient, LynxWindowlessRenderer, NapiCallbackInfo,
+    NapiDeferred, NapiEnv, NapiValue, LYNX_LOG_INFO, LYNX_RENDERER_TYPE_GL_DIRECT,
+    LYNX_RESOURCE_TYPE_LYNX_CORE_JS, NAPI_AUTO_LENGTH, NAPI_OK,
 };
+
+use crate::support::{file_uri, read_file};
+use lynx_launcher_platform::Launcher;
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 const CLOCK_MONOTONIC: c_int = 1;
+const FETCHER_FINALIZER_TIMEOUT: Duration = Duration::from_secs(5);
+const INJECTED_APPLICATION_ERROR: &str = "injected native application snapshot failure";
 
 #[repr(C)]
 struct Timespec {
@@ -81,6 +90,165 @@ impl GlApi {
             get_proc_address,
         }
     }
+}
+
+pub struct RuntimeViewOptions {
+    pub bundle: PathBuf,
+    pub lynx_core: PathBuf,
+    pub icu: PathBuf,
+    pub logical_width: f32,
+    pub logical_height: f32,
+    pub pixel_ratio: f32,
+}
+
+struct ApplicationSnapshot {
+    id: String,
+    name: String,
+    icon_uri: Option<String>,
+}
+
+#[derive(Default)]
+struct FetcherFinalization {
+    finalized: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl FetcherFinalization {
+    fn signal(&self) {
+        let mut finalized = self
+            .finalized
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *finalized = true;
+        self.changed.notify_all();
+    }
+
+    fn wait(&self, timeout: Duration) -> bool {
+        let Ok(finalized) = self.finalized.lock() else {
+            return false;
+        };
+        if *finalized {
+            return true;
+        }
+        let Ok((finalized, _)) = self
+            .changed
+            .wait_timeout_while(finalized, timeout, |finalized| !*finalized)
+        else {
+            return false;
+        };
+        *finalized
+    }
+}
+
+struct ViewState {
+    core_source: Vec<u8>,
+    bundle_source: Vec<u8>,
+    bundle_url: CString,
+    icu_path: CString,
+    applications: Result<Vec<ApplicationSnapshot>, String>,
+    wake: EventWake,
+    first_screen: AtomicBool,
+    received_error: AtomicBool,
+    callback_failed: AtomicBool,
+    fetcher_finalization: FetcherFinalization,
+    native_callbacks_not_quiesced: AtomicBool,
+    snapshot_trace: bool,
+    injected_application_error: bool,
+}
+
+impl ViewState {
+    fn load(options: &RuntimeViewOptions, wake: EventWake) -> io::Result<Self> {
+        for (label, value) in [
+            ("logical width", options.logical_width),
+            ("logical height", options.logical_height),
+            ("pixel ratio", options.pixel_ratio),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(io::Error::other(format!(
+                    "Lynx view {label} must be positive and finite"
+                )));
+            }
+        }
+
+        let core_source = read_file(&options.lynx_core)?;
+        let bundle_source = read_file(&options.bundle)?;
+        let bundle_url = CString::new(file_uri(&options.bundle)?).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bundle file URI unexpectedly contained NUL",
+            )
+        })?;
+        let icu_path = CString::new(options.icu.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ICU data path contains a NUL byte",
+            )
+        })?;
+
+        let injected_application_error =
+            std::env::var_os("LYNX_LAUNCHER_E2E_FORCE_APPLICATIONS_ERROR").as_deref()
+                == Some(OsStr::new("1"));
+        let snapshot_trace = std::env::var_os("LYNX_LAUNCHER_E2E_SNAPSHOT_TRACE").as_deref()
+            == Some(OsStr::new("1"));
+        let applications = if injected_application_error {
+            Err(INJECTED_APPLICATION_ERROR.to_owned())
+        } else {
+            (|| -> Result<Vec<ApplicationSnapshot>, String> {
+                let launcher = Launcher::discover()
+                    .map_err(|error| format!("could not discover applications: {error}"))?;
+                let mut applications = Vec::with_capacity(launcher.applications().len());
+                for application in launcher.applications() {
+                    let icon_uri = launcher
+                        .resolve_icon(application.id(), 64)
+                        .map_err(|error| {
+                            format!("could not resolve icon for {}: {error}", application.id())
+                        })?
+                        .map(|path| file_uri(&path).map_err(|error| error.to_string()))
+                        .transpose()?;
+                    applications.push(ApplicationSnapshot {
+                        id: application.id().to_owned(),
+                        name: application.name().to_owned(),
+                        icon_uri,
+                    });
+                }
+                Ok(applications)
+            })()
+        };
+
+        Ok(Self {
+            core_source,
+            bundle_source,
+            bundle_url,
+            icu_path,
+            applications,
+            wake,
+            first_screen: AtomicBool::new(false),
+            received_error: AtomicBool::new(false),
+            callback_failed: AtomicBool::new(false),
+            fetcher_finalization: FetcherFinalization::default(),
+            native_callbacks_not_quiesced: AtomicBool::new(false),
+            snapshot_trace,
+            injected_application_error,
+        })
+    }
+
+    fn record_callback_failure(&self) {
+        self.callback_failed.store(true, Ordering::Release);
+        let _ = self.wake.wake();
+    }
+
+    fn wait_for_fetcher_finalizer(&self, timeout: Duration) -> bool {
+        let finalized = self.fetcher_finalization.wait(timeout);
+        if !finalized {
+            self.native_callbacks_not_quiesced
+                .store(true, Ordering::Release);
+        }
+        finalized
+    }
+}
+
+fn is_packaged_core_request(resource_type: c_int) -> bool {
+    resource_type == LYNX_RESOURCE_TYPE_LYNX_CORE_JS
 }
 
 struct ScheduledQueue<T> {
@@ -498,6 +666,7 @@ struct RendererState {
     callback_failed: AtomicBool,
     gl_context_stranded: AtomicBool,
     finalized: AtomicBool,
+    first_present: AtomicBool,
 }
 
 struct RendererCallbackLifecycle {
@@ -541,6 +710,7 @@ impl RendererState {
             callback_failed: AtomicBool::new(false),
             gl_context_stranded: AtomicBool::new(false),
             finalized: AtomicBool::new(false),
+            first_present: AtomicBool::new(false),
         }
     }
 
@@ -611,6 +781,10 @@ impl RendererState {
             return false;
         }
         unsafe { (self.gl.swap_buffers)(window) };
+        if !self.first_present.swap(true, Ordering::AcqRel) {
+            eprintln!("[host-rs] first GL frame presented");
+            let _ = self.wake.wake();
+        }
         true
     }
 
@@ -885,8 +1059,12 @@ fn finish_failed_initialization(
 }
 
 pub struct RuntimeCore {
+    view: Option<NonNull<LynxView>>,
+    view_client: Option<NonNull<LynxViewClient>>,
+    fetcher: Option<NonNull<LynxGenericResourceFetcher>>,
     renderer: Option<NonNull<LynxWindowlessRenderer>>,
     renderer_state: Arc<RendererState>,
+    view_state: Arc<ViewState>,
     ui_runner: &'static GlobalUiRunnerState,
     ui_activation: Option<UiActivation>,
     _thread_bound: PhantomData<Rc<()>>,
@@ -897,12 +1075,18 @@ impl RuntimeCore {
     ///
     /// `window`, every function in `gl`, and the optional `wake` userdata must
     /// remain valid for callbacks from any Lynx thread until `shutdown` returns.
-    pub unsafe fn initialize(window: *mut c_void, gl: GlApi, wake: EventWake) -> io::Result<Self> {
+    pub unsafe fn initialize(
+        window: *mut c_void,
+        gl: GlApi,
+        wake: EventWake,
+        view_options: &RuntimeViewOptions,
+    ) -> io::Result<Self> {
         if window.is_null() {
             return Err(io::Error::other(
                 "cannot initialize the Lynx renderer without a GLFW window",
             ));
         }
+        let view_state = Arc::new(ViewState::load(view_options, wake)?);
         let ui_runner = configure_global_ui_runner()?;
         let ui_activation = activate_runtime_generation(ui_runner, wake)?;
 
@@ -960,12 +1144,146 @@ impl RuntimeCore {
         }
 
         Ok(Self {
+            view: None,
+            view_client: None,
+            fetcher: None,
             renderer: Some(renderer),
             renderer_state,
+            view_state,
             ui_runner,
             ui_activation: Some(ui_activation),
             _thread_bound: PhantomData,
         })
+    }
+
+    pub fn initialize_view(&mut self, options: &RuntimeViewOptions) -> io::Result<()> {
+        let fetcher_state = Arc::into_raw(Arc::clone(&self.view_state));
+        // SAFETY: The fetcher owns this Arc reference until its finalizer runs.
+        let fetcher = unsafe {
+            lynx_sys::lynx_generic_resource_fetcher_create_with_finalizer(
+                fetcher_state.cast_mut().cast(),
+                Some(resource_fetcher_finalizer_callback),
+            )
+        };
+        let Some(fetcher) = NonNull::new(fetcher) else {
+            // SAFETY: Fetcher creation failed, so ownership was not transferred.
+            unsafe { drop(Arc::from_raw(fetcher_state)) };
+            return Err(io::Error::other("could not create Lynx resource fetcher"));
+        };
+        self.fetcher = Some(fetcher);
+        // SAFETY: The live fetcher retains its stable ViewState userdata.
+        unsafe {
+            lynx_sys::lynx_generic_resource_fetcher_bind_fetch_resource(
+                fetcher.as_ptr(),
+                Some(fetch_resource_callback),
+            );
+            lynx_sys::lynx_generic_resource_fetcher_bind_fetch_resource_path(
+                fetcher.as_ptr(),
+                Some(fetch_resource_callback),
+            );
+        }
+
+        let state_pointer = Arc::as_ptr(&self.view_state).cast_mut().cast();
+        let renderer = self
+            .renderer
+            .ok_or_else(|| io::Error::other("Lynx renderer is not available"))?;
+        // SAFETY: The builder is released after the synchronous view creation call.
+        let builder = unsafe { lynx_sys::lynx_view_builder_create() };
+        let Some(builder) = NonNull::new(builder) else {
+            return Err(io::Error::other("could not create Lynx view builder"));
+        };
+        // SAFETY: All pointers remain valid through view creation. The SDK copies
+        // builder configuration before the builder is released.
+        let view = unsafe {
+            lynx_sys::lynx_sys_view_builder_set_screen_size(
+                builder.as_ptr(),
+                options.logical_width,
+                options.logical_height,
+                options.pixel_ratio,
+            );
+            lynx_sys::lynx_sys_view_builder_set_frame(
+                builder.as_ptr(),
+                0.0,
+                0.0,
+                options.logical_width,
+                options.logical_height,
+            );
+            lynx_sys::lynx_sys_view_builder_set_font_scale(builder.as_ptr(), 1.0);
+            lynx_sys::lynx_view_builder_set_enable_js_runtime(builder.as_ptr(), true);
+            lynx_sys::lynx_view_builder_set_icu_data_path(
+                builder.as_ptr(),
+                self.view_state.icu_path.as_ptr(),
+            );
+            lynx_sys::lynx_view_builder_set_windowless_renderer(
+                builder.as_ptr(),
+                renderer.as_ptr(),
+            );
+            lynx_sys::lynx_view_builder_set_generic_resource_fetcher(
+                builder.as_ptr(),
+                fetcher.as_ptr(),
+            );
+            lynx_sys::lynx_view_builder_register_native_module(
+                builder.as_ptr(),
+                c"Launcher".as_ptr(),
+                Some(launcher_module_creator),
+                state_pointer,
+            );
+            let view = lynx_sys::lynx_view_create(builder.as_ptr(), state_pointer);
+            lynx_sys::lynx_view_builder_release(builder.as_ptr());
+            view
+        };
+        let Some(view) = NonNull::new(view) else {
+            return Err(io::Error::other("could not create Lynx view"));
+        };
+        self.view = Some(view);
+
+        // SAFETY: ViewState outlives the client and all client callbacks.
+        let client = unsafe { lynx_sys::lynx_view_client_create(state_pointer) };
+        let Some(client) = NonNull::new(client) else {
+            return Err(io::Error::other("could not create Lynx view client"));
+        };
+        self.view_client = Some(client);
+        // SAFETY: The view and client are live and owned by RuntimeCore.
+        unsafe {
+            lynx_sys::lynx_view_client_bind_on_first_screen(
+                client.as_ptr(),
+                Some(first_screen_callback),
+            );
+            lynx_sys::lynx_view_client_bind_on_received_error(
+                client.as_ptr(),
+                Some(received_error_callback),
+            );
+            lynx_sys::lynx_view_add_client(view.as_ptr(), client.as_ptr());
+            lynx_sys::lynx_view_enter_foreground(view.as_ptr());
+        }
+
+        // SAFETY: The metadata setters synchronously retain or copy their input;
+        // the bundle bytes themselves remain owned by ViewState for the view's
+        // complete lifetime.
+        let load_meta = unsafe { lynx_sys::lynx_load_meta_create() };
+        let Some(load_meta) = NonNull::<LynxLoadMeta>::new(load_meta) else {
+            return Err(io::Error::other("could not create Lynx load metadata"));
+        };
+        unsafe {
+            lynx_sys::lynx_load_meta_set_url(
+                load_meta.as_ptr(),
+                self.view_state.bundle_url.as_ptr(),
+            );
+            lynx_sys::lynx_load_meta_set_binary_data(
+                load_meta.as_ptr(),
+                self.view_state.bundle_source.as_ptr().cast_mut(),
+                self.view_state.bundle_source.len(),
+                None,
+                std::ptr::null_mut(),
+            );
+            lynx_sys::lynx_view_load_template(view.as_ptr(), load_meta.as_ptr());
+            lynx_sys::lynx_load_meta_release(load_meta.as_ptr());
+        }
+
+        eprintln!("[host-rs] ICU: {}", options.icu.display());
+        eprintln!("[host-rs] lynx_core.js: {}", options.lynx_core.display());
+        eprintln!("[host-rs] bundle: {}", options.bundle.display());
+        Ok(())
     }
 
     pub fn run_due_tasks(&self) -> io::Result<()> {
@@ -990,30 +1308,71 @@ impl RuntimeCore {
     }
 
     pub fn ensure_healthy(&self) -> io::Result<()> {
-        if LYNX_LOG_CALLBACK_FAILED.load(Ordering::Acquire)
+        if self
+            .view_state
+            .native_callbacks_not_quiesced
+            .load(Ordering::Acquire)
+        {
+            Err(io::Error::other("native callbacks did not quiesce"))
+        } else if LYNX_LOG_CALLBACK_FAILED.load(Ordering::Acquire)
             || RENDERER_CALLBACK_ENTRY_FAILED.load(Ordering::Acquire)
             || self.ui_runner.callback_failed.load(Ordering::Acquire)
             || self.renderer_state.callback_failed.load(Ordering::Acquire)
+            || self.view_state.callback_failed.load(Ordering::Acquire)
             || self
                 .renderer_state
                 .gl_context_stranded
                 .load(Ordering::Acquire)
         {
             Err(io::Error::other("a Lynx runtime callback failed"))
+        } else if self.view_state.received_error.load(Ordering::Acquire) {
+            Err(io::Error::other("the Lynx view reported a load error"))
         } else {
             Ok(())
         }
+    }
+
+    pub fn first_frame_ready(&self) -> bool {
+        self.view_state.first_screen.load(Ordering::Acquire)
+            && self.renderer_state.first_present.load(Ordering::Acquire)
     }
 
     pub fn requires_process_exit_without_glfw_cleanup(&self) -> bool {
         self.renderer_state
             .gl_context_stranded
             .load(Ordering::Acquire)
+            || self
+                .view_state
+                .native_callbacks_not_quiesced
+                .load(Ordering::Acquire)
+    }
+
+    pub fn native_callbacks_not_quiesced(&self) -> bool {
+        self.view_state
+            .native_callbacks_not_quiesced
+            .load(Ordering::Acquire)
     }
 
     pub fn shutdown(&mut self) -> io::Result<()> {
-        if self.renderer.is_none() && self.ui_activation.is_none() {
+        if self.view.is_none()
+            && self.view_client.is_none()
+            && self.fetcher.is_none()
+            && self.renderer.is_none()
+            && self.ui_activation.is_none()
+        {
             return Ok(());
+        }
+
+        if let Some(view) = self.view.take() {
+            // SAFETY: The view is live and task queues still accept release work.
+            unsafe {
+                lynx_sys::lynx_view_enter_background(view.as_ptr());
+                lynx_sys::lynx_view_release(view.as_ptr());
+            }
+        }
+        if let Some(client) = self.view_client.take() {
+            // SAFETY: View release has quiesced its client callbacks.
+            unsafe { lynx_sys::lynx_view_client_release(client.as_ptr()) };
         }
 
         self.renderer_state
@@ -1028,10 +1387,20 @@ impl RuntimeCore {
             }
         }
 
+        let mut errors = Vec::new();
         let ui_draining = if let Some(activation) = self.ui_activation.take() {
-            self.ui_runner.stop_and_drain(activation).map(Some)
+            match self.ui_runner.stop_and_drain(activation) {
+                Ok(generation) => Some(generation),
+                Err(error) => {
+                    self.view_state
+                        .native_callbacks_not_quiesced
+                        .store(true, Ordering::Release);
+                    errors.push(error.to_string());
+                    None
+                }
+            }
         } else {
-            Ok(None)
+            None
         };
 
         self.renderer_state.close_callbacks_and_wait();
@@ -1043,28 +1412,61 @@ impl RuntimeCore {
             // the registry remains live through release and prevents callbacks
             // already entering Rust from dereferencing freed userdata.
             unsafe { lynx_sys::lynx_windowless_renderer_release(renderer.as_ptr()) };
-            unregister_renderer_state(renderer, &self.renderer_state)
+            Some(unregister_renderer_state(renderer, &self.renderer_state))
         } else {
-            Ok(())
+            None
         };
-        let finalizer_result = if self.renderer_state.finalized.load(Ordering::Acquire) {
-            Ok(())
+        let released_fetcher = if let Some(fetcher) = self.fetcher.take() {
+            // SAFETY: View, renderer, and queued work no longer use the fetcher.
+            unsafe { lynx_sys::lynx_generic_resource_fetcher_release(fetcher.as_ptr()) };
+            true
         } else {
-            Err(io::Error::other(
-                "Lynx renderer release did not run its finalizer",
-            ))
-        };
-        let health_result = self.ensure_healthy();
-        let ui_finish_result = match ui_draining {
-            Ok(Some(generation)) => self.ui_runner.finish_deactivation(generation),
-            Ok(None) => Ok(()),
-            Err(error) => Err(error),
+            false
         };
 
-        ui_finish_result?;
-        finalizer_result?;
-        unregister_result?;
-        health_result
+        if released_fetcher
+            && !self
+                .view_state
+                .wait_for_fetcher_finalizer(FETCHER_FINALIZER_TIMEOUT)
+        {
+            errors
+                .push("Lynx resource fetcher callbacks did not quiesce before timeout".to_owned());
+        }
+
+        if unregister_result.is_some() && !self.renderer_state.finalized.load(Ordering::Acquire) {
+            self.view_state
+                .native_callbacks_not_quiesced
+                .store(true, Ordering::Release);
+            errors.push("Lynx renderer release did not run its finalizer".to_owned());
+        }
+        if let Some(Err(error)) = unregister_result {
+            self.view_state
+                .native_callbacks_not_quiesced
+                .store(true, Ordering::Release);
+            errors.push(error.to_string());
+        }
+
+        let health_result = self.ensure_healthy();
+        if let Err(error) = health_result {
+            errors.push(error.to_string());
+        }
+
+        if !self.native_callbacks_not_quiesced() {
+            if let Some(generation) = ui_draining {
+                if let Err(error) = self.ui_runner.finish_deactivation(generation) {
+                    self.view_state
+                        .native_callbacks_not_quiesced
+                        .store(true, Ordering::Release);
+                    errors.push(error.to_string());
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(errors.join("; ")))
+        }
     }
 }
 
@@ -1193,6 +1595,539 @@ unsafe extern "C" fn ui_post_task_callback(
             }
         }));
     }
+}
+
+unsafe extern "C" fn resource_fetcher_finalizer_callback(
+    _fetcher: *mut LynxGenericResourceFetcher,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: Creation transferred exactly one Arc reference to the
+        // fetcher, and its finalizer is the only code that consumes it.
+        let state = unsafe { Arc::from_raw(user_data.cast::<ViewState>()) };
+        state.fetcher_finalization.signal();
+    }));
+}
+
+unsafe extern "C" fn fetch_resource_callback(
+    fetcher: *mut LynxGenericResourceFetcher,
+    request: *mut LynxResourceRequest,
+    response: *mut LynxResourceResponse,
+) {
+    let state = if fetcher.is_null() {
+        None
+    } else {
+        // SAFETY: The fetcher retains its Arc-owned userdata until release.
+        let user_data = unsafe { lynx_sys::lynx_generic_resource_fetcher_get_user_data(fetcher) };
+        NonNull::new(user_data.cast::<ViewState>()).map(|pointer| unsafe { pointer.as_ref() })
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let state = state.ok_or_else(|| "resource fetcher state is unavailable".to_owned())?;
+        if request.is_null() {
+            return Err("resource request is null".to_owned());
+        }
+        let resource_type = unsafe { lynx_sys::lynx_resource_request_get_type(request) };
+        let request_url = unsafe { lynx_sys::lynx_resource_request_get_url(request) };
+        let url = if request_url.is_null() {
+            String::new()
+        } else {
+            // SAFETY: The request owns a NUL-terminated URL through release.
+            unsafe { CStr::from_ptr(request_url) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        if !is_packaged_core_request(resource_type) {
+            return Err(format!(
+                "unsupported resource type {resource_type} for URL: {url}"
+            ));
+        }
+        if response.is_null() {
+            return Err("resource response is null".to_owned());
+        }
+        // SAFETY: ViewState owns the immutable bytes until after fetcher release.
+        unsafe {
+            lynx_sys::lynx_resource_response_set_code(response, 0);
+            lynx_sys::lynx_resource_response_set_data(
+                response,
+                state.core_source.as_ptr().cast_mut(),
+                state.core_source.len(),
+                None,
+                std::ptr::null_mut(),
+            );
+        }
+        Ok(())
+    }));
+
+    let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let error = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(message)) => Some(message),
+            Err(_) => {
+                if let Some(state) = state {
+                    state.record_callback_failure();
+                }
+                Some("resource fetch callback panicked".to_owned())
+            }
+        };
+        if let (Some(message), Some(response)) = (error, NonNull::new(response)) {
+            let message =
+                CString::new(message).unwrap_or_else(|_| c"resource fetch failed".to_owned());
+            // SAFETY: The response is live until completion below; the SDK
+            // copies the error text synchronously.
+            unsafe {
+                lynx_sys::lynx_resource_response_set_code(response.as_ptr(), -1);
+                lynx_sys::lynx_resource_response_set_error_message(
+                    response.as_ptr(),
+                    message.as_ptr(),
+                );
+            }
+            eprintln!("[host-rs] {}", message.to_string_lossy());
+        }
+    }));
+    if completion.is_err() {
+        if let Some(state) = state {
+            state.record_callback_failure();
+        }
+        if !response.is_null() {
+            // SAFETY: Static fallback text avoids further Rust work after a
+            // contained panic; the response remains live until completion.
+            unsafe {
+                lynx_sys::lynx_resource_response_set_code(response, -1);
+                lynx_sys::lynx_resource_response_set_error_message(
+                    response,
+                    c"resource fetch callback panicked".as_ptr(),
+                );
+            }
+        }
+    }
+    if !request.is_null() {
+        // SAFETY: The fetch callback consumes each request exactly once.
+        unsafe { lynx_sys::lynx_resource_request_release(request) };
+    }
+    if !response.is_null() {
+        // SAFETY: Completion precedes the matching response release.
+        unsafe {
+            lynx_sys::lynx_resource_response_callback(response);
+            lynx_sys::lynx_resource_response_release(response);
+        }
+    }
+}
+
+unsafe extern "C" fn first_screen_callback(client: *mut LynxViewClient) {
+    if client.is_null() {
+        return;
+    }
+    // SAFETY: RuntimeCore retains ViewState until after client release.
+    let user_data = unsafe { lynx_sys::lynx_view_client_get_user_data(client) };
+    let Some(state) = NonNull::new(user_data.cast::<ViewState>()) else {
+        return;
+    };
+    let state = unsafe { state.as_ref() };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !state.first_screen.swap(true, Ordering::AcqRel) {
+            eprintln!("[host-rs] first screen layout completed");
+            let _ = state.wake.wake();
+        }
+    }))
+    .is_err()
+    {
+        state.record_callback_failure();
+    }
+}
+
+unsafe extern "C" fn received_error_callback(
+    client: *mut LynxViewClient,
+    code: c_int,
+    message: *const c_char,
+) {
+    if client.is_null() {
+        return;
+    }
+    // SAFETY: RuntimeCore retains ViewState until after client release.
+    let user_data = unsafe { lynx_sys::lynx_view_client_get_user_data(client) };
+    let Some(state) = NonNull::new(user_data.cast::<ViewState>()) else {
+        return;
+    };
+    let state = unsafe { state.as_ref() };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let message = if message.is_null() {
+            "".into()
+        } else {
+            // SAFETY: Lynx supplies a NUL-terminated message for this callback.
+            unsafe { CStr::from_ptr(message) }.to_string_lossy()
+        };
+        state.received_error.store(true, Ordering::Release);
+        eprintln!("[lynx-error {code}] {message}");
+        let _ = state.wake.wake();
+    }))
+    .is_err()
+    {
+        state.record_callback_failure();
+    }
+}
+
+enum DeferredSettlementState<D: Copy> {
+    Pending(D),
+    Settled,
+    FatalSettlementFailure,
+}
+
+struct DeferredSettlement<D: Copy> {
+    state: DeferredSettlementState<D>,
+}
+
+impl<D: Copy> DeferredSettlement<D> {
+    fn new(deferred: D) -> Self {
+        Self {
+            state: DeferredSettlementState::Pending(deferred),
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        matches!(self.state, DeferredSettlementState::Pending(_))
+    }
+
+    fn resolve(&mut self, settle: impl FnOnce(D) -> bool) -> bool {
+        let DeferredSettlementState::Pending(deferred) = self.state else {
+            return false;
+        };
+        if !settle(deferred) {
+            return false;
+        }
+        self.state = DeferredSettlementState::Settled;
+        true
+    }
+
+    fn reject(&mut self, settle: impl FnOnce(D) -> bool, on_fatal: impl FnOnce()) -> bool {
+        let DeferredSettlementState::Pending(deferred) = self.state else {
+            return false;
+        };
+        if settle(deferred) {
+            self.state = DeferredSettlementState::Settled;
+            return true;
+        }
+        self.state = DeferredSettlementState::FatalSettlementFailure;
+        on_fatal();
+        false
+    }
+
+    fn callback_value<T>(&mut self, promise: T, on_fatal: impl FnOnce()) -> Option<T> {
+        match self.state {
+            DeferredSettlementState::Settled => Some(promise),
+            DeferredSettlementState::Pending(_) => {
+                self.state = DeferredSettlementState::FatalSettlementFailure;
+                on_fatal();
+                None
+            }
+            DeferredSettlementState::FatalSettlementFailure => None,
+        }
+    }
+}
+
+struct NapiPromiseSettlement {
+    deferred: DeferredSettlement<NapiDeferred>,
+    promise: NapiValue,
+}
+
+impl NapiPromiseSettlement {
+    unsafe fn callback_value(&mut self, env: NapiEnv) -> NapiValue {
+        self.deferred
+            .callback_value(self.promise, || unsafe {
+                throw_promise_settlement_failure(env)
+            })
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    unsafe fn reject(&mut self, env: NapiEnv, message: &str) -> bool {
+        if !self.deferred.is_pending() {
+            return false;
+        }
+        let mut text = std::ptr::null_mut();
+        let mut error = std::ptr::null_mut();
+        // SAFETY: The UTF-8 bytes remain live through these synchronous calls.
+        let created_error = unsafe {
+            lynx_sys::napi_create_string_utf8_weak(
+                env,
+                message.as_ptr().cast(),
+                message.len(),
+                &mut text,
+            ) == NAPI_OK
+                && lynx_sys::napi_create_error_weak(env, std::ptr::null_mut(), text, &mut error)
+                    == NAPI_OK
+        };
+        if !created_error {
+            // SAFETY: `error` is writable and receives the environment singleton.
+            let _ = unsafe { lynx_sys::napi_get_undefined_weak(env, &mut error) };
+        }
+        self.deferred.reject(
+            |deferred| {
+                // SAFETY: This owner exposes a pending deferred to exactly one
+                // reject call. A failed call permanently poisons ownership.
+                (unsafe { lynx_sys::napi_reject_deferred_weak(env, deferred, error) }) == NAPI_OK
+            },
+            || unsafe { throw_promise_settlement_failure(env) },
+        )
+    }
+
+    unsafe fn resolve(&mut self, env: NapiEnv, resolution: NapiValue) -> bool {
+        self.deferred.resolve(|deferred| {
+            // SAFETY: This owner removes the deferred immediately after a
+            // successful resolve, before any later operation can panic.
+            (unsafe { lynx_sys::napi_resolve_deferred_weak(env, deferred, resolution) }) == NAPI_OK
+        })
+    }
+}
+
+unsafe fn throw_promise_settlement_failure(env: NapiEnv) {
+    // SAFETY: The static strings outlive this best-effort N-API call. Failure is
+    // intentionally ignored because the deferred is already poisoned.
+    let _ = unsafe {
+        lynx_sys::napi_throw_error_weak(
+            env,
+            std::ptr::null(),
+            c"failed to settle native Promise".as_ptr(),
+        )
+    };
+}
+
+unsafe fn create_promise(env: NapiEnv) -> Option<NapiPromiseSettlement> {
+    let mut deferred = std::ptr::null_mut();
+    let mut promise = std::ptr::null_mut();
+    // SAFETY: Outputs point to writable storage for this N-API environment.
+    (unsafe { lynx_sys::napi_create_promise_weak(env, &mut deferred, &mut promise) } == NAPI_OK)
+        .then(|| NapiPromiseSettlement {
+            deferred: DeferredSettlement::new(deferred),
+            promise,
+        })
+}
+
+unsafe fn set_string_property(env: NapiEnv, object: NapiValue, name: &CStr, value: &str) -> bool {
+    let mut string = std::ptr::null_mut();
+    // SAFETY: Inputs remain live for both synchronous N-API calls.
+    unsafe {
+        lynx_sys::napi_create_string_utf8_weak(env, value.as_ptr().cast(), value.len(), &mut string)
+            == NAPI_OK
+            && lynx_sys::napi_set_named_property_weak(env, object, name.as_ptr(), string) == NAPI_OK
+    }
+}
+
+unsafe fn get_applications_impl(
+    env: NapiEnv,
+    info: NapiCallbackInfo,
+    settlement: &mut NapiPromiseSettlement,
+) {
+    let mut argument_count = 0;
+    let mut opaque = std::ptr::null_mut();
+    // SAFETY: No arguments are requested; `opaque` receives callback data.
+    if unsafe {
+        lynx_sys::napi_get_cb_info_weak(
+            env,
+            info,
+            &mut argument_count,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut opaque,
+        )
+    } != NAPI_OK
+    {
+        let _ = unsafe {
+            settlement.reject(env, "could not read Launcher.getApplications callback data")
+        };
+        return;
+    }
+    let Some(state) = NonNull::new(opaque.cast::<ViewState>()) else {
+        let _ = unsafe { settlement.reject(env, "launcher platform is not available") };
+        return;
+    };
+    // SAFETY: The native module is owned by the live view and RuntimeCore.
+    let state = unsafe { state.as_ref() };
+    let applications_snapshot = match &state.applications {
+        Ok(applications) => applications,
+        Err(message) => {
+            if state.injected_application_error {
+                eprintln!("[host-rs] Launcher.getApplications rejected: {message}");
+            }
+            let _ = unsafe { settlement.reject(env, message) };
+            return;
+        }
+    };
+    if applications_snapshot.len() > u32::MAX as usize {
+        let _ = unsafe { settlement.reject(env, "application snapshot is too large") };
+        return;
+    }
+
+    let mut applications = std::ptr::null_mut();
+    if unsafe {
+        lynx_sys::napi_create_array_with_length_weak(
+            env,
+            applications_snapshot.len(),
+            &mut applications,
+        )
+    } != NAPI_OK
+    {
+        let _ = unsafe { settlement.reject(env, "could not create the applications array") };
+        return;
+    }
+
+    for (index, application) in applications_snapshot.iter().enumerate() {
+        let mut object = std::ptr::null_mut();
+        let converted = unsafe {
+            lynx_sys::napi_create_object_weak(env, &mut object) == NAPI_OK
+                && set_string_property(env, object, c"id", &application.id)
+                && set_string_property(env, object, c"name", &application.name)
+                && application
+                    .icon_uri
+                    .as_ref()
+                    .is_none_or(|icon_uri| set_string_property(env, object, c"iconUri", icon_uri))
+                && lynx_sys::napi_set_element_weak(env, applications, index as u32, object)
+                    == NAPI_OK
+        };
+        if !converted {
+            let _ =
+                unsafe { settlement.reject(env, "could not convert an application to JavaScript") };
+            return;
+        }
+    }
+
+    // Trace before settlement so an I/O panic is handled while the deferred is
+    // still owned and pending.
+    if state.snapshot_trace {
+        for (index, application) in applications_snapshot.iter().enumerate() {
+            eprintln!(
+                "[host-rs] snapshot index={index} id={} name={} icon={}",
+                application.id,
+                application.name,
+                if application.icon_uri.is_some() {
+                    "present"
+                } else {
+                    "missing"
+                }
+            );
+        }
+    }
+
+    // SAFETY: The completed array belongs to this environment. Resolve failure
+    // leaves ownership pending for one rejection attempt.
+    if !unsafe { settlement.resolve(env, applications) } {
+        let _ =
+            unsafe { settlement.reject(env, "could not resolve Launcher.getApplications Promise") };
+        return;
+    }
+
+    // Settlement is already consumed. Diagnostics are isolated so they can
+    // never re-enter a panic handler with the old deferred.
+    let application_count = applications_snapshot.len();
+    let _ = std::panic::catch_unwind(|| {
+        eprintln!("[host-rs] Launcher.getApplications resolved {application_count} applications");
+    });
+}
+
+unsafe extern "C" fn get_applications_callback(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        create_promise(env)
+    }));
+    let Ok(Some(mut settlement)) = created else {
+        return std::ptr::null_mut();
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        get_applications_impl(env, info, &mut settlement)
+    }))
+    .is_err()
+    {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            settlement.reject(env, "Launcher.getApplications callback panicked")
+        }));
+    }
+    // SAFETY: Callback completion either returns the original settled Promise
+    // or converts any fatal/pending ownership state to a synchronous NULL path.
+    unsafe { settlement.callback_value(env) }
+}
+
+unsafe extern "C" fn launch_application_callback(
+    env: NapiEnv,
+    _info: NapiCallbackInfo,
+) -> NapiValue {
+    let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        create_promise(env)
+    }));
+    let Ok(Some(mut settlement)) = created else {
+        return std::ptr::null_mut();
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        settlement.reject(
+            env,
+            "launchApplication is not implemented by the Rust host tracer",
+        )
+    }))
+    .is_err()
+    {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            settlement.reject(env, "Launcher.launchApplication callback panicked")
+        }));
+    }
+    // SAFETY: The launch stub follows the same exactly-once settlement owner.
+    unsafe { settlement.callback_value(env) }
+}
+
+unsafe extern "C" fn launcher_module_creator(
+    env: NapiEnv,
+    exports: NapiValue,
+    _module_name: *const c_char,
+    opaque: *mut c_void,
+) -> NapiValue {
+    let initialized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut get_applications = std::ptr::null_mut();
+        let mut launch_application = std::ptr::null_mut();
+        // SAFETY: The view owns `opaque`; both callbacks and properties are
+        // created synchronously in this N-API environment.
+        unsafe {
+            lynx_sys::napi_create_function_weak(
+                env,
+                c"getApplications".as_ptr(),
+                NAPI_AUTO_LENGTH,
+                Some(get_applications_callback),
+                opaque,
+                &mut get_applications,
+            ) == NAPI_OK
+                && lynx_sys::napi_create_function_weak(
+                    env,
+                    c"launchApplication".as_ptr(),
+                    NAPI_AUTO_LENGTH,
+                    Some(launch_application_callback),
+                    opaque,
+                    &mut launch_application,
+                ) == NAPI_OK
+                && lynx_sys::napi_set_named_property_weak(
+                    env,
+                    exports,
+                    c"getApplications".as_ptr(),
+                    get_applications,
+                ) == NAPI_OK
+                && lynx_sys::napi_set_named_property_weak(
+                    env,
+                    exports,
+                    c"launchApplication".as_ptr(),
+                    launch_application,
+                ) == NAPI_OK
+        }
+    }))
+    .unwrap_or(false);
+    if !initialized {
+        // SAFETY: Throwing records an exception in this environment; the
+        // returned exports value remains owned by Lynx.
+        let _ = unsafe {
+            lynx_sys::napi_throw_error_weak(
+                env,
+                std::ptr::null(),
+                c"failed to initialize Launcher module".as_ptr(),
+            )
+        };
+    }
+    exports
 }
 
 enum ContainedCallback<R> {
@@ -1420,6 +2355,24 @@ mod tests {
         EventWake::new(std::ptr::null_mut(), ignore_wake)
     }
 
+    fn test_view_state() -> Arc<ViewState> {
+        Arc::new(ViewState {
+            core_source: Vec::new(),
+            bundle_source: Vec::new(),
+            bundle_url: CString::new("file:///bundle").unwrap(),
+            icu_path: CString::new("/icu").unwrap(),
+            applications: Ok(Vec::new()),
+            wake: test_wake(),
+            first_screen: AtomicBool::new(false),
+            received_error: AtomicBool::new(false),
+            callback_failed: AtomicBool::new(false),
+            fetcher_finalization: FetcherFinalization::default(),
+            native_callbacks_not_quiesced: AtomicBool::new(false),
+            snapshot_trace: false,
+            injected_application_error: false,
+        })
+    }
+
     fn blocking_event_wake() -> (Box<BlockingWake>, mpsc::Receiver<()>) {
         let (entered, entered_rx) = mpsc::sync_channel(0);
         (
@@ -1475,6 +2428,133 @@ mod tests {
         assert!(queue.push_after(3, 10, u64::MAX - 2));
         assert_eq!(queue.next_deadline(), Some(u64::MAX));
         assert_eq!(queue.pop_due(u64::MAX), Some(3));
+    }
+
+    #[test]
+    fn resource_fetch_policy_accepts_only_lynx_core_requests() {
+        assert!(is_packaged_core_request(LYNX_RESOURCE_TYPE_LYNX_CORE_JS));
+        for resource_type in [0, 1, 6, 8, c_int::MAX] {
+            assert!(!is_packaged_core_request(resource_type));
+        }
+    }
+
+    #[test]
+    fn reject_failure_is_fatal_and_returns_null_with_one_throw() {
+        let mut settlement = DeferredSettlement::new(7);
+        let reject_count = Cell::new(0);
+        let throw_count = Cell::new(0);
+
+        assert!(!settlement.reject(
+            |deferred| {
+                assert_eq!(deferred, 7);
+                reject_count.set(reject_count.get() + 1);
+                false
+            },
+            || throw_count.set(throw_count.get() + 1),
+        ));
+        assert_eq!(
+            settlement.callback_value("original promise", || {
+                throw_count.set(throw_count.get() + 1)
+            }),
+            None
+        );
+        assert_eq!(reject_count.get(), 1);
+        assert_eq!(throw_count.get(), 1);
+    }
+
+    #[test]
+    fn resolve_failure_then_reject_success_returns_original_promise() {
+        let mut settlement = DeferredSettlement::new(11);
+        let resolve_count = Cell::new(0);
+        let reject_count = Cell::new(0);
+        let throw_count = Cell::new(0);
+
+        assert!(!settlement.resolve(|deferred| {
+            assert_eq!(deferred, 11);
+            resolve_count.set(resolve_count.get() + 1);
+            false
+        }));
+        assert!(settlement.reject(
+            |deferred| {
+                assert_eq!(deferred, 11);
+                reject_count.set(reject_count.get() + 1);
+                true
+            },
+            || throw_count.set(throw_count.get() + 1),
+        ));
+        assert_eq!(
+            settlement.callback_value("original promise", || {
+                throw_count.set(throw_count.get() + 1)
+            }),
+            Some("original promise")
+        );
+        assert_eq!(resolve_count.get(), 1);
+        assert_eq!(reject_count.get(), 1);
+        assert_eq!(throw_count.get(), 0);
+    }
+
+    #[test]
+    fn successful_settlement_cannot_be_used_twice() {
+        let mut settlement = DeferredSettlement::new(13);
+        let resolve_count = Cell::new(0);
+        let reject_count = Cell::new(0);
+        let throw_count = Cell::new(0);
+
+        assert!(settlement.resolve(|deferred| {
+            assert_eq!(deferred, 13);
+            resolve_count.set(resolve_count.get() + 1);
+            true
+        }));
+        assert!(!settlement.reject(
+            |_| {
+                reject_count.set(reject_count.get() + 1);
+                true
+            },
+            || throw_count.set(throw_count.get() + 1),
+        ));
+        assert_eq!(
+            settlement.callback_value("original promise", || {
+                throw_count.set(throw_count.get() + 1)
+            }),
+            Some("original promise")
+        );
+        assert_eq!(resolve_count.get(), 1);
+        assert_eq!(reject_count.get(), 0);
+        assert_eq!(throw_count.get(), 0);
+    }
+
+    #[test]
+    fn pre_settle_panic_rejects_once_and_returns_original_promise() {
+        let mut settlement = DeferredSettlement::new(17);
+        let reject_count = Cell::new(0);
+        let throw_count = Cell::new(0);
+        let result = std::panic::catch_unwind(|| panic!("controlled pre-settle panic"));
+
+        if result.is_err() {
+            assert!(settlement.reject(
+                |deferred| {
+                    assert_eq!(deferred, 17);
+                    reject_count.set(reject_count.get() + 1);
+                    true
+                },
+                || throw_count.set(throw_count.get() + 1),
+            ));
+        }
+        assert!(!settlement.reject(
+            |_| {
+                reject_count.set(reject_count.get() + 1);
+                true
+            },
+            || throw_count.set(throw_count.get() + 1),
+        ));
+        assert_eq!(
+            settlement.callback_value("original promise", || {
+                throw_count.set(throw_count.get() + 1)
+            }),
+            Some("original promise")
+        );
+        assert_eq!(reject_count.get(), 1);
+        assert_eq!(throw_count.get(), 0);
     }
 
     #[test]
@@ -1543,6 +2623,67 @@ mod tests {
         assert!(state.tasks.pop_any().is_some());
         let draining = state.stop_and_drain(activation).unwrap();
         state.finish_deactivation(draining).unwrap();
+    }
+
+    #[test]
+    fn ui_draining_lease_outlives_delayed_fetcher_finalizer() {
+        let state = Arc::new(GlobalUiRunnerState::new());
+        let activation = state.activate(test_wake()).unwrap();
+        let draining = state.stop_and_drain(activation).unwrap();
+        let view_state = test_view_state();
+        let (attempted_tx, attempted_rx) = mpsc::sync_channel(0);
+        let (finalize_tx, finalize_rx) = mpsc::sync_channel(0);
+
+        let other_state = Arc::clone(&state);
+        let other_view_state = Arc::clone(&view_state);
+        let finalizer = thread::spawn(move || {
+            attempted_tx
+                .send(other_state.activate(test_wake()).is_err())
+                .unwrap();
+            finalize_rx.recv().unwrap();
+            other_view_state.fetcher_finalization.signal();
+        });
+
+        assert!(attempted_rx.recv().unwrap());
+        finalize_tx.send(()).unwrap();
+        assert!(view_state.wait_for_fetcher_finalizer(Duration::from_secs(1)));
+        assert!(!view_state
+            .native_callbacks_not_quiesced
+            .load(Ordering::Acquire));
+        assert!(state.activate(test_wake()).is_err());
+
+        state.finish_deactivation(draining).unwrap();
+        finalizer.join().unwrap();
+        let next = state.activate(test_wake()).unwrap();
+        let next_draining = state.stop_and_drain(next).unwrap();
+        state.finish_deactivation(next_draining).unwrap();
+    }
+
+    #[test]
+    fn fetcher_finalizer_timeout_latches_fatal_cleanup() {
+        let view_state = test_view_state();
+        assert!(!view_state.wait_for_fetcher_finalizer(Duration::ZERO));
+        assert!(view_state
+            .native_callbacks_not_quiesced
+            .load(Ordering::Acquire));
+
+        let runtime = RuntimeCore {
+            view: None,
+            view_client: None,
+            fetcher: None,
+            renderer: None,
+            renderer_state: Arc::new(RendererState::new(
+                std::ptr::dangling_mut::<c_void>(),
+                test_gl_api(),
+                test_wake(),
+            )),
+            view_state,
+            ui_runner: global_ui_runner(),
+            ui_activation: None,
+            _thread_bound: PhantomData,
+        };
+        assert!(runtime.requires_process_exit_without_glfw_cleanup());
+        assert!(runtime.native_callbacks_not_quiesced());
     }
 
     #[test]
@@ -1772,8 +2913,12 @@ mod tests {
         release_registered_test_renderer(renderer, &state);
 
         let runtime = RuntimeCore {
+            view: None,
+            view_client: None,
+            fetcher: None,
             renderer: None,
             renderer_state: Arc::clone(&state),
+            view_state: test_view_state(),
             ui_runner: global_ui_runner(),
             ui_activation: None,
             _thread_bound: PhantomData,

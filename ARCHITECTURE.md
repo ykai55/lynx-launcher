@@ -27,8 +27,11 @@ uses the Rust platform interface for discovery, and verifies that its linked
 `lynx_log_init` symbol resolves to the staged `$ORIGIN/liblynx.so`. Its windowed
 path owns a popup-like pinned-GLFW X11 window, OpenGL 3.3 context, static shell
 frame, focus exit, bounded event loop, process-global UI runner, deadline queues,
-and an empty GLDirect renderer with deterministic teardown. It does not create a
-Lynx view; the C++ binary remains the default host.
+GLDirect renderer, restricted core-resource fetcher, builder, view, client, and
+load metadata with deterministic teardown. It loads the staged ReactLynx bundle
+and exposes a Promise-based application snapshot through the SDK's verified weak
+N-API symbols. Input and application launch parity remain later migration stages;
+the C++ binary remains the default host.
 
 ## Layers
 
@@ -61,26 +64,37 @@ for the engine preloader's default lookup.
 
 `host-rs/src/support.rs` preserves those pure path, file, URI, XSettings, scroll,
 UTF-8, and window-metric semantics as the first migration tracer. `lynx-sys/`
-contains the reviewed runtime and renderer ABI, strict by-value view wrappers,
-and dynamic-loader path probe. The Rust runtime tracer configures the
-process-global UI runner once, executes absolute UI deadlines and relative
-renderer intervals through the GLFW loop, binds the GLDirect callbacks, and
-stops and drains accepted work before renderer release. Its callback userdata
-has a stable heap address, a process registry acquires an `Arc` before callback
-state access, and shutdown waits for registered callbacks before releasing
-their wake/window dependencies. The registry remains installed through
-`lynx_windowless_renderer_release`; pointer reuse relies on the SDK contract
-that release returns only after that renderer can no longer initiate callbacks.
-The process-global UI generation remains in a draining lease through renderer
-release, registry removal, finalizer validation, and old-generation health
-sampling, so another host cannot activate or reset health early. Queue generation
-tags detect only accepted work crossing that lease; they do not identify the
-origin generation of an arbitrary SDK callback.
-All Rust callbacks contain panics. The binary-private window module supplies raw
-GLFW, X11, and OpenGL operations. Lynx view creation/rendering, weak N-API,
-input, and view teardown remain exclusively in the C++ host. Consequently this
-empty runtime tracer does not yet provide SDK-originated task or GL-callback
-evidence; the real view stage supplies that executable coverage.
+contains the reviewed runtime, renderer, view/resource, and weak N-API ABI,
+strict by-value view wrappers, and dynamic-loader path probe. The Rust runtime
+tracer configures the process-global UI runner once, executes absolute UI
+deadlines and relative renderer intervals through the GLFW loop, and binds the
+GLDirect callbacks. Its renderer callback userdata has a stable heap address;
+a process registry acquires an `Arc` before state access and remains installed
+through renderer release. View, client, native-module, and fetcher userdata share
+an `Arc`-owned state that outlives SDK callbacks, while the fetcher owns one
+explicit reference consumed by its finalizer.
+
+The Rust fetcher returns only the staged core bytes for the Lynx-core resource
+type and rejects every other request. Bundle file URIs percent-encode raw Linux
+path bytes, and the ICU C path is constructed directly from `OsStr` bytes rather
+than a lossy UTF-8 conversion. The view prefetches an ordered application and
+icon snapshot through the Rust platform API. `Launcher.getApplications()`
+resolves that snapshot as a real Promise or rejects with its native discovery
+error; `launchApplication()` is registered but deliberately rejects until the
+launch parity stage.
+
+Shutdown backgrounds and releases the view and client while queues still accept
+release work, then stops and drains renderer and UI work before releasing the
+renderer and fetcher. The process-global UI generation remains in a draining
+lease through renderer release, registry removal, fetcher release, and a bounded
+`Mutex`/`Condvar` wait for the fetcher finalizer. Renderer/fetcher finalizer,
+registry, and old-generation health results are sampled before the lease is
+finished, so another host cannot activate or reset health early. If native
+callbacks cannot be proven quiescent, the lease remains draining and the window
+path forgets the runtime, window, and GLFW owners before delegating cleanup to
+process exit. All Rust callbacks contain panics. The binary-private window
+module supplies raw GLFW, X11, and OpenGL operations; input remains exclusively
+in the C++ host for now.
 
 ### ReactLynx UI
 
@@ -102,6 +116,11 @@ and error state. Rspeedy produces `ui/dist/main.lynx.bundle` for the host.
    Rust handles.
 6. TypeScript validates IDs, names, icon URIs, and uniqueness before updating
    ReactLynx state.
+
+The side-by-side Rust tracer performs the same platform discovery and icon
+resolution directly before creating its view, stores an owned snapshot, and
+resolves it from `Launcher.getApplications()` without crossing the platform C
+ABI. This alternate path is not yet the default host.
 
 ### Launch
 
@@ -125,7 +144,9 @@ and error state. Rspeedy produces `ui/dist/main.lynx.bundle` for the host.
   from another render thread. Context ownership is also tracked per thread.
 - Shutdown cancels input, backgrounds/releases the view and client while their
   renderer/UI queues still accept release work, then stops and drains those
-  queues before releasing renderer, fetcher, Rust, cursor, and GLFW resources.
+  queues before releasing renderer and fetcher. The Rust path waits for fetcher
+  finalization before ending its UI draining generation; unsafe timeout paths do
+  not run ordinary cursor/window/GLFW destruction.
 - Rust `LynxLauncher`, list, icon, and error values are opaque heap handles.
   Every successful allocation has one matching destroy call. Slices borrowed
   from a handle are valid only until that handle is destroyed.
@@ -152,10 +173,12 @@ can claim that backend.
 
 The Rust shell links the same CMake `glfw` static target directly rather than a
 system or crate-provided GLFW. Its `[host-rs] first shell GL frame presented`
-marker proves only the static clear/swap path and is deliberately distinct from
-the C++ host's Lynx first-frame marker. While the shell event loop is active it
-uses an X11 background matching the verified shell clear, so Expose handling
-preserves that color without reacquiring the GL context after renderer startup.
+marker proves only the static clear/swap path. Real Rust-host readiness requires
+both `[host-rs] first screen layout completed` from the view client and
+`[host-rs] first GL frame presented` from the GLDirect renderer. While the shell
+event loop is active it uses an X11 background matching the verified shell clear,
+so Expose handling preserves that color without reacquiring the GL context after
+renderer startup.
 If owner-thread context rollback or detach verification fails, the Rust tracer
 marks the context stranded and exits without calling `glfwDestroyWindow` or
 `glfwTerminate`; only this fatal path delegates native cleanup to process exit,

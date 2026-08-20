@@ -60,9 +60,10 @@ UI 不依赖浏览器 DOM；C++ host 拥有 embedder、图形、输入和任务�
 操作系统策略与 `.desktop` 解析。完整边界、数据流和所有权说明见
 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-迁移中的 `host-rs` 是 side-by-side popup GL shell：它验证 Rust CLI、support logic、
-platform direct interface、staged `liblynx.so` linkage，以及 pinned GLFW/X11/OpenGL 窗口
-和静态 shell frame。它尚不创建 Lynx view，也不替代上图中的 C++ host。
+迁移中的 `host-rs` 是 side-by-side Lynx view tracer：它验证 Rust CLI、support logic、
+platform direct interface、staged `liblynx.so` linkage、pinned GLFW/X11/OpenGL 窗口，
+并加载 packaged core 与 bundle 渲染真实 launcher 首帧。它尚未迁移完整输入和应用启动，
+也不替代上图中的 C++ host。
 
 ## 目录
 
@@ -70,7 +71,7 @@ platform direct interface、staged `liblynx.so` linkage，以及 pinned GLFW/X11
 | --- | --- |
 | `platform/` | Rust 应用发现、启动、图标解析、稳定 C ABI 及测试。 |
 | `lynx-sys/` | 最小 Lynx raw binding 与 native library path probe。 |
-| `host-rs/` | Rust host 迁移 tracer；当前支持 resource/link check 和 popup GL shell。 |
+| `host-rs/` | Rust host 迁移 tracer；当前支持 resource/link check、popup GL shell 和真实 Lynx view 首帧。 |
 | `ui/` | ReactLynx/TypeScript UI，Rspeedy 输出 bundle。 |
 | `host/` | C++20 embedder、GLFW/OpenGL、N-API bridge、CMake 与 native tests。 |
 | `scripts/` | 首选的 bootstrap、构建、测试、运行和图形测试入口。 |
@@ -167,9 +168,12 @@ older-source/newer-target 回归场景。
 ```
 
 它会额外确认实际加载的 Lynx symbol 来自 executable 同目录的 staged `liblynx.so`。
-window mode 使用 CMake 构建的 pinned GLFW static archive，创建 X11/XWayland popup 并提交
-静态 OpenGL shell frame；`[host-rs] first shell GL frame presented` 不代表 Lynx 已完成布局
-或渲染。默认图形入口仍是 `scripts/run.sh`。
+window mode 使用 CMake 构建的 pinned GLFW static archive，先提交独立静态 shell frame，
+再由 Rust-owned fetcher、builder、view、client 和 weak N-API `Launcher` module 加载 staged
+core 与 bundle。`[host-rs] first shell GL frame presented` 仍不代表 Lynx readiness；只有
+`[host-rs] first screen layout completed` 与 `[host-rs] first GL frame presented` 同时出现后，
+`--exit-after-first-frame` 才会退出。当前 `getApplications()` 返回 platform direct snapshot，
+`launchApplication()` 明确 reject，默认图形入口仍是 `scripts/run.sh`。
 
 ## 测试
 
@@ -193,8 +197,13 @@ LYNX_LAUNCHER_SMOKE=1 LYNX_LAUNCHER_SMOKE_TIMEOUT=45s ./scripts/test.sh
 ```
 
 进程必须在 timeout 前同时报告 first-screen layout 和首个 GL present。
-该入口还会运行 Rust shell 的 popup、可见背景像素、focus-loss 退出和首帧自动退出检查。
-也可单独执行并增加重复次数：
+该入口还会运行 Rust tracer 的 popup、真实 launcher 像素、application Promise、focus-loss
+退出和双条件首帧自动退出检查；静态 shell marker 继续单独断言，不能冒充 readiness。
+Rust smoke 使用隔离 XDG fixture，精确核对 3 个 application snapshot 的 ID、名称、顺序、
+resolved icon 与 fallback 像素，并通过同一 native module seam 注入一次测试专用 discovery
+错误，验证 Promise reject 和现有 UI error state。重复次数同时应用于 first-frame 与 bounded
+模式，每轮都要求 clean shutdown；日志保存在 `.logs/ticket-03/rust-shell-smoke/`。也可单独
+执行并增加重复次数：
 
 ```sh
 ./scripts/rust-shell-smoke.sh

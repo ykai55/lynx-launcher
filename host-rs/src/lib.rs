@@ -46,6 +46,9 @@ pub struct WindowRunOptions {
     pub run_for_seconds: Option<f64>,
     pub exit_after_first_frame: bool,
     pub expected_lynx_library: PathBuf,
+    pub bundle: PathBuf,
+    pub lynx_core: PathBuf,
+    pub icu: PathBuf,
 }
 
 pub fn run<I, W>(arguments: I, run_window: W) -> Result<(), Box<dyn Error>>
@@ -73,6 +76,9 @@ where
             run_for_seconds: options.run_for_seconds,
             exit_after_first_frame: options.exit_after_first_frame,
             expected_lynx_library: executable_directory.join("liblynx.so"),
+            bundle: paths.bundle,
+            lynx_core: paths.lynx_core,
+            icu: paths.icu,
         })
     }
 }
@@ -226,7 +232,7 @@ fn print_usage(program: &OsStr) {
            --lynx-core PATH           lynx_core.js\n\
            --icu PATH                 icudtl.dat\n\
            --run-for SECONDS          Exit after a bounded run\n\
-           --exit-after-first-frame   Exit after the first shell GL present\n\
+           --exit-after-first-frame   Exit after Lynx layout and GL present\n\
            --check-resources          Validate resources and native linkage without a window\n\
            --help                     Show this help",
         program.to_string_lossy()
@@ -237,6 +243,7 @@ fn print_usage(program: &OsStr) {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::os::unix::ffi::OsStringExt;
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -308,12 +315,15 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&directory).unwrap();
-        let bundle = directory.join("bundle");
-        let core = directory.join("core");
-        let icu = directory.join("icu");
+        let bundle = directory.join(OsString::from_vec(b"bundle-\xff".to_vec()));
+        let core = directory.join(OsString::from_vec(b"core-\xfe".to_vec()));
+        let icu = directory.join(OsString::from_vec(b"icu-\xfd".to_vec()));
         fs::write(&bundle, b"bundle").unwrap();
         fs::write(&core, b"core").unwrap();
         fs::write(&icu, b"icu").unwrap();
+        let expected_bundle = fs::canonicalize(&bundle).unwrap();
+        let expected_core = fs::canonicalize(&core).unwrap();
+        let expected_icu = fs::canonicalize(&icu).unwrap();
         let received = RefCell::new(None);
         let expected_lynx_library = std::env::current_exe()
             .unwrap()
@@ -347,6 +357,9 @@ mod tests {
                 run_for_seconds: Some(2.5),
                 exit_after_first_frame: true,
                 expected_lynx_library,
+                bundle: expected_bundle,
+                lynx_core: expected_core,
+                icu: expected_icu,
             })
         );
         fs::remove_dir_all(directory).unwrap();

@@ -247,6 +247,9 @@ if(BUILD_TESTING)
     "${LYNX_SDK_DIR}/include"
     "${LYNX_SYS_DIR}/include"
   )
+  target_compile_definitions(lynx_sys_abi_test PRIVATE
+    USE_WEAK_SUFFIX_NAPI=1
+  )
   target_link_libraries(lynx_sys_abi_test PRIVATE
     lynx_sys_shim
     lynx_sdk

@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use lynx_launcher_host::runtime::{EventWake, GlApi, RuntimeCore};
+use lynx_launcher_host::runtime::{EventWake, GlApi, RuntimeCore, RuntimeViewOptions};
 use lynx_launcher_host::support::xsettings_window_scale;
 use lynx_launcher_host::{verify_linked_lynx, WindowRunOptions};
 
@@ -16,6 +16,8 @@ const INITIAL_WIDTH: f32 = 1120.0;
 const INITIAL_HEIGHT: f32 = 760.0;
 const MAXIMUM_EVENT_WAIT: Duration = Duration::from_millis(250);
 const STRANDED_GL_LOG: &[u8] = b"[host-rs] fatal: renderer stranded an OpenGL context; \
+skipping glfwDestroyWindow/glfwTerminate and exiting for OS cleanup\n";
+const NATIVE_CALLBACKS_LOG: &[u8] = b"[host-rs] fatal: native callbacks did not quiesce; \
 skipping glfwDestroyWindow/glfwTerminate and exiting for OS cleanup\n";
 
 static CALLBACK_PANICKED: AtomicBool = AtomicBool::new(false);
@@ -172,6 +174,14 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
         })
         .transpose()?;
 
+    let view_options = RuntimeViewOptions {
+        bundle: options.bundle.clone(),
+        lynx_core: options.lynx_core.clone(),
+        icu: options.icu.clone(),
+        logical_width: INITIAL_WIDTH,
+        logical_height: INITIAL_HEIGHT,
+        pixel_ratio: system_scale,
+    };
     // SAFETY: `runtime` shuts down before `window` and `_glfw` are dropped;
     // the function table is static and the wake callback has no userdata.
     let mut runtime = unsafe {
@@ -184,38 +194,48 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
                 runtime_get_proc_address,
             ),
             EventWake::new(std::ptr::null_mut(), runtime_wake_event_loop),
+            &view_options,
         )
     }?;
-    eprintln!("[host-rs] runtime core initialized");
 
-    let run_result = (|| {
-        runtime.run_due_tasks()?;
-        runtime.ensure_healthy()?;
-        if options.exit_after_first_frame {
-            eprintln!("[host-rs] auto-exit after first shell frame");
-            return Ok(());
-        }
-
-        while unsafe { ffi::glfw_window_should_close(window.raw()) } == ffi::GLFW_FALSE {
-            ensure_callback_did_not_panic()?;
-            runtime.run_due_tasks()?;
-            let mut timeout = runtime.wait_duration(MAXIMUM_EVENT_WAIT)?;
-            if let Some(deadline) = deadline {
-                let now = Instant::now();
-                if now >= deadline {
-                    eprintln!("[host-rs] auto-exit after bounded run");
-                    break;
+    let run_result = match runtime.initialize_view(&view_options) {
+        Ok(()) => {
+            eprintln!("[host-rs] runtime core initialized");
+            (|| {
+                runtime.run_due_tasks()?;
+                runtime.ensure_healthy()?;
+                while unsafe { ffi::glfw_window_should_close(window.raw()) } == ffi::GLFW_FALSE {
+                    ensure_callback_did_not_panic()?;
+                    runtime.run_due_tasks()?;
+                    if options.exit_after_first_frame && runtime.first_frame_ready() {
+                        eprintln!("[host-rs] auto-exit after first rendered frame");
+                        break;
+                    }
+                    let mut timeout = runtime.wait_duration(MAXIMUM_EVENT_WAIT)?;
+                    if let Some(deadline) = deadline {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            eprintln!("[host-rs] auto-exit after bounded run");
+                            break;
+                        }
+                        timeout = timeout.min(deadline.duration_since(now));
+                    }
+                    unsafe { ffi::glfw_wait_events_timeout(timeout.as_secs_f64().max(0.0005)) };
+                    ensure_callback_did_not_panic()?;
+                    runtime.ensure_healthy()?;
                 }
-                timeout = timeout.min(deadline.duration_since(now));
-            }
-            unsafe { ffi::glfw_wait_events_timeout(timeout.as_secs_f64().max(0.0005)) };
-            ensure_callback_did_not_panic()?;
-            runtime.ensure_healthy()?;
+                ensure_callback_did_not_panic()
+            })()
         }
-        ensure_callback_did_not_panic()
-    })();
+        Err(error) => Err(error),
+    };
     let shutdown_result = runtime.shutdown();
     let requires_process_exit = runtime.requires_process_exit_without_glfw_cleanup();
+    let fatal_log = if runtime.native_callbacks_not_quiesced() {
+        NATIVE_CALLBACKS_LOG
+    } else {
+        STRANDED_GL_LOG
+    };
     // A kind-only io::Error carries no formatted/custom payload and is saved
     // before the fatal branch disables all native cleanup.
     let fatal_error = io::Error::from(io::ErrorKind::Other);
@@ -227,7 +247,7 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
         std::mem::forget(_glfw);
 
         // With native cleanup disabled, diagnostics are strictly best effort.
-        let _ = io::stderr().write_all(STRANDED_GL_LOG);
+        let _ = io::stderr().write_all(fatal_log);
         return Err(fatal_error);
     }
     if shutdown_result.is_ok() {
