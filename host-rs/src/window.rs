@@ -1,19 +1,22 @@
 mod ffi;
 
 use std::ffi::{c_void, CStr, CString};
-use std::io;
+use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use lynx_launcher_host::runtime::{EventWake, GlApi, RuntimeCore};
 use lynx_launcher_host::support::xsettings_window_scale;
 use lynx_launcher_host::{verify_linked_lynx, WindowRunOptions};
 
 const INITIAL_WIDTH: f32 = 1120.0;
 const INITIAL_HEIGHT: f32 = 760.0;
 const MAXIMUM_EVENT_WAIT: Duration = Duration::from_millis(250);
+const STRANDED_GL_LOG: &[u8] = b"[host-rs] fatal: renderer stranded an OpenGL context; \
+skipping glfwDestroyWindow/glfwTerminate and exiting for OS cleanup\n";
 
 static CALLBACK_PANICKED: AtomicBool = AtomicBool::new(false);
 
@@ -157,11 +160,6 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
     eprintln!("[host-rs] OpenGL: {version} via pinned GLFW X11");
     eprintln!("[host-rs] first shell GL frame presented");
 
-    if options.exit_after_first_frame {
-        eprintln!("[host-rs] auto-exit after first shell frame");
-        return Ok(());
-    }
-
     let deadline = options
         .run_for_seconds
         .map(|seconds| {
@@ -174,23 +172,91 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
         })
         .transpose()?;
 
-    while unsafe { ffi::glfw_window_should_close(window.raw()) } == ffi::GLFW_FALSE {
-        ensure_callback_did_not_panic()?;
-        let timeout = if let Some(deadline) = deadline {
-            let now = Instant::now();
-            if now >= deadline {
-                eprintln!("[host-rs] auto-exit after bounded run");
-                break;
+    // SAFETY: `runtime` shuts down before `window` and `_glfw` are dropped;
+    // the function table is static and the wake callback has no userdata.
+    let mut runtime = unsafe {
+        RuntimeCore::initialize(
+            window.raw().cast(),
+            GlApi::new(
+                runtime_make_context_current,
+                runtime_get_current_context,
+                runtime_swap_buffers,
+                runtime_get_proc_address,
+            ),
+            EventWake::new(std::ptr::null_mut(), runtime_wake_event_loop),
+        )
+    }?;
+    eprintln!("[host-rs] runtime core initialized");
+
+    let run_result = (|| {
+        runtime.run_due_tasks()?;
+        runtime.ensure_healthy()?;
+        if options.exit_after_first_frame {
+            eprintln!("[host-rs] auto-exit after first shell frame");
+            return Ok(());
+        }
+
+        while unsafe { ffi::glfw_window_should_close(window.raw()) } == ffi::GLFW_FALSE {
+            ensure_callback_did_not_panic()?;
+            runtime.run_due_tasks()?;
+            let mut timeout = runtime.wait_duration(MAXIMUM_EVENT_WAIT)?;
+            if let Some(deadline) = deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    eprintln!("[host-rs] auto-exit after bounded run");
+                    break;
+                }
+                timeout = timeout.min(deadline.duration_since(now));
             }
-            MAXIMUM_EVENT_WAIT.min(deadline.duration_since(now))
-        } else {
-            MAXIMUM_EVENT_WAIT
-        };
-        unsafe { ffi::glfw_wait_events_timeout(timeout.as_secs_f64()) };
-        ensure_callback_did_not_panic()?;
-        present_shell_frame(&window, framebuffer_width, framebuffer_height)?;
+            unsafe { ffi::glfw_wait_events_timeout(timeout.as_secs_f64().max(0.0005)) };
+            ensure_callback_did_not_panic()?;
+            runtime.ensure_healthy()?;
+        }
+        ensure_callback_did_not_panic()
+    })();
+    let shutdown_result = runtime.shutdown();
+    let requires_process_exit = runtime.requires_process_exit_without_glfw_cleanup();
+    // A kind-only io::Error carries no formatted/custom payload and is saved
+    // before the fatal branch disables all native cleanup.
+    let fatal_error = io::Error::from(io::ErrorKind::Other);
+    if requires_process_exit {
+        // Do not format, log, or otherwise risk unwinding until every owner
+        // whose Drop would touch GLFW has been intentionally forgotten.
+        std::mem::forget(runtime);
+        std::mem::forget(window);
+        std::mem::forget(_glfw);
+
+        // With native cleanup disabled, diagnostics are strictly best effort.
+        let _ = io::stderr().write_all(STRANDED_GL_LOG);
+        return Err(fatal_error);
     }
-    ensure_callback_did_not_panic()
+    if shutdown_result.is_ok() {
+        eprintln!("[host-rs] runtime core shutdown complete");
+    }
+    run_result?;
+    shutdown_result
+}
+
+unsafe fn runtime_make_context_current(window: *mut c_void) {
+    unsafe { ffi::glfw_make_context_current(window.cast()) };
+}
+
+unsafe fn runtime_get_current_context() -> *mut c_void {
+    unsafe { ffi::glfw_get_current_context().cast() }
+}
+
+unsafe fn runtime_swap_buffers(window: *mut c_void) {
+    unsafe { ffi::glfw_swap_buffers(window.cast()) };
+}
+
+unsafe fn runtime_get_proc_address(name: *const std::ffi::c_char) -> *mut c_void {
+    unsafe { ffi::glfw_get_proc_address(name) }
+        .map(|function| function as *const () as *mut c_void)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+unsafe fn runtime_wake_event_loop(_: *mut c_void) {
+    unsafe { ffi::glfw_post_empty_event() };
 }
 
 fn present_shell_frame(window: &PopupWindow, width: i32, height: i32) -> io::Result<()> {
@@ -303,6 +369,10 @@ fn configure_popup_window(window: *mut ffi::GlfwWindow) -> io::Result<()> {
     if display.is_null() || native_window == ffi::X_NONE {
         return Err(io::Error::other("could not access the launcher X11 window"));
     }
+
+    // Preserve the verified shell color on later X11 Expose clears without
+    // reacquiring the GL context after the Lynx renderer starts.
+    unsafe { ffi::x_set_window_background(display, native_window, 0x0009_0a0b) };
 
     let window_type = intern_atom(display, c"_NET_WM_WINDOW_TYPE")?;
     let normal_type = intern_atom(display, c"_NET_WM_WINDOW_TYPE_NORMAL")?;

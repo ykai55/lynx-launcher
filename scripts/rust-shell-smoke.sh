@@ -115,12 +115,21 @@ wait_for_host_exit() {
   return 1
 }
 
+assert_clean_host_log() {
+  local path="$1" label="$2"
+  if grep -Eq -- 'destroyed thread host|Maybe leaked|post an unknown task|LoadJSSource load js error|\[lynx-error' "${path}"; then
+    dump_log "${path}"
+    die "${label} emitted a forbidden lifecycle or Lynx error"
+  fi
+}
+
 first_frame_log="${run_directory}/first-frame.log"
 if ! timeout --foreground 10s "${rust_host_binary}" --exit-after-first-frame \
   >"${first_frame_log}" 2>&1; then
   dump_log "${first_frame_log}"
   die "Rust shell first-frame process failed"
 fi
+assert_clean_host_log "${first_frame_log}" "Rust shell first-frame process"
 grep -Fq -- '[host-rs] first shell GL frame presented' "${first_frame_log}" || {
   dump_log "${first_frame_log}"
   die "Rust shell first-frame marker was not emitted"
@@ -128,6 +137,14 @@ grep -Fq -- '[host-rs] first shell GL frame presented' "${first_frame_log}" || {
 grep -Fq -- '[host-rs] auto-exit after first shell frame' "${first_frame_log}" || {
   dump_log "${first_frame_log}"
   die "Rust shell did not auto-exit after its first frame"
+}
+grep -Fq -- '[host-rs] runtime core initialized' "${first_frame_log}" || {
+  dump_log "${first_frame_log}"
+  die "Rust shell first-frame process did not initialize the runtime core"
+}
+grep -Fq -- '[host-rs] runtime core shutdown complete' "${first_frame_log}" || {
+  dump_log "${first_frame_log}"
+  die "Rust shell first-frame process did not release the runtime core"
 }
 
 for ((iteration = 1; iteration <= iterations; iteration += 1)); do
@@ -155,9 +172,18 @@ for ((iteration = 1; iteration <= iterations; iteration += 1)); do
     dump_log "${host_log}"
     die "Rust shell iteration ${iteration} did not exit cleanly after focus loss"
   fi
+  assert_clean_host_log "${host_log}" "Rust shell iteration ${iteration}"
   grep -Fq -- '[host-rs] window lost focus; exiting' "${host_log}" || {
     dump_log "${host_log}"
     die "Rust shell iteration ${iteration} did not handle focus loss"
+  }
+  grep -Fq -- '[host-rs] runtime core initialized' "${host_log}" || {
+    dump_log "${host_log}"
+    die "Rust shell iteration ${iteration} did not initialize the runtime core"
+  }
+  grep -Fq -- '[host-rs] runtime core shutdown complete' "${host_log}" || {
+    dump_log "${host_log}"
+    die "Rust shell iteration ${iteration} did not release the runtime core"
   }
   printf 'Rust shell smoke iteration %s/%s passed.\n' "${iteration}" "${iterations}"
 done

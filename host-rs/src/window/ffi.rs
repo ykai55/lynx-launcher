@@ -17,6 +17,7 @@ pub struct Display {
 
 pub type GlfwErrorCallback = Option<unsafe extern "C" fn(c_int, *const c_char)>;
 pub type GlfwWindowFocusCallback = Option<unsafe extern "C" fn(*mut GlfwWindow, c_int)>;
+pub type GlfwGlProc = Option<unsafe extern "C" fn()>;
 pub type Atom = c_ulong;
 pub type XWindow = c_ulong;
 
@@ -91,6 +92,8 @@ unsafe extern "C" {
     ) -> GlfwWindowFocusCallback;
     #[link_name = "glfwWaitEventsTimeout"]
     pub fn glfw_wait_events_timeout(timeout: c_double);
+    #[link_name = "glfwPostEmptyEvent"]
+    pub fn glfw_post_empty_event();
     #[link_name = "glfwMakeContextCurrent"]
     pub fn glfw_make_context_current(window: *mut GlfwWindow);
     #[link_name = "glfwGetCurrentContext"]
@@ -99,6 +102,8 @@ unsafe extern "C" {
     pub fn glfw_swap_buffers(window: *mut GlfwWindow);
     #[link_name = "glfwSwapInterval"]
     pub fn glfw_swap_interval(interval: c_int);
+    #[link_name = "glfwGetProcAddress"]
+    pub fn glfw_get_proc_address(name: *const c_char) -> GlfwGlProc;
 
     #[link_name = "glfwGetX11Display"]
     pub fn glfw_get_x11_display() -> *mut Display;
@@ -137,6 +142,12 @@ unsafe extern "C" {
         mode: c_int,
         data: *const c_uchar,
         element_count: c_int,
+    ) -> c_int;
+    #[link_name = "XSetWindowBackground"]
+    pub fn x_set_window_background(
+        display: *mut Display,
+        window: XWindow,
+        background_pixel: c_ulong,
     ) -> c_int;
     #[link_name = "XFlush"]
     pub fn x_flush(display: *mut Display) -> c_int;
