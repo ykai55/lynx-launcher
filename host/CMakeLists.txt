@@ -59,6 +59,15 @@ set_target_properties(lynx_sdk PROPERTIES
   IMPORTED_LOCATION "${LYNX_SDK_DIR}/lib/liblynx.so"
 )
 
+add_library(lynx_sys_shim STATIC
+  "${LYNX_SYS_DIR}/src/lynx_sys_shim.cc"
+)
+target_include_directories(lynx_sys_shim
+  PUBLIC "${LYNX_SYS_DIR}/include"
+  PRIVATE "${LYNX_SDK_DIR}/include"
+)
+target_link_libraries(lynx_sys_shim PRIVATE lynx_sdk)
+
 set(CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/cargo-target")
 set(PLATFORM_STATIC_LIB "${CARGO_TARGET_DIR}/release/liblynx_launcher_platform.a")
 set(RUST_HOST_CARGO_BINARY "${CARGO_TARGET_DIR}/release/lynx-launcher-rs")
@@ -90,14 +99,17 @@ add_custom_command(
 add_custom_command(
   OUTPUT "${RUST_HOST_CARGO_BINARY}"
   COMMAND "${CMAKE_COMMAND}" -E env
-          "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
-          "LYNX_SDK_DIR=${LYNX_SDK_DIR}"
-          "LYNX_LAUNCHER_GLFW_ARCHIVE=$<TARGET_FILE:glfw>"
-          cargo build --release --locked -p lynx-launcher-host
+           "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
+           "LYNX_SDK_DIR=${LYNX_SDK_DIR}"
+           "LYNX_LAUNCHER_LYNX_SHIM_ARCHIVE=$<TARGET_FILE:lynx_sys_shim>"
+           "LYNX_LAUNCHER_GLFW_ARCHIVE=$<TARGET_FILE:glfw>"
+           "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=${CMAKE_CXX_COMPILER}"
+           cargo build --release --locked -p lynx-launcher-host
           --bin lynx-launcher-rs
   WORKING_DIRECTORY "${LAUNCHER_ROOT}"
   DEPENDS
     glfw
+    lynx_sys_shim
     "${PLATFORM_STATIC_LIB}"
     "${LAUNCHER_ROOT}/Cargo.toml"
     "${LAUNCHER_ROOT}/Cargo.lock"
@@ -220,7 +232,40 @@ if(BUILD_TESTING)
     X11::X11
   )
 
+  add_library(lynx_sys_c_header_smoke OBJECT
+    tests/lynx_sys_c_header_smoke.c
+  )
+  target_include_directories(lynx_sys_c_header_smoke PRIVATE
+    "${LYNX_SYS_DIR}/include"
+  )
+
+  add_executable(lynx_sys_abi_test
+    tests/lynx_sys_abi_test.cc
+    $<TARGET_OBJECTS:lynx_sys_c_header_smoke>
+  )
+  target_include_directories(lynx_sys_abi_test PRIVATE
+    "${LYNX_SDK_DIR}/include"
+    "${LYNX_SYS_DIR}/include"
+  )
+  target_link_libraries(lynx_sys_abi_test PRIVATE
+    lynx_sys_shim
+    lynx_sdk
+  )
+
   add_test(NAME host_support_test COMMAND host_support_test)
+  add_test(NAME lynx_sys_abi_test COMMAND lynx_sys_abi_test)
+  add_test(NAME lynx_sys_rust_abi_test
+    COMMAND "${CMAKE_COMMAND}" -E env
+            "CARGO_TARGET_DIR=${CMAKE_BINARY_DIR}/cargo-abi-target"
+            "LYNX_SDK_DIR=${LYNX_SDK_DIR}"
+            "LYNX_LAUNCHER_LYNX_SHIM_ARCHIVE=$<TARGET_FILE:lynx_sys_shim>"
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=${CMAKE_CXX_COMPILER}"
+            "LD_LIBRARY_PATH=${LYNX_SDK_DIR}/lib"
+            cargo test --locked -p lynx-sys --test abi)
+  set_tests_properties(lynx_sys_rust_abi_test PROPERTIES
+    RUN_SERIAL TRUE
+    WORKING_DIRECTORY "${LAUNCHER_ROOT}"
+  )
   add_test(NAME launcher_resource_smoke
            COMMAND lynx-launcher --check-resources)
   add_test(NAME launcher_rejects_empty_icu

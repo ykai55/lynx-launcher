@@ -7,7 +7,62 @@ use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-type LynxLogCallback = unsafe extern "C" fn(c_int, *const c_char, *const c_char);
+pub type LynxLogCallback = Option<unsafe extern "C" fn(c_int, *const c_char, *const c_char)>;
+
+#[repr(C)]
+pub struct LynxTaskRunner {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct LynxWindowlessRenderer {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct LynxViewBuilder {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct LynxView {
+    _private: [u8; 0],
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct LynxTask {
+    pub runner: *mut LynxTaskRunner,
+    pub task: u64,
+}
+
+pub type LynxUiRunsOnCurrentThreadCallback = Option<unsafe extern "C" fn(*mut c_void) -> bool>;
+pub type LynxUiPostTaskCallback = Option<unsafe extern "C" fn(LynxTask, u64, *mut c_void)>;
+
+#[repr(C)]
+pub struct LynxUiTaskRunnerConfig {
+    pub struct_size: usize,
+    pub user_data: *mut c_void,
+    pub runs_on_current_thread_callback: LynxUiRunsOnCurrentThreadCallback,
+    pub post_task_callback: LynxUiPostTaskCallback,
+}
+
+pub type LynxRendererFinalizer =
+    Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer, *mut c_void)>;
+pub type LynxGlMakeCurrentCallback =
+    Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer) -> bool>;
+pub type LynxGlClearCurrentCallback =
+    Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer) -> bool>;
+pub type LynxGlPresentCallback = Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer) -> bool>;
+pub type LynxGlCreateFboCallback =
+    Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer, c_int, c_int) -> u32>;
+pub type LynxGlProcResolverCallback =
+    Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer, *const c_char) -> *mut c_void>;
+pub type LynxRendererPostTaskCallback =
+    Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer, LynxTask, u64)>;
+
+pub const LYNX_LOG_INFO: c_int = 2;
+pub const LYNX_RENDERER_TYPE_GL_DIRECT: c_int = 2;
 
 #[repr(C)]
 struct DlInfo {
@@ -17,9 +72,70 @@ struct DlInfo {
     symbol_address: *mut c_void,
 }
 
-#[link(name = "lynx")]
 unsafe extern "C" {
-    fn lynx_log_init(callback: LynxLogCallback);
+    pub fn lynx_log_init(callback: LynxLogCallback);
+    pub fn lynx_log_set_minimum_level(level: c_int);
+
+    pub fn lynx_windowless_set_global_ui_task_runner(config: *const LynxUiTaskRunnerConfig)
+        -> bool;
+    pub fn lynx_windowless_run_ui_task(task: LynxTask) -> bool;
+
+    pub fn lynx_windowless_renderer_create_with_finalizer(
+        renderer_type: c_int,
+        user_data: *mut c_void,
+        finalizer: LynxRendererFinalizer,
+    ) -> *mut LynxWindowlessRenderer;
+    pub fn lynx_windowless_renderer_get_user_data(
+        renderer: *mut LynxWindowlessRenderer,
+    ) -> *mut c_void;
+    pub fn lynx_windowless_renderer_bind_on_gl_make_current(
+        renderer: *mut LynxWindowlessRenderer,
+        callback: LynxGlMakeCurrentCallback,
+    );
+    pub fn lynx_windowless_renderer_bind_on_gl_clear_current(
+        renderer: *mut LynxWindowlessRenderer,
+        callback: LynxGlClearCurrentCallback,
+    );
+    pub fn lynx_windowless_renderer_bind_on_gl_present(
+        renderer: *mut LynxWindowlessRenderer,
+        callback: LynxGlPresentCallback,
+    );
+    pub fn lynx_windowless_renderer_bind_on_gl_create_fbo(
+        renderer: *mut LynxWindowlessRenderer,
+        callback: LynxGlCreateFboCallback,
+    );
+    pub fn lynx_windowless_renderer_bind_on_gl_proc_resolver(
+        renderer: *mut LynxWindowlessRenderer,
+        callback: LynxGlProcResolverCallback,
+    );
+    pub fn lynx_windowless_renderer_bind_on_post_task(
+        renderer: *mut LynxWindowlessRenderer,
+        callback: LynxRendererPostTaskCallback,
+    );
+    pub fn lynx_windowless_renderer_run_task(renderer: *mut LynxWindowlessRenderer, task: LynxTask);
+    pub fn lynx_windowless_renderer_release(renderer: *mut LynxWindowlessRenderer);
+
+    pub fn lynx_sys_view_builder_set_screen_size(
+        builder: *mut LynxViewBuilder,
+        width: f32,
+        height: f32,
+        pixel_ratio: f32,
+    );
+    pub fn lynx_sys_view_builder_set_frame(
+        builder: *mut LynxViewBuilder,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    );
+    pub fn lynx_sys_view_builder_set_font_scale(builder: *mut LynxViewBuilder, scale: f32);
+    pub fn lynx_sys_view_update_screen_metrics(
+        view: *mut LynxView,
+        width: f32,
+        height: f32,
+        pixel_ratio: f32,
+    );
+    pub fn lynx_sys_view_set_frame(view: *mut LynxView, x: f32, y: f32, width: f32, height: f32);
 }
 
 #[link(name = "dl")]
