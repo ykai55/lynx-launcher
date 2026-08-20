@@ -60,9 +60,9 @@ UI 不依赖浏览器 DOM；C++ host 拥有 embedder、图形、输入和任务�
 操作系统策略与 `.desktop` 解析。完整边界、数据流和所有权说明见
 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-迁移中的 `host-rs` 目前只提供 side-by-side `--check-resources` tracer，用于验证 Rust
-CLI、support logic、platform direct interface 和 staged `liblynx.so` linkage；它尚不创建
-窗口，也不替代上图中的 C++ host。
+迁移中的 `host-rs` 是 side-by-side popup GL shell：它验证 Rust CLI、support logic、
+platform direct interface、staged `liblynx.so` linkage，以及 pinned GLFW/X11/OpenGL 窗口
+和静态 shell frame。它尚不创建 Lynx view，也不替代上图中的 C++ host。
 
 ## 目录
 
@@ -70,7 +70,7 @@ CLI、support logic、platform direct interface 和 staged `liblynx.so` linkage�
 | --- | --- |
 | `platform/` | Rust 应用发现、启动、图标解析、稳定 C ABI 及测试。 |
 | `lynx-sys/` | 最小 Lynx raw binding 与 native library path probe。 |
-| `host-rs/` | Rust host 迁移 tracer；当前仅支持无窗口 resource/link check。 |
+| `host-rs/` | Rust host 迁移 tracer；当前支持 resource/link check 和 popup GL shell。 |
 | `ui/` | ReactLynx/TypeScript UI，Rspeedy 输出 bundle。 |
 | `host/` | C++20 embedder、GLFW/OpenGL、N-API bridge、CMake 与 native tests。 |
 | `scripts/` | 首选的 bootstrap、构建、测试、运行和图形测试入口。 |
@@ -162,10 +162,14 @@ older-source/newer-target 回归场景。
 
 ```sh
 ./host/build/lynx-launcher-rs --check-resources
+./host/build/lynx-launcher-rs --run-for 10
+./host/build/lynx-launcher-rs --exit-after-first-frame
 ```
 
 它会额外确认实际加载的 Lynx symbol 来自 executable 同目录的 staged `liblynx.so`。
-未带 `--check-resources` 时会明确拒绝运行；图形入口仍是 `scripts/run.sh`。
+window mode 使用 CMake 构建的 pinned GLFW static archive，创建 X11/XWayland popup 并提交
+静态 OpenGL shell frame；`[host-rs] first shell GL frame presented` 不代表 Lynx 已完成布局
+或渲染。默认图形入口仍是 `scripts/run.sh`。
 
 ## 测试
 
@@ -189,6 +193,13 @@ LYNX_LAUNCHER_SMOKE=1 LYNX_LAUNCHER_SMOKE_TIMEOUT=45s ./scripts/test.sh
 ```
 
 进程必须在 timeout 前同时报告 first-screen layout 和首个 GL present。
+该入口还会运行 Rust shell 的 popup、可见背景像素、focus-loss 退出和首帧自动退出检查。
+也可单独执行并增加重复次数：
+
+```sh
+./scripts/rust-shell-smoke.sh
+LYNX_LAUNCHER_RUST_SHELL_ITERATIONS=10 ./scripts/rust-shell-smoke.sh
+```
 
 ### 搜索 + 图标 + 启动 E2E
 
@@ -255,7 +266,7 @@ LYNX_LAUNCHER_TEARDOWN_TIMEOUT=45s ./scripts/teardown-stress.sh
 | --- | --- |
 | `ui/dist/main.lynx.bundle` | Rspeedy production bundle。 |
 | `host/build/lynx-launcher` | 默认 C++ 可执行文件。 |
-| `host/build/lynx-launcher-rs` | side-by-side Rust resource/link tracer。 |
+| `host/build/lynx-launcher-rs` | side-by-side Rust resource/link 与 popup GL shell tracer。 |
 | `host/build/liblynx.so` | verified SDK shared library。 |
 | `host/build/lynx_core.js` | engine 默认 `$ORIGIN/lynx_core.js` lookup。 |
 | `host/build/resources/main.lynx.bundle` | host 显式加载的 UI bundle。 |

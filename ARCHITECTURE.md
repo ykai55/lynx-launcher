@@ -24,8 +24,10 @@ than an application layer.
 `host-rs/` is currently a side-by-side migration tracer, not another production
 layer. It implements the executable CLI and pure host support behavior, directly
 uses the Rust platform interface for discovery, and verifies that its linked
-`lynx_log_init` symbol resolves to the staged `$ORIGIN/liblynx.so`. It supports
-only `--check-resources`; the C++ binary remains the default windowed host.
+`lynx_log_init` symbol resolves to the staged `$ORIGIN/liblynx.so`. Its windowed
+path owns a popup-like pinned-GLFW X11 window, OpenGL 3.3 context, static shell
+frame, focus exit, and bounded event loop. It does not create a Lynx view; the C++
+binary remains the default host.
 
 ## Layers
 
@@ -59,8 +61,10 @@ for the engine preloader's default lookup.
 `host-rs/src/support.rs` preserves those pure path, file, URI, XSettings, scroll,
 UTF-8, and window-metric semantics as the first migration tracer. `lynx-sys/`
 contains only the verified Lynx logging symbol binding and dynamic-loader path
-probe at this stage. GLFW, rendering, callbacks, weak N-API, task queues, and
-teardown remain exclusively in the C++ host.
+probe at this stage. The binary-private Rust window module uses raw GLFW, X11,
+and OpenGL bindings and catches panic in its error/focus callbacks. Lynx
+rendering, weak N-API, input, task queues, and view teardown remain exclusively
+in the C++ host.
 
 ### ReactLynx UI
 
@@ -129,6 +133,13 @@ the host. On a Wayland desktop this runs through XWayland and therefore requires
 `DISPLAY`. Enabling native Wayland is more than a build switch: clipboard, text
 input/IME, cursor, scale, and context behavior must be validated before the host
 can claim that backend.
+
+The Rust shell links the same CMake `glfw` static target directly rather than a
+system or crate-provided GLFW. Its `[host-rs] first shell GL frame presented`
+marker proves only the static clear/swap path and is deliberately distinct from
+the C++ host's Lynx first-frame marker. While the shell event loop is active it
+repaints after X11 events so mapped-window Expose handling cannot replace the
+verified shell color with the X11 background.
 
 At startup the host combines GLFW's X11 content scale with the XSettings
 `Gdk/WindowScalingFactor`. It creates a correspondingly larger physical window

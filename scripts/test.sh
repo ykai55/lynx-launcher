@@ -52,6 +52,7 @@ case "${LYNX_LAUNCHER_SMOKE:-0}" in
       die "invalid LYNX_LAUNCHER_SMOKE_TIMEOUT: ${smoke_timeout}"
     printf 'Running graphical first-frame smoke with timeout %s\n' "${smoke_timeout}"
     timeout --foreground -- "${smoke_timeout}" "${host_binary}" --exit-after-first-frame
+    "${scripts_dir}/rust-shell-smoke.sh"
     ;;
   *)
     die "LYNX_LAUNCHER_SMOKE must be 0/false/no or 1/true/yes"

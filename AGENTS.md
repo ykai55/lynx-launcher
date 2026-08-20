@@ -37,7 +37,7 @@ Rust platform / XDG discovery / icon lookup / process launch
 | `platform/include/lynx_launcher.h` | C ABI public contract；必须与 `ffi.rs` 同步。 |
 | `platform/tests/` | discovery、Exec 安全、icon 和 ABI ownership 回归。 |
 | `lynx-sys/` | 最小 Lynx raw binding、native linkage 和后续严格 C shim。 |
-| `host-rs/` | side-by-side Rust host；当前只拥有 CLI、support logic 和无窗口 resource/link check。 |
+| `host-rs/` | side-by-side Rust host；当前拥有 CLI、support logic、resource/link check 和 popup GL shell。 |
 | `host/src/main.cc` | Lynx/GLFW host、N-API Promise、线程、输入和 lifecycle。 |
 | `host/src/support.*` | 可独立测试的 path、file、URI、UTF-8 支持逻辑。 |
 | `host/tests/`、`host/cmake/` | native tests、X11 E2E driver、resource refresh checks。 |
@@ -77,6 +77,7 @@ Rust platform / XDG discovery / icon lookup / process launch
 | 生命周期 stress | `./scripts/teardown-stress.sh` |
 | 运行 | `./scripts/run.sh` |
 | 无窗口 ABI/resource check | `./scripts/run.sh --check-resources` |
+| Rust popup GL shell smoke | `./scripts/rust-shell-smoke.sh` |
 
 `./host/build.sh` 仅用于已有 `ui/dist/main.lynx.bundle` 后的 host/Rust/CMake 增量构建与
 CTest；它不能代替 UI 验证。
@@ -92,6 +93,7 @@ CTest；它不能代替 UI 验证。
 | UI layout、input、icon rendering、launch interaction | `./scripts/test.sh`；首帧 smoke；`./scripts/e2e-launch.sh` |
 | C++ support、CMake、runtime resource copy | `./scripts/test.sh` |
 | GLFW/input/render/task queue/lifecycle | `./scripts/test.sh`；首帧 smoke；相关 E2E；`./scripts/teardown-stress.sh` |
+| Rust GLFW/X11/OpenGL shell | `./scripts/test.sh`；`./scripts/rust-shell-smoke.sh`；C++ 首帧 smoke、E2E 和 teardown 回归。 |
 | `scripts/bootstrap.sh`、SDK provenance、gitlink、Lynx patch | `./scripts/bootstrap.sh`；`./scripts/test.sh`；首帧 smoke；`./scripts/teardown-stress.sh` |
 | E2E driver 或 process cleanup | `./scripts/e2e-launch.sh`，用 `LYNX_LAUNCHER_E2E_ITERATIONS` 重复 |
 
@@ -159,10 +161,12 @@ CTest；它不能代替 UI 验证。
 
 ## Rust Host Tracer 约束
 
-- `host-rs` 当前是 side-by-side 无窗口 tracer，不是默认 host。`scripts/run.sh`、smoke、E2E
+- `host-rs` 当前是 side-by-side popup GL shell，不是默认 host。`scripts/run.sh`、C++ smoke、E2E
   和 teardown 继续使用 `host/build/lynx-launcher`，直到独立 parity gate 完成。
 - tracer 必须从 executable 相对位置读取 staged runtime，并核验 `lynx_log_init` 实际来自同目录
   的 `liblynx.so`；不能用只读资源文件冒充 native linkage 验证。
+- Rust shell 只能直链 CMake `$<TARGET_FILE:glfw>` 提供的 pinned static archive；不能使用系统
+  GLFW、crate-bundled GLFW 或 native Wayland。shell frame marker 不能冒充 Lynx first frame。
 - `lynx-sys` 只暴露已核对的窄 binding。五个 C++ float-reference wrapper 属于后续 renderer
   阶段，必须作为严格 `extern "C"` by-value shim 落在该模块，不能硬编码 C++ reference ABI。
 - Rust host 直接使用 `platform` Rust interface；现有 C ABI 在 C++ host 移除前继续保留并测试。

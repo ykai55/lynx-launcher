@@ -23,5 +23,5 @@ cmake -S "${host_dir}" -B "${host_build_dir}" \
   -DLYNX_SDK_DIR="${verified_sdk_dir}"
 cmake --build "${host_build_dir}" --parallel
 
-printf 'Build complete: %s (default), %s (resource tracer)\n' \
+printf 'Build complete: %s (default), %s (Rust window shell)\n' \
   "${host_binary}" "${rust_host_binary}"

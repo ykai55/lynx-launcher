@@ -23,6 +23,8 @@ struct Options {
     bundle: Option<PathBuf>,
     lynx_core: Option<PathBuf>,
     icu: Option<PathBuf>,
+    run_for_seconds: Option<f64>,
+    exit_after_first_frame: bool,
     check_resources: bool,
 }
 
@@ -38,9 +40,17 @@ struct RuntimePaths {
     icu: PathBuf,
 }
 
-pub fn run<I>(arguments: I) -> Result<(), Box<dyn Error>>
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowRunOptions {
+    pub run_for_seconds: Option<f64>,
+    pub exit_after_first_frame: bool,
+    pub expected_lynx_library: PathBuf,
+}
+
+pub fn run<I, W>(arguments: I, run_window: W) -> Result<(), Box<dyn Error>>
 where
     I: IntoIterator<Item = OsString>,
+    W: FnOnce(WindowRunOptions) -> Result<(), Box<dyn Error>>,
 {
     let arguments: Vec<OsString> = arguments.into_iter().collect();
     let program = arguments
@@ -55,14 +65,15 @@ where
 
     let executable_directory = executable_directory(program)?;
     let paths = resolve_runtime_paths(&options, &executable_directory)?;
-    if !options.check_resources {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "windowed Rust host is not implemented; use --check-resources",
-        )
-        .into());
+    if options.check_resources {
+        check_resources(&paths, &executable_directory.join("liblynx.so"))
+    } else {
+        run_window(WindowRunOptions {
+            run_for_seconds: options.run_for_seconds,
+            exit_after_first_frame: options.exit_after_first_frame,
+            expected_lynx_library: executable_directory.join("liblynx.so"),
+        })
     }
-    check_resources(&paths, &executable_directory)
 }
 
 fn parse_options(arguments: &[OsString]) -> io::Result<ParseOutcome> {
@@ -88,14 +99,14 @@ fn parse_options(arguments: &[OsString]) -> io::Result<ParseOutcome> {
             options.icu = Some(PathBuf::from(value_after("--icu")?));
         } else if argument == "--run-for" {
             let value = value_after("--run-for")?;
-            parse_positive_seconds(value).ok_or_else(|| {
+            options.run_for_seconds = Some(parse_positive_seconds(value).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "--run-for must be a positive number",
                 )
-            })?;
+            })?);
         } else if argument == "--exit-after-first-frame" {
-            // Accepted for CLI parity; the tracer never starts a window.
+            options.exit_after_first_frame = true;
         } else if argument == "--check-resources" {
             options.check_resources = true;
         } else if argument == "--help" {
@@ -163,33 +174,13 @@ fn resolve_runtime_paths(
 
 fn check_resources(
     paths: &RuntimePaths,
-    executable_directory: &Path,
+    expected_lynx_library: &Path,
 ) -> Result<(), Box<dyn Error>> {
     let icu = read_file(&paths.icu)?;
     let core = read_file(&paths.lynx_core)?;
     let bundle = read_file(&paths.bundle)?;
 
-    let expected_library = require_file(
-        "staged liblynx.so",
-        None,
-        None,
-        None,
-        &[executable_directory.join("liblynx.so")],
-    )?;
-    let loaded_library = fs::canonicalize(lynx_sys::loaded_library_path()?).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("could not resolve loaded liblynx.so path: {error}"),
-        )
-    })?;
-    if loaded_library != expected_library {
-        return Err(io::Error::other(format!(
-            "loaded liblynx.so from {}, expected {}",
-            loaded_library.display(),
-            expected_library.display()
-        ))
-        .into());
-    }
+    let loaded_library = verify_linked_lynx(expected_lynx_library)?;
 
     let launcher = Launcher::discover()?;
     println!(
@@ -203,6 +194,30 @@ fn check_resources(
     Ok(())
 }
 
+pub fn verify_linked_lynx(expected_lynx_library: &Path) -> io::Result<PathBuf> {
+    let expected_library = require_file(
+        "staged liblynx.so",
+        None,
+        None,
+        None,
+        &[expected_lynx_library.to_path_buf()],
+    )?;
+    let loaded_library = fs::canonicalize(lynx_sys::loaded_library_path()?).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not resolve loaded liblynx.so path: {error}"),
+        )
+    })?;
+    if loaded_library != expected_library {
+        return Err(io::Error::other(format!(
+            "loaded liblynx.so from {}, expected {}",
+            loaded_library.display(),
+            expected_library.display()
+        )));
+    }
+    Ok(loaded_library)
+}
+
 fn print_usage(program: &OsStr) {
     println!(
         "Usage: {} [options]\n\
@@ -210,7 +225,7 @@ fn print_usage(program: &OsStr) {
            --lynx-core PATH           lynx_core.js\n\
            --icu PATH                 icudtl.dat\n\
            --run-for SECONDS          Exit after a bounded run\n\
-           --exit-after-first-frame   Exit after layout and GL present\n\
+           --exit-after-first-frame   Exit after the first shell GL present\n\
            --check-resources          Validate resources and native linkage without a window\n\
            --help                     Show this help",
         program.to_string_lossy()
@@ -220,6 +235,7 @@ fn print_usage(program: &OsStr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -245,6 +261,8 @@ mod tests {
                 bundle: Some(PathBuf::from("bundle")),
                 lynx_core: Some(PathBuf::from("core")),
                 icu: Some(PathBuf::from("icu")),
+                run_for_seconds: Some(1.5),
+                exit_after_first_frame: true,
                 check_resources: true,
             })
         );
@@ -280,5 +298,56 @@ mod tests {
             parse_options(&arguments(&["--help", "--unknown"])).unwrap(),
             ParseOutcome::Help
         );
+    }
+
+    #[test]
+    fn dispatches_window_run_options() {
+        let directory = std::env::temp_dir().join(format!(
+            "lynx-launcher-rs-window-options-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let bundle = directory.join("bundle");
+        let core = directory.join("core");
+        let icu = directory.join("icu");
+        fs::write(&bundle, b"bundle").unwrap();
+        fs::write(&core, b"core").unwrap();
+        fs::write(&icu, b"icu").unwrap();
+        let received = RefCell::new(None);
+        let expected_lynx_library = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("liblynx.so");
+
+        run(
+            vec![
+                OsString::from("launcher"),
+                OsString::from("--bundle"),
+                bundle.into_os_string(),
+                OsString::from("--lynx-core"),
+                core.into_os_string(),
+                OsString::from("--icu"),
+                icu.into_os_string(),
+                OsString::from("--run-for"),
+                OsString::from("2.5"),
+                OsString::from("--exit-after-first-frame"),
+            ],
+            |options| {
+                received.replace(Some(options));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            received.borrow().clone(),
+            Some(WindowRunOptions {
+                run_for_seconds: Some(2.5),
+                exit_after_first_frame: true,
+                expected_lynx_library,
+            })
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

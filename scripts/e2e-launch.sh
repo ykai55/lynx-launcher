@@ -170,6 +170,10 @@ run_iteration() {
     --minimum-differences 10 --timeout-ms 3000
   "${click_driver}" --pid "${host_pid}" click --x 220 --y 160
   sleep 0.2
+  # A synthetic X11 click can be consumed while activating the popup. Repeat
+  # the same click once the window is active before testing Lynx input.
+  "${click_driver}" --pid "${host_pid}" click --x 220 --y 160
+  sleep 0.1
   "${click_driver}" --pid "${host_pid}" type --text cobalt
   "${click_driver}" --pid "${host_pid}" expect-pixel \
     --x 40 --y 265 --width 76 --height 76 \

@@ -49,6 +49,7 @@ set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 set(GLFW_USE_WAYLAND OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 # GLFW 3.3 declares compatibility with CMake 3.0; CMake 4 needs this floor.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 add_subdirectory("${GLFW_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/glfw" EXCLUDE_FROM_ALL)
@@ -91,10 +92,12 @@ add_custom_command(
   COMMAND "${CMAKE_COMMAND}" -E env
           "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
           "LYNX_SDK_DIR=${LYNX_SDK_DIR}"
+          "LYNX_LAUNCHER_GLFW_ARCHIVE=$<TARGET_FILE:glfw>"
           cargo build --release --locked -p lynx-launcher-host
           --bin lynx-launcher-rs
   WORKING_DIRECTORY "${LAUNCHER_ROOT}"
   DEPENDS
+    glfw
     "${PLATFORM_STATIC_LIB}"
     "${LAUNCHER_ROOT}/Cargo.toml"
     "${LAUNCHER_ROOT}/Cargo.lock"
@@ -237,6 +240,16 @@ if(BUILD_TESTING)
             "-DLAUNCHER=${RUST_HOST_BINARY}"
             "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/rust-empty-icu-test"
             -P "${CMAKE_CURRENT_LIST_DIR}/cmake/test_empty_icu.cmake")
+  add_test(NAME rust_launcher_requires_display
+    COMMAND "${CMAKE_COMMAND}"
+            "-DLAUNCHER=${RUST_HOST_BINARY}"
+            -P "${CMAKE_CURRENT_LIST_DIR}/cmake/test_rust_requires_display.cmake")
+  add_test(NAME rust_launcher_rejects_external_lynx
+    COMMAND "${CMAKE_COMMAND}"
+            "-DLAUNCHER=${RUST_HOST_BINARY}"
+            "-DSTAGED_LIBRARY=${RUNTIME_LIBLYNX}"
+            "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/rust-external-lynx-test"
+            -P "${CMAKE_CURRENT_LIST_DIR}/cmake/test_rust_rejects_external_lynx.cmake")
   add_test(NAME runtime_resource_refresh_older_source
     COMMAND "${CMAKE_COMMAND}"
             "-DREFRESH_SCRIPT=${REFRESH_RESOURCE_SCRIPT}"
