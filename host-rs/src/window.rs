@@ -62,6 +62,7 @@ impl PopupWindow {
             ffi::glfw_window_hint(ffi::GLFW_DECORATED, ffi::GLFW_FALSE);
             ffi::glfw_window_hint(ffi::GLFW_RESIZABLE, ffi::GLFW_FALSE);
             ffi::glfw_window_hint(ffi::GLFW_FLOATING, ffi::GLFW_TRUE);
+            ffi::glfw_window_hint(ffi::GLFW_FOCUS_ON_SHOW, ffi::GLFW_TRUE);
         }
         let raw = unsafe {
             ffi::glfw_create_window(
@@ -304,7 +305,7 @@ fn configure_popup_window(window: *mut ffi::GlfwWindow) -> io::Result<()> {
     }
 
     let window_type = intern_atom(display, c"_NET_WM_WINDOW_TYPE")?;
-    let utility_type = intern_atom(display, c"_NET_WM_WINDOW_TYPE_UTILITY")?;
+    let normal_type = intern_atom(display, c"_NET_WM_WINDOW_TYPE_NORMAL")?;
     unsafe {
         ffi::x_change_property(
             display,
@@ -313,7 +314,7 @@ fn configure_popup_window(window: *mut ffi::GlfwWindow) -> io::Result<()> {
             ffi::XA_ATOM,
             32,
             ffi::X_PROP_MODE_REPLACE,
-            (&utility_type as *const ffi::Atom).cast(),
+            (&normal_type as *const ffi::Atom).cast(),
             1,
         );
     }

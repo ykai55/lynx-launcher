@@ -26,6 +26,7 @@ pub const GLFW_RESIZABLE: c_int = 0x0002_0003;
 pub const GLFW_VISIBLE: c_int = 0x0002_0004;
 pub const GLFW_DECORATED: c_int = 0x0002_0005;
 pub const GLFW_FLOATING: c_int = 0x0002_0007;
+pub const GLFW_FOCUS_ON_SHOW: c_int = 0x0002_000c;
 pub const GLFW_CONTEXT_VERSION_MAJOR: c_int = 0x0002_2002;
 pub const GLFW_CONTEXT_VERSION_MINOR: c_int = 0x0002_2003;
 pub const GLFW_OPENGL_FORWARD_COMPAT: c_int = 0x0002_2006;
