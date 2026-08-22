@@ -60,10 +60,11 @@ UI 不依赖浏览器 DOM；C++ host 拥有 embedder、图形、输入和任务�
 操作系统策略与 `.desktop` 解析。完整边界、数据流和所有权说明见
 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-迁移中的 `host-rs` 是 side-by-side Lynx view tracer：它验证 Rust CLI、support logic、
+`host-rs` 是默认 Lynx host：它实现 Rust CLI、support logic、
 platform direct interface、staged `liblynx.so` linkage、pinned GLFW/X11/OpenGL 窗口，
 加载 packaged core 与 bundle 渲染真实 launcher，并已迁移 pointer、wheel、keyboard、character、
-focus、scale handling 和直接 Rust application launch。它仍不替代上图中的默认 C++ host。
+focus、scale handling 和直接 Rust application launch。完成 parity gate 后，它已成为默认 host；
+C++ 实现仅作为迁移清理前的显式 fallback。
 
 ## 目录
 
@@ -71,9 +72,9 @@ focus、scale handling 和直接 Rust application launch。它仍不替代上图
 | --- | --- |
 | `platform/` | Rust 应用发现、启动、图标解析、稳定 C ABI 及测试。 |
 | `lynx-sys/` | 最小 Lynx raw binding 与 native library path probe。 |
-| `host-rs/` | Rust host 迁移 tracer；当前支持 resource/link check、popup GL shell、真实 Lynx view、input，以及 async application launch。 |
+| `host-rs/` | 默认 Rust host：resource/link check、popup GL、真实 Lynx view、input、desktop integration 与 async application launch。 |
 | `ui/` | ReactLynx/TypeScript UI，Rspeedy 输出 bundle。 |
-| `host/` | C++20 embedder、GLFW/OpenGL、N-API bridge、CMake 与 native tests。 |
+| `host/` | CMake/native tests，以及迁移清理前保留的 C++20 fallback embedder。 |
 | `scripts/` | 首选的 bootstrap、构建、测试、运行和图形测试入口。 |
 | `patches/lynx/` | 构建 SDK 时临时应用的 allowlisted Linux windowless 补丁。 |
 | `third_party/lynx/` | pinned Lynx Git submodule 及其 SDK 构建中间产物。 |
@@ -154,6 +155,7 @@ older-source/newer-target 回归场景。
 ./scripts/run.sh
 ./scripts/run.sh --help
 ./scripts/run.sh --check-resources
+./scripts/run.sh --host cpp --check-resources
 ```
 
 `run.sh` 从 executable 相对位置寻找完整 runtime，缺失时会提示先运行
@@ -161,12 +163,11 @@ older-source/newer-target 回归场景。
 `--lynx-core PATH`、`--icu PATH`、`--run-for SECONDS` 和
 `--exit-after-first-frame`。
 
-迁移 tracer 可单独执行：
+Rust host 是默认入口；迁移窗口内可显式运行 C++ fallback：
 
 ```sh
-./host/build/lynx-launcher-rs --check-resources
-./host/build/lynx-launcher-rs --run-for 10
-./host/build/lynx-launcher-rs --exit-after-first-frame
+./host/build/lynx-launcher --run-for 10
+./host/build/lynx-launcher-cpp --run-for 10
 ```
 
 它会额外确认实际加载的 Lynx symbol 来自 executable 同目录的 staged `liblynx.so`。
@@ -176,7 +177,8 @@ core 与 bundle。`[host-rs] first shell GL frame presented` 仍不代表 Lynx r
 `[host-rs] first screen layout completed` 与 `[host-rs] first GL frame presented` 同时出现后，
 `--exit-after-first-frame` 才会退出。`getApplications()` 返回同一 Rust `Launcher` 的 platform
 direct snapshot；`launchApplication()` 立即返回真实 Promise，在 N-API worker 调用该 launcher，
-再由 JS-thread completion resolve/reject。默认图形入口仍是 `scripts/run.sh`。
+再由 JS-thread completion resolve/reject。`scripts/run.sh` 和未指定 host 的 smoke、E2E、
+teardown 均选择 Rust；设置对应脚本的 host 变量为 `cpp` 或 `both` 可运行 fallback/parity。
 
 ## 测试
 
@@ -313,8 +315,8 @@ immediate-defocus，以及 cursor/clipboard desktop teardown。每次都必须 p
 | 路径 | 内容 |
 | --- | --- |
 | `ui/dist/main.lynx.bundle` | Rspeedy production bundle。 |
-| `host/build/lynx-launcher` | 默认 C++ 可执行文件。 |
-| `host/build/lynx-launcher-rs` | side-by-side Rust resource/link 与 popup GL shell tracer。 |
+| `host/build/lynx-launcher` | 默认 Rust 可执行文件。 |
+| `host/build/lynx-launcher-cpp` | parity 验证窗口内保留的 C++ fallback。 |
 | `host/build/liblynx.so` | verified SDK shared library。 |
 | `host/build/lynx_core.js` | engine 默认 `$ORIGIN/lynx_core.js` lookup。 |
 | `host/build/resources/main.lynx.bundle` | host 显式加载的 UI bundle。 |

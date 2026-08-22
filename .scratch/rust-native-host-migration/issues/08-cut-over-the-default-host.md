@@ -4,9 +4,9 @@
 
 **Blocked by:** 07 — Prove Rust-host lifecycle parity.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Build, run, smoke, E2E, and teardown entry points select the Rust host by default and can select the C++ fallback explicitly.
-- [ ] Runtime staging, `$ORIGIN` dependency checks, pinned GLFW linkage, and CMake ownership remain unchanged.
-- [ ] Full no-display and repeated graphical parity gates pass through the default entry points.
-- [ ] Architecture and contributor documentation describe the new default and the temporary fallback boundary.
+- [x] Build, run, smoke, E2E, and teardown entry points select the Rust host by default and can select the C++ fallback explicitly.
+- [x] Runtime staging, `$ORIGIN` dependency checks, pinned GLFW linkage, and CMake ownership remain unchanged.
+- [x] Full no-display and repeated graphical parity gates pass through the default entry points.
+- [x] Architecture and contributor documentation describe the new default and the temporary fallback boundary.

@@ -13,7 +13,7 @@ require_command setsid
 require_visible_capture_commands
 
 click_driver="${host_build_dir}/x11_click_test_driver"
-host_kind="${LYNX_LAUNCHER_E2E_HOST:-cpp}"
+host_kind="${LYNX_LAUNCHER_E2E_HOST:-rust}"
 requested_scenario="${LYNX_LAUNCHER_E2E_SCENARIO:-}"
 
 if [[ "${host_kind}" == both ]]; then
@@ -39,7 +39,7 @@ fi
 
 case "${host_kind}" in
   cpp)
-    selected_host_binary="${host_binary}"
+    selected_host_binary="${cpp_host_binary}"
     host_log_prefix='[host]'
     ;;
   rust)

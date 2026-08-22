@@ -21,8 +21,8 @@ host contains embedder and graphics concerns, and Rust owns operating-system
 policy and parsing. `third_party/lynx` is an implementation dependency rather
 than an application layer.
 
-`host-rs/` is currently a side-by-side migration tracer, not another production
-layer. It implements the executable CLI and pure host support behavior, directly
+`host-rs/` owns the default native host. It implements the executable CLI and
+pure host support behavior, directly
 uses the Rust platform interface for discovery, and verifies that its linked
 `lynx_log_init` symbol resolves to the staged `$ORIGIN/liblynx.so`. Its windowed
 path owns a popup-like pinned-GLFW X11 window, OpenGL 3.3 context, static shell
@@ -31,8 +31,9 @@ GLDirect renderer, restricted core-resource fetcher, builder, view, client, and
 load metadata with deterministic teardown. It loads the staged ReactLynx bundle
 and exposes a Promise-based application snapshot through the SDK's verified weak
 N-API symbols. Pointer, wheel, keyboard, character, focus, metric, and async
-application-launch parity are implemented. The C++ binary remains the default
-host.
+application-launch, clipboard, cursor, and lifecycle parity are implemented.
+The C++ binary remains available as an explicit fallback until post-cutover
+cleanup completes.
 
 ## Layers
 
@@ -51,10 +52,11 @@ and panic containment. This keeps Rust layout and allocator details out of C++.
 
 ### Native host
 
-`host/src/main.cc` owns the GLFW window, OpenGL context, Lynx view, windowless
-renderer callbacks, task queues, input translation, resource loading, and the
-`Launcher` N-API module. The host links the Rust static library and the pinned
-Lynx shared library.
+`host/src/main.cc` is the temporary C++ fallback. It owns its GLFW window,
+OpenGL context, Lynx view, renderer callbacks, task queues, input translation,
+resource loading, and `Launcher` N-API module while the cutover remains
+reversible. It links the Rust platform static library and pinned Lynx shared
+library.
 
 `host/src/support.cc` contains independently testable path, file, URI, and UTF-8
 operations. CMake copies `liblynx.so`, ICU data, `lynx_core.js`, and the UI bundle

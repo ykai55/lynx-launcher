@@ -9,7 +9,7 @@ require_command grep
 require_command mktemp
 require_command timeout
 
-host_kind="${LYNX_LAUNCHER_TEARDOWN_HOST:-cpp}"
+host_kind="${LYNX_LAUNCHER_TEARDOWN_HOST:-rust}"
 if [[ "${host_kind}" == both ]]; then
   LYNX_LAUNCHER_TEARDOWN_HOST=cpp "$0"
   LYNX_LAUNCHER_TEARDOWN_HOST=rust "$0"
@@ -18,7 +18,7 @@ fi
 
 case "${host_kind}" in
   cpp)
-    selected_host_binary="${host_binary}"
+    selected_host_binary="${cpp_host_binary}"
     first_frame_marker='[host] first GL frame presented'
     ;;
   rust)

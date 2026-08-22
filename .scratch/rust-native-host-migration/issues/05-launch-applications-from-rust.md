@@ -16,7 +16,8 @@ The Rust host now binds the verified weak N-API async-work symbols, parses the
 single UTF-8 application ID, keeps `ViewState` alive across execute/completion,
 calls the Rust `Launcher` only on the worker, and settles the deferred exactly
 once on the JS thread. Rust E2E verifies both the target process marker and a
-real spawn failure with native error detail; the C++ path remains the default.
+real spawn failure with native error detail. Ticket 08 subsequently made this
+parity-proven Rust path the default.
 
 Shutdown closes launch registration before releasing the view and waits for all
 registered work to settle and delete its N-API handle. Timeout or deletion
