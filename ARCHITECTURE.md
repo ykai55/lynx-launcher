@@ -190,6 +190,13 @@ shutdown ownership deterministic in E2E tests.
   remains valid independently of the launcher's internal vector.
 - Rust panics are caught at the ABI boundary. Status-returning functions expose
   a panic status instead of unwinding through C++.
+- The Rust shutdown gate cancels input and launch work before closing desktop
+  callbacks. It then backgrounds/releases the view and client while renderer
+  and UI queues can service release work, stops and drains those queues, and
+  releases renderer, fetcher, cursor, and GLFW owners in that order. Repeated
+  bounded, real-first-frame, pending-launch, cursor, and clipboard runs exercise
+  this same path; fatal callback/context failures preserve native owners for
+  process-exit cleanup rather than masking the original error.
 
 ## Windowless API and XWayland
 
@@ -291,6 +298,11 @@ The build treats every dependency boundary as an explicit lock:
 - Runtime resources are refreshed by an always-run target whose operations are
   content-aware `copy_if_different` calls. Correctness does not depend on source
   mtimes, while equal files avoid writes and preserve incremental efficiency.
+- Both executables use an exact `$ORIGIN` runtime search path, depend on one
+  staged `liblynx.so`, and never dynamically link GLFW. Rust check and windowed
+  startup resolve bundle, core JavaScript, ICU, and Lynx relative to the
+  executable, verify the actually loaded Lynx path, and reject an injected
+  `LD_LIBRARY_PATH` copy even when launched from an unrelated working directory.
 
 Changing a lock or integration patch is an intentional source change. A Lynx
 update must update the gitlink, revalidate or remove the integration patch,

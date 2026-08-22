@@ -23,7 +23,7 @@ iterations="${LYNX_LAUNCHER_RUST_SHELL_ITERATIONS:-10}"
 [[ "${iterations}" =~ ^[1-9][0-9]*$ ]] ||
   die "LYNX_LAUNCHER_RUST_SHELL_ITERATIONS must be a positive integer"
 
-log_root="${repo_root}/.logs/ticket-06/rust-desktop-smoke"
+log_root="${repo_root}/.logs/ticket-07/rust-desktop-smoke"
 mkdir -p -- "${log_root}"
 run_directory="$(mktemp -d "${log_root}/run.XXXXXX")"
 fixture_root="${run_directory}/fixture"

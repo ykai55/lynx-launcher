@@ -14,6 +14,29 @@ require_visible_capture_commands
 
 click_driver="${host_build_dir}/x11_click_test_driver"
 host_kind="${LYNX_LAUNCHER_E2E_HOST:-cpp}"
+requested_scenario="${LYNX_LAUNCHER_E2E_SCENARIO:-}"
+
+if [[ "${host_kind}" == both ]]; then
+  case "${requested_scenario:-all}" in
+    all)
+      LYNX_LAUNCHER_E2E_HOST=cpp LYNX_LAUNCHER_E2E_SCENARIO=success "$0"
+      LYNX_LAUNCHER_E2E_HOST=cpp LYNX_LAUNCHER_E2E_SCENARIO=spawn-failure "$0"
+      LYNX_LAUNCHER_E2E_HOST=rust LYNX_LAUNCHER_E2E_SCENARIO=all "$0"
+      ;;
+    success | spawn-failure)
+      LYNX_LAUNCHER_E2E_HOST=cpp LYNX_LAUNCHER_E2E_SCENARIO="${requested_scenario}" "$0"
+      LYNX_LAUNCHER_E2E_HOST=rust LYNX_LAUNCHER_E2E_SCENARIO="${requested_scenario}" "$0"
+      ;;
+    unknown | immediate-defocus)
+      die "E2E scenario ${requested_scenario} is Rust-specific; select LYNX_LAUNCHER_E2E_HOST=rust"
+      ;;
+    *)
+      die "LYNX_LAUNCHER_E2E_SCENARIO must be success, spawn-failure, unknown, immediate-defocus, or all"
+      ;;
+  esac
+  exit 0
+fi
+
 case "${host_kind}" in
   cpp)
     selected_host_binary="${host_binary}"
@@ -24,7 +47,7 @@ case "${host_kind}" in
     host_log_prefix='[host-rs]'
     ;;
   *)
-    die "LYNX_LAUNCHER_E2E_HOST must be cpp or rust"
+    die "LYNX_LAUNCHER_E2E_HOST must be cpp, rust, or both"
     ;;
 esac
 [[ -x "${selected_host_binary}" ]] ||
@@ -113,7 +136,7 @@ dump_log() {
 
 assert_clean_host_log() {
   local label="$1"
-  if grep -Eq -- 'destroyed thread host|Maybe leaked|post an unknown task|LoadJSSource load js error|\[lynx-error|\[host-rs\] fatal:' "${host_log}"; then
+  if grep -Eq -- 'destroyed thread host|Maybe leaked|post an unknown task|LoadJSSource load js error|\[lynx-error|\[host(-rs)?\] fatal:' "${host_log}"; then
     dump_log
     die "${label}: host log contains a forbidden lifecycle or Lynx error"
   fi

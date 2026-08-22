@@ -9,7 +9,27 @@ require_command grep
 require_command mktemp
 require_command timeout
 
-[[ -x "${host_binary}" ]] || die "host is not built; run scripts/build.sh first"
+host_kind="${LYNX_LAUNCHER_TEARDOWN_HOST:-cpp}"
+if [[ "${host_kind}" == both ]]; then
+  LYNX_LAUNCHER_TEARDOWN_HOST=cpp "$0"
+  LYNX_LAUNCHER_TEARDOWN_HOST=rust "$0"
+  exit 0
+fi
+
+case "${host_kind}" in
+  cpp)
+    selected_host_binary="${host_binary}"
+    first_frame_marker='[host] first GL frame presented'
+    ;;
+  rust)
+    selected_host_binary="${rust_host_binary}"
+    first_frame_marker='[host-rs] first GL frame presented'
+    ;;
+  *) die "LYNX_LAUNCHER_TEARDOWN_HOST must be cpp, rust, or both" ;;
+esac
+
+[[ -x "${selected_host_binary}" ]] ||
+  die "${host_kind} host is not built; run scripts/build.sh first"
 
 iterations="${LYNX_LAUNCHER_TEARDOWN_ITERATIONS:-10}"
 timeout_value="${LYNX_LAUNCHER_TEARDOWN_TIMEOUT:-30s}"
@@ -18,7 +38,7 @@ timeout_value="${LYNX_LAUNCHER_TEARDOWN_TIMEOUT:-30s}"
 [[ "${timeout_value}" =~ ^[0-9]+([.][0-9]+)?[smh]?$ ]] ||
   die "invalid LYNX_LAUNCHER_TEARDOWN_TIMEOUT: ${timeout_value}"
 
-log_root="${repo_root}/.logs/teardown-stress"
+log_root="${repo_root}/.logs/ticket-07/teardown-stress/${host_kind}"
 mkdir -p -- "${log_root}"
 log_dir="$(mktemp -d "${log_root}/run.XXXXXX")"
 summary_file="${log_dir}/summary.txt"
@@ -28,8 +48,8 @@ layout_parent_count=0
 target_missing_count=0
 
 write_summary() {
-  printf 'status=%s bounded=%s first-frame=%s layout_parent=%s target_missing=%s\n' \
-    "${stress_status}" "${iterations}" "${iterations}" \
+  printf 'status=%s host=%s bounded=%s first-frame=%s layout_parent=%s target_missing=%s\n' \
+    "${stress_status}" "${host_kind}" "${iterations}" "${iterations}" \
     "${layout_parent_count}" "${target_missing_count}" >"${summary_file}"
   printf 'Logs: %s\n' "${log_dir}"
 }
@@ -41,14 +61,14 @@ run_case() {
   local kind="$1" iteration="$2" log="$3"
   shift 3
 
-  if ! timeout --foreground -- "${timeout_value}" "${host_binary}" "$@" \
+  if ! timeout --foreground -- "${timeout_value}" "${selected_host_binary}" "$@" \
     >"${log}" 2>&1; then
     printf 'teardown stress %s iteration %s failed\n' "${kind}" "${iteration}" >&2
     return 1
   fi
-  grep -Fq -- '[host] first GL frame presented' "${log}" ||
+  grep -Fq -- "${first_frame_marker}" "${log}" ||
     die "teardown stress ${kind} iteration ${iteration} did not present a frame"
-  if grep -Eq -- 'destroyed thread host|Maybe leaked|post an unknown task|LoadJSSource load js error' "${log}"; then
+  if grep -Eq -- 'destroyed thread host|Maybe leaked|post an unknown task|LoadJSSource load js error|\[lynx-error|\[host(-rs)?\] fatal:' "${log}"; then
     printf 'teardown stress %s iteration %s emitted a forbidden teardown/resource error\n' \
       "${kind}" "${iteration}" >&2
     return 1
@@ -71,6 +91,18 @@ for ((iteration = 1; iteration <= iterations; iteration += 1)); do
     --exit-after-first-frame
 done
 
-printf 'Teardown stress passed: bounded=%s first-frame=%s layout_parent=%s target_missing=%s\n' \
-  "${iterations}" "${iterations}" "${layout_parent_count}" "${target_missing_count}"
+if [[ "${host_kind}" == rust ]]; then
+  printf 'Running Rust pending-launch immediate-defocus teardown (%s iterations)\n' "${iterations}"
+  LYNX_LAUNCHER_E2E_HOST=rust \
+    LYNX_LAUNCHER_E2E_SCENARIO=immediate-defocus \
+    LYNX_LAUNCHER_E2E_IMMEDIATE_DEFOCUS_ITERATIONS="${iterations}" \
+    "${scripts_dir}/e2e-launch.sh"
+
+  printf 'Running Rust cursor/clipboard desktop teardown (%s iterations)\n' "${iterations}"
+  LYNX_LAUNCHER_RUST_SHELL_ITERATIONS="${iterations}" \
+    "${scripts_dir}/rust-shell-smoke.sh"
+fi
+
+printf '%s teardown stress passed: bounded=%s first-frame=%s layout_parent=%s target_missing=%s\n' \
+  "${host_kind}" "${iterations}" "${iterations}" "${layout_parent_count}" "${target_missing_count}"
 stress_status="passed"

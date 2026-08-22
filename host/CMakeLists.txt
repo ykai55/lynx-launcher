@@ -303,6 +303,17 @@ if(BUILD_TESTING)
             "-DSTAGED_LIBRARY=${RUNTIME_LIBLYNX}"
             "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/rust-external-lynx-test"
             -P "${CMAKE_CURRENT_LIST_DIR}/cmake/test_rust_rejects_external_lynx.cmake")
+  foreach(runtime_host IN ITEMS cpp rust)
+    if(runtime_host STREQUAL "cpp")
+      set(runtime_launcher "$<TARGET_FILE:lynx-launcher>")
+    else()
+      set(runtime_launcher "${RUST_HOST_BINARY}")
+    endif()
+    add_test(NAME ${runtime_host}_launcher_dependency_contract
+      COMMAND "${CMAKE_COMMAND}"
+              "-DLAUNCHER=${runtime_launcher}"
+              -P "${CMAKE_CURRENT_LIST_DIR}/cmake/test_runtime_dependencies.cmake")
+  endforeach()
   add_test(NAME runtime_resource_refresh_older_source
     COMMAND "${CMAKE_COMMAND}"
             "-DREFRESH_SCRIPT=${REFRESH_RESOURCE_SCRIPT}"

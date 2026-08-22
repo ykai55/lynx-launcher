@@ -37,8 +37,17 @@ cmake -S "${host_dir}" -B "${host_build_dir}" \
   -DLYNX_SDK_DIR="${verified_sdk_dir}"
 cmake --build "${host_build_dir}" --parallel
 ctest --test-dir "${host_build_dir}" --build-config RelWithDebInfo --output-on-failure
-"${host_binary}" --check-resources
-"${rust_host_binary}" --check-resources
+
+resource_host="${LYNX_LAUNCHER_RESOURCE_HOST:-both}"
+case "${resource_host}" in
+  cpp) "${host_binary}" --check-resources ;;
+  rust) "${rust_host_binary}" --check-resources ;;
+  both)
+    "${host_binary}" --check-resources
+    "${rust_host_binary}" --check-resources
+    ;;
+  *) die "LYNX_LAUNCHER_RESOURCE_HOST must be cpp, rust, or both" ;;
+esac
 
 case "${LYNX_LAUNCHER_SMOKE:-0}" in
   0|false|no|'')
@@ -50,9 +59,22 @@ case "${LYNX_LAUNCHER_SMOKE:-0}" in
     smoke_timeout="${LYNX_LAUNCHER_SMOKE_TIMEOUT:-30s}"
     [[ "${smoke_timeout}" =~ ^[0-9]+([.][0-9]+)?[smh]?$ ]] ||
       die "invalid LYNX_LAUNCHER_SMOKE_TIMEOUT: ${smoke_timeout}"
-    printf 'Running graphical first-frame smoke with timeout %s\n' "${smoke_timeout}"
-    timeout --foreground -- "${smoke_timeout}" "${host_binary}" --exit-after-first-frame
-    "${scripts_dir}/rust-shell-smoke.sh"
+    smoke_host="${LYNX_LAUNCHER_SMOKE_HOST:-cpp}"
+    printf 'Running %s graphical first-frame smoke with timeout %s\n' \
+      "${smoke_host}" "${smoke_timeout}"
+    case "${smoke_host}" in
+      cpp)
+        timeout --foreground -- "${smoke_timeout}" "${host_binary}" --exit-after-first-frame
+        ;;
+      rust)
+        "${scripts_dir}/rust-shell-smoke.sh"
+        ;;
+      both)
+        timeout --foreground -- "${smoke_timeout}" "${host_binary}" --exit-after-first-frame
+        "${scripts_dir}/rust-shell-smoke.sh"
+        ;;
+      *) die "LYNX_LAUNCHER_SMOKE_HOST must be cpp, rust, or both" ;;
+    esac
     ;;
   *)
     die "LYNX_LAUNCHER_SMOKE must be 0/false/no or 1/true/yes"

@@ -188,7 +188,10 @@ direct snapshot；`launchApplication()` 立即返回真实 Promise，在 N-API w
 
 该入口依次执行 Rust workspace format check、locked Clippy（warnings denied）和全部
 Rust tests；UI tests、typecheck 和 production build；host build、CTest；最后执行 C++
-与 Rust 两套资源检查。默认路径不需要 display。
+与 Rust 两套资源检查。`LYNX_LAUNCHER_RESOURCE_HOST=cpp|rust|both` 可选择最后一次显式
+资源检查，默认 `both`；CTest 始终保留两套 provenance 回归。默认路径不需要 display。
+两种 host 都要求精确 `$ORIGIN` RUNPATH 和唯一的 staged `liblynx.so`，禁止动态 GLFW；Rust
+check/windowed startup 还会从非仓库 cwd 注入外部 `liblynx.so` 并断言拒绝。
 
 ### 首帧 smoke
 
@@ -196,12 +199,13 @@ Rust tests；UI tests、typecheck 和 production build；host build、CTest；�
 
 ```sh
 LYNX_LAUNCHER_SMOKE=1 ./scripts/test.sh
+LYNX_LAUNCHER_SMOKE=1 LYNX_LAUNCHER_SMOKE_HOST=both ./scripts/test.sh
 LYNX_LAUNCHER_SMOKE=1 LYNX_LAUNCHER_SMOKE_TIMEOUT=45s ./scripts/test.sh
 ```
 
 进程必须在 timeout 前同时报告 first-screen layout 和首个 GL present。
-该入口还会运行 Rust tracer 的 popup、真实 launcher 输入、application Promise、focus-loss
-退出和双条件首帧自动退出检查；静态 shell marker 继续单独断言，不能冒充 readiness。
+Rust 或 both 模式还会运行 Rust tracer 的 popup、真实 launcher 输入、application Promise、
+focus-loss 退出和双条件首帧自动退出检查；静态 shell marker 继续单独断言，不能冒充 readiness。
 Rust smoke 使用隔离 XDG fixture 和可观察的 1.25 system scale，精确核对 3 个 application
 snapshot 的 ID、名称与顺序；通过共享 X11 driver 聚焦搜索框、输入 `cobalt`、确认只有目标
 绿色 icon 和过滤后像素、点击目标，并在 discovery 后删除 fixture executable，确认真实 spawn
@@ -213,7 +217,8 @@ startup focus-loss 用例验证 runtime userdata 安装前的 FocusOut 不会丢
 seam 还会注入一次测试专用 discovery 错误。重复次数同时应用于 first-frame 与 bounded input
 模式；每轮都执行完整过滤、launch rejection、`ActionError` 像素、真实键入、scroll/repeat、
 held-input cancellation 和 focus teardown，并要求 clean shutdown；日志保存在
-`.logs/ticket-06/rust-desktop-smoke/`。
+`.logs/ticket-07/rust-desktop-smoke/`。`LYNX_LAUNCHER_SMOKE_HOST=cpp|rust|both` 显式选择 host；
+默认仍为 C++。
 
 desktop integration gate 还通过 XFixes cursor image fingerprint 核对普通区域的 arrow
 fallback 与搜索输入框的 I-beam，并执行 10 次 cursor teardown。clipboard read/write 使用独立
@@ -236,6 +241,7 @@ LYNX_LAUNCHER_RUST_SHELL_ITERATIONS=10 ./scripts/rust-shell-smoke.sh
 ./scripts/e2e-launch.sh
 LYNX_LAUNCHER_E2E_ITERATIONS=10 ./scripts/e2e-launch.sh
 LYNX_LAUNCHER_E2E_HOST=rust ./scripts/e2e-launch.sh
+LYNX_LAUNCHER_E2E_HOST=both LYNX_LAUNCHER_E2E_ITERATIONS=10 ./scripts/e2e-launch.sh
 LYNX_LAUNCHER_E2E_HOST=rust LYNX_LAUNCHER_E2E_SCENARIO=unknown \
   LYNX_LAUNCHER_E2E_ITERATIONS=10 ./scripts/e2e-launch.sh
 ```
@@ -247,7 +253,9 @@ compositor capture 比较两个不同中文 glyph 的渲染区域，拒绝重复
 `spawn-failure`、`unknown` 和 `immediate-defocus` 场景可独立选择；`all` 为默认。success helper
 写入 started 后至少运行 5 秒，测试要求 Promise resolved 时 exited 尚不存在，证明 Promise
 不等待 child。failure 与 unknown 分别验证真实 spawn detail 和 `ApplicationNotFound`，两者都
-必须显示 `ActionError`。`LYNX_LAUNCHER_E2E_SUCCESS_ITERATIONS`、
+必须显示 `ActionError`。`both` 的 `all` 复用同一 driver/fixture，依次对 C++ 跑共同的
+success/spawn-failure，并对 Rust 跑全部四种场景；Rust-only 场景必须显式选择 `rust`。
+`LYNX_LAUNCHER_E2E_SUCCESS_ITERATIONS`、
 `LYNX_LAUNCHER_E2E_SPAWN_FAILURE_ITERATIONS`、`LYNX_LAUNCHER_E2E_UNKNOWN_ITERATIONS` 和
 `LYNX_LAUNCHER_E2E_IMMEDIATE_DEFOCUS_ITERATIONS` 可在 `all` 模式分别覆盖重复次数。
 
@@ -255,14 +263,17 @@ compositor capture 比较两个不同中文 glyph 的渲染区域，拒绝重复
 
 ```sh
 ./scripts/teardown-stress.sh
+LYNX_LAUNCHER_TEARDOWN_HOST=both ./scripts/teardown-stress.sh
 LYNX_LAUNCHER_TEARDOWN_ITERATIONS=20 ./scripts/teardown-stress.sh
 LYNX_LAUNCHER_TEARDOWN_TIMEOUT=45s ./scripts/teardown-stress.sh
 ```
 
-默认执行 10 次 bounded launch 和 10 次 first-frame close。每次都必须 present 一帧，
+`LYNX_LAUNCHER_TEARDOWN_HOST=cpp|rust|both` 选择 host，默认仍为 C++。每个 host 执行 10 次
+bounded launch 和 10 次真实 first-frame close。Rust 模式随后还执行相同次数的 pending-launch
+immediate-defocus，以及 cursor/clipboard desktop teardown。每次都必须 present 一帧，
 且日志不得出现 `destroyed thread host`、`Maybe leaked`、`post an unknown task`、
 `LoadJSSource load js error`。每次并发 invocation 使用独立的
-`.logs/teardown-stress/run.XXXXXX/`，保留逐次日志和 `summary.txt`；summary 也记录
+`.logs/ticket-07/teardown-stress/<host>/run.XXXXXX/`，保留逐次日志和 `summary.txt`；summary 也记录
 `DestroyLayoutNodeBeforeRemoveFromParent` 与 `target view: ... not found` 的残余计数。
 
 ## Lynx Pin、补丁与 verified SDK
@@ -310,7 +321,7 @@ LYNX_LAUNCHER_TEARDOWN_TIMEOUT=45s ./scripts/teardown-stress.sh
 | `host/build/resources/lynx_core.js` | host 显式 resource path。 |
 | `host/build/resources/icudtl.dat` | verified packaged ICU data。 |
 | `.logs/bootstrap.log` | 最近一次串行 bootstrap 完整输出。 |
-| `.logs/teardown-stress/run.XXXXXX/` | 每次 stress 的独立日志与 summary。 |
+| `.logs/ticket-07/teardown-stress/<host>/run.XXXXXX/` | 每次 host stress 的独立日志与 summary。 |
 
 ## 已知限制
 
