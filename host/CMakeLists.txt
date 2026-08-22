@@ -230,6 +230,7 @@ if(BUILD_TESTING)
   target_link_libraries(x11_click_test_driver PRIVATE
     host_support
     X11::X11
+    X11::Xfixes
   )
 
   add_library(lynx_sys_c_header_smoke OBJECT

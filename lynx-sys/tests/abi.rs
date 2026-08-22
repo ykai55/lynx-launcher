@@ -2,20 +2,21 @@ use std::ffi::{c_char, c_int, c_void};
 use std::mem::{align_of, offset_of, size_of};
 
 use lynx_sys::{
-    LynxDataDestructor, LynxFetchResourceCallback, LynxGlClearCurrentCallback,
-    LynxGlCreateFboCallback, LynxGlMakeCurrentCallback, LynxGlPresentCallback,
-    LynxGlProcResolverCallback, LynxKeyEvent, LynxLogCallback, LynxPointerEvent,
-    LynxRendererFinalizer, LynxRendererPostTaskCallback, LynxResourceFetcherFinalizer,
-    LynxShowTextInputCallback, LynxTask, LynxUiPostTaskCallback, LynxUiRunsOnCurrentThreadCallback,
-    LynxUiTaskRunnerConfig, LynxViewClientCallback, LynxViewClientErrorCallback,
-    NapiAsyncCompleteCallback, NapiAsyncExecuteCallback, NapiCallback, NapiModuleCreator,
-    LYNX_KEY_EVENT_TYPE_DOWN, LYNX_KEY_EVENT_TYPE_REPEAT, LYNX_KEY_EVENT_TYPE_UP, LYNX_LOG_INFO,
-    LYNX_POINTER_BUTTON_BACK, LYNX_POINTER_BUTTON_FORWARD, LYNX_POINTER_BUTTON_MIDDLE,
-    LYNX_POINTER_BUTTON_PRIMARY, LYNX_POINTER_BUTTON_SECONDARY, LYNX_POINTER_DEVICE_KIND_MOUSE,
-    LYNX_POINTER_PHASE_ADD, LYNX_POINTER_PHASE_CANCEL, LYNX_POINTER_PHASE_DOWN,
-    LYNX_POINTER_PHASE_HOVER, LYNX_POINTER_PHASE_MOVE, LYNX_POINTER_PHASE_REMOVE,
-    LYNX_POINTER_PHASE_UP, LYNX_POINTER_SIGNAL_KIND_NONE, LYNX_POINTER_SIGNAL_KIND_SCROLL,
-    LYNX_RENDERER_TYPE_GL_DIRECT, LYNX_RESOURCE_TYPE_LYNX_CORE_JS, NAPI_AUTO_LENGTH, NAPI_OK,
+    LynxActivateSystemCursorCallback, LynxDataDestructor, LynxFetchResourceCallback,
+    LynxGetClipboardDataCallback, LynxGlClearCurrentCallback, LynxGlCreateFboCallback,
+    LynxGlMakeCurrentCallback, LynxGlPresentCallback, LynxGlProcResolverCallback, LynxKeyEvent,
+    LynxLogCallback, LynxPointerEvent, LynxRendererFinalizer, LynxRendererPostTaskCallback,
+    LynxResourceFetcherFinalizer, LynxSetClipboardDataCallback, LynxShowTextInputCallback,
+    LynxTask, LynxUiPostTaskCallback, LynxUiRunsOnCurrentThreadCallback, LynxUiTaskRunnerConfig,
+    LynxViewClientCallback, LynxViewClientErrorCallback, NapiAsyncCompleteCallback,
+    NapiAsyncExecuteCallback, NapiCallback, NapiModuleCreator, LYNX_KEY_EVENT_TYPE_DOWN,
+    LYNX_KEY_EVENT_TYPE_REPEAT, LYNX_KEY_EVENT_TYPE_UP, LYNX_LOG_INFO, LYNX_POINTER_BUTTON_BACK,
+    LYNX_POINTER_BUTTON_FORWARD, LYNX_POINTER_BUTTON_MIDDLE, LYNX_POINTER_BUTTON_PRIMARY,
+    LYNX_POINTER_BUTTON_SECONDARY, LYNX_POINTER_DEVICE_KIND_MOUSE, LYNX_POINTER_PHASE_ADD,
+    LYNX_POINTER_PHASE_CANCEL, LYNX_POINTER_PHASE_DOWN, LYNX_POINTER_PHASE_HOVER,
+    LYNX_POINTER_PHASE_MOVE, LYNX_POINTER_PHASE_REMOVE, LYNX_POINTER_PHASE_UP,
+    LYNX_POINTER_SIGNAL_KIND_NONE, LYNX_POINTER_SIGNAL_KIND_SCROLL, LYNX_RENDERER_TYPE_GL_DIRECT,
+    LYNX_RESOURCE_TYPE_LYNX_CORE_JS, NAPI_AUTO_LENGTH, NAPI_OK,
 };
 
 #[test]
@@ -91,6 +92,12 @@ fn callbacks_and_constants_match_the_verified_sdk() {
     >;
     let _: LynxRendererPostTaskCallback =
         None::<unsafe extern "C" fn(*mut lynx_sys::LynxWindowlessRenderer, LynxTask, u64)>;
+    let _: LynxGetClipboardDataCallback =
+        None::<unsafe extern "C" fn(*mut lynx_sys::LynxWindowlessRenderer) -> *const c_char>;
+    let _: LynxSetClipboardDataCallback =
+        None::<unsafe extern "C" fn(*mut lynx_sys::LynxWindowlessRenderer, *const c_char)>;
+    let _: LynxActivateSystemCursorCallback =
+        None::<unsafe extern "C" fn(*mut lynx_sys::LynxWindowlessRenderer, c_int, *const c_char)>;
     let _: LynxShowTextInputCallback =
         None::<unsafe extern "C" fn(*mut lynx_sys::LynxWindowlessRenderer, bool)>;
     let _: LynxResourceFetcherFinalizer =
@@ -132,6 +139,9 @@ fn callbacks_and_constants_match_the_verified_sdk() {
         size_of::<LynxGlCreateFboCallback>(),
         size_of::<LynxGlProcResolverCallback>(),
         size_of::<LynxRendererPostTaskCallback>(),
+        size_of::<LynxGetClipboardDataCallback>(),
+        size_of::<LynxSetClipboardDataCallback>(),
+        size_of::<LynxActivateSystemCursorCallback>(),
         size_of::<LynxShowTextInputCallback>(),
         size_of::<LynxResourceFetcherFinalizer>(),
         size_of::<LynxFetchResourceCallback>(),
@@ -149,6 +159,53 @@ fn callbacks_and_constants_match_the_verified_sdk() {
     assert_eq!(LYNX_LOG_INFO, 2);
     assert_eq!(LYNX_RENDERER_TYPE_GL_DIRECT, 2);
     assert_eq!(LYNX_RESOURCE_TYPE_LYNX_CORE_JS, 7);
+    for (actual, expected) in [
+        lynx_sys::LYNX_CURSOR_TYPE_UNKNOWN,
+        lynx_sys::LYNX_CURSOR_TYPE_NET,
+        lynx_sys::LYNX_CURSOR_TYPE_FILE,
+        lynx_sys::LYNX_CURSOR_TYPE_AUTO,
+        lynx_sys::LYNX_CURSOR_TYPE_NONE,
+        lynx_sys::LYNX_CURSOR_TYPE_BASIC,
+        lynx_sys::LYNX_CURSOR_TYPE_CLICK,
+        lynx_sys::LYNX_CURSOR_TYPE_FORBIDDEN,
+        lynx_sys::LYNX_CURSOR_TYPE_WAIT,
+        lynx_sys::LYNX_CURSOR_TYPE_PROGRESS,
+        lynx_sys::LYNX_CURSOR_TYPE_CONTEXT_MENU,
+        lynx_sys::LYNX_CURSOR_TYPE_HELP,
+        lynx_sys::LYNX_CURSOR_TYPE_TEXT,
+        lynx_sys::LYNX_CURSOR_TYPE_VERTICAL_TEXT,
+        lynx_sys::LYNX_CURSOR_TYPE_CELL,
+        lynx_sys::LYNX_CURSOR_TYPE_PRECISE,
+        lynx_sys::LYNX_CURSOR_TYPE_MOVE,
+        lynx_sys::LYNX_CURSOR_TYPE_GRAB,
+        lynx_sys::LYNX_CURSOR_TYPE_GRABBING,
+        lynx_sys::LYNX_CURSOR_TYPE_NO_DROP,
+        lynx_sys::LYNX_CURSOR_TYPE_ALIAS,
+        lynx_sys::LYNX_CURSOR_TYPE_SYSTEM_MOUSE_CURSOR,
+        lynx_sys::LYNX_CURSOR_TYPE_DISAPPEARING,
+        lynx_sys::LYNX_CURSOR_TYPE_ALL_SCROLL,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_LEFT_RIGHT,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_UP_DOWN,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_UP_LEFT_DOWN_RIGHT,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_UP_RIGHT_DOWN_LEFT,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_UP,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_DOWN,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_LEFT,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_RIGHT,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_UP_LEFT,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_UP_RIGHT,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_DOWN_LEFT,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_DOWN_RIGHT,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_COLUMN,
+        lynx_sys::LYNX_CURSOR_TYPE_RESIZE_ROW,
+        lynx_sys::LYNX_CURSOR_TYPE_ZOOM_IN,
+        lynx_sys::LYNX_CURSOR_TYPE_ZOOM_OUT,
+    ]
+    .into_iter()
+    .zip(1..=40)
+    {
+        assert_eq!(actual, expected);
+    }
     assert_eq!(LYNX_POINTER_PHASE_CANCEL, 0);
     assert_eq!(LYNX_POINTER_PHASE_UP, 1);
     assert_eq!(LYNX_POINTER_PHASE_DOWN, 2);
@@ -205,6 +262,12 @@ fn runtime_function_declarations_match_the_reviewed_signatures() {
         lynx_windowless_renderer_send_pointer_event;
     let _: unsafe extern "C" fn(*mut LynxWindowlessRenderer, *mut LynxKeyEvent) =
         lynx_windowless_renderer_send_key_event;
+    let _: unsafe extern "C" fn(*mut LynxWindowlessRenderer, LynxGetClipboardDataCallback) =
+        lynx_windowless_renderer_bind_get_clipboard_data;
+    let _: unsafe extern "C" fn(*mut LynxWindowlessRenderer, LynxSetClipboardDataCallback) =
+        lynx_windowless_renderer_bind_set_clipboard_data;
+    let _: unsafe extern "C" fn(*mut LynxWindowlessRenderer, LynxActivateSystemCursorCallback) =
+        lynx_windowless_renderer_bind_activate_system_cursor;
     let _: unsafe extern "C" fn(*mut LynxWindowlessRenderer, LynxShowTextInputCallback) =
         lynx_windowless_renderer_bind_show_text_input;
     let _: unsafe extern "C" fn(*mut LynxWindowlessRenderer) = lynx_windowless_renderer_release;

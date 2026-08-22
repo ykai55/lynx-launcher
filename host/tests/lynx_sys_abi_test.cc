@@ -60,9 +60,52 @@ static_assert(offsetof(lynx_key_event_t, synthesized) == 48);
 
 static_assert(sizeof(lynx_log_level_e) == sizeof(int));
 static_assert(sizeof(lynx_windowless_renderer_type_e) == sizeof(int));
+static_assert(sizeof(lynx_cursor_type_e) == sizeof(int));
 static_assert(LYNX_LOG_INFO == 2);
 static_assert(kRendererTypeGLDirect == 2);
 static_assert(kLynxResourceTypeLynxCoreJS == 7);
+#define ASSERT_CURSOR_VALUE(name, value) static_assert(name == value)
+ASSERT_CURSOR_VALUE(kLynxCursorTypeUnknown, 1);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeNet, 2);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeFile, 3);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeAuto, 4);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeNone, 5);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeBasic, 6);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeClick, 7);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeForbidden, 8);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeWait, 9);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeProgress, 10);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeContextmenu, 11);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeHelp, 12);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeText, 13);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeVerticalText, 14);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeCell, 15);
+ASSERT_CURSOR_VALUE(kLynxCursorTypePrecise, 16);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeMove, 17);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeGrab, 18);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeGrabbing, 19);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeNoDrop, 20);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeAlias, 21);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeSystemMouseCursor, 22);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeDisappearing, 23);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeAllScroll, 24);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeLeftRight, 25);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeUpDown, 26);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeUpLeftDownRight, 27);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeUpRightDownLeft, 28);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeUp, 29);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeDown, 30);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeLeft, 31);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeRight, 32);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeUpLeft, 33);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeUpRight, 34);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeDownLeft, 35);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeDownRight, 36);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeColumn, 37);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeResizeRow, 38);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeZoomIn, 39);
+ASSERT_CURSOR_VALUE(kLynxCursorTypeZoomOut, 40);
+#undef ASSERT_CURSOR_VALUE
 static_assert(kLynxPointerPhaseCancel == 0);
 static_assert(kLynxPointerPhaseUp == 1);
 static_assert(kLynxPointerPhaseDown == 2);
@@ -108,6 +151,14 @@ static_assert(std::is_same_v<on_gl_proc_resolver,
 static_assert(std::is_same_v<on_post_task,
                              void (*)(lynx_windowless_renderer_t*, lynx_task_t,
                                       uint64_t)>);
+static_assert(std::is_same_v<get_clipboard_data,
+                             const char* (*)(lynx_windowless_renderer_t*)>);
+static_assert(std::is_same_v<set_clipboard_data,
+                             void (*)(lynx_windowless_renderer_t*,
+                                      const char*)>);
+static_assert(std::is_same_v<activate_system_cursor,
+                             void (*)(lynx_windowless_renderer_t*,
+                                      lynx_cursor_type_e, const char*)>);
 
 static_assert(std::is_same_v<decltype(&lynx_log_init),
                              void (*)(lynx_log_callback_t)>);
@@ -144,6 +195,15 @@ static_assert(std::is_same_v<
 static_assert(std::is_same_v<
               decltype(&lynx_windowless_renderer_bind_on_post_task),
               void (*)(lynx_windowless_renderer_t*, on_post_task)>);
+static_assert(std::is_same_v<
+              decltype(&lynx_windowless_renderer_bind_get_clipboard_data),
+              void (*)(lynx_windowless_renderer_t*, get_clipboard_data)>);
+static_assert(std::is_same_v<
+              decltype(&lynx_windowless_renderer_bind_set_clipboard_data),
+              void (*)(lynx_windowless_renderer_t*, set_clipboard_data)>);
+static_assert(std::is_same_v<
+              decltype(&lynx_windowless_renderer_bind_activate_system_cursor),
+              void (*)(lynx_windowless_renderer_t*, activate_system_cursor)>);
 static_assert(std::is_same_v<decltype(&lynx_windowless_renderer_run_task),
                              void (*)(lynx_windowless_renderer_t*,
                                       lynx_task_t)>);

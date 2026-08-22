@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use lynx_launcher_host::runtime::{EventWake, GlApi, RuntimeCore, RuntimeViewOptions};
+use lynx_launcher_host::runtime::{DesktopApi, EventWake, GlApi, RuntimeCore, RuntimeViewOptions};
 use lynx_launcher_host::support::{
     calculate_window_metrics, logical_key, physical_key, utf8_from_codepoint,
     xsettings_window_scale, InputState, PointerDispatch, PressedKey, WindowMetrics,
@@ -124,6 +124,7 @@ struct WindowState {
     system_scale: f32,
     callback_failed: AtomicBool,
     input_trace: bool,
+    ignore_focus_loss: bool,
 }
 
 impl WindowState {
@@ -132,6 +133,7 @@ impl WindowState {
         runtime: RuntimeCore,
         metrics: WindowMetrics,
         system_scale: f32,
+        ignore_focus_loss: bool,
     ) -> Self {
         Self {
             window,
@@ -143,6 +145,7 @@ impl WindowState {
             callback_failed: AtomicBool::new(false),
             input_trace: std::env::var_os("LYNX_LAUNCHER_E2E_SNAPSHOT_TRACE").as_deref()
                 == Some(std::ffi::OsStr::new("1")),
+            ignore_focus_loss,
         }
     }
 
@@ -325,6 +328,10 @@ impl WindowState {
                 .enter_foreground();
         }
 
+        if self.ignore_focus_loss {
+            return Ok(());
+        }
+
         if !self.accepting_input.replace(false) {
             return Ok(());
         }
@@ -347,6 +354,16 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
             "DISPLAY is not set; the GLFW host requires XWayland/X11",
         ));
     }
+    let ignore_focus_loss = match std::env::var_os("LYNX_LAUNCHER_E2E_IGNORE_FOCUS_LOSS") {
+        None => false,
+        Some(value) if value == std::ffi::OsStr::new("1") => true,
+        Some(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LYNX_LAUNCHER_E2E_IGNORE_FOCUS_LOSS must be 1 when set",
+            ));
+        }
+    };
 
     let _glfw = GlfwRuntime::initialize()?;
     let system_scale = system_window_scale()?;
@@ -448,6 +465,14 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
                 runtime_swap_buffers,
                 runtime_get_proc_address,
             ),
+            DesktopApi::new(
+                runtime_get_clipboard,
+                runtime_set_clipboard,
+                runtime_create_cursor,
+                runtime_destroy_cursor,
+                runtime_set_cursor,
+                runtime_set_cursor_mode,
+            ),
             EventWake::new(std::ptr::null_mut(), runtime_wake_event_loop),
             &view_options,
         )
@@ -461,6 +486,7 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
                 runtime,
                 initial_metrics,
                 system_scale,
+                ignore_focus_loss,
             ));
             state.register_callbacks();
             let startup_focus_result = if STARTUP_FOCUS_LOST.swap(false, Ordering::AcqRel)
@@ -570,6 +596,43 @@ unsafe fn runtime_get_proc_address(name: *const std::ffi::c_char) -> *mut c_void
     unsafe { ffi::glfw_get_proc_address(name) }
         .map(|function| function as *const () as *mut c_void)
         .unwrap_or(std::ptr::null_mut())
+}
+
+unsafe fn runtime_get_clipboard(window: *mut c_void) -> *const std::ffi::c_char {
+    unsafe { ffi::glfw_get_clipboard_string(window.cast()) }
+}
+
+unsafe fn runtime_set_clipboard(window: *mut c_void, value: *const std::ffi::c_char) {
+    unsafe { ffi::glfw_set_clipboard_string(window.cast(), value) };
+}
+
+unsafe fn runtime_create_cursor(shape: i32) -> *mut c_void {
+    let shape = match shape {
+        1 => ffi::GLFW_HAND_CURSOR,
+        2 => ffi::GLFW_IBEAM_CURSOR,
+        3 => ffi::GLFW_CROSSHAIR_CURSOR,
+        4 => ffi::GLFW_HRESIZE_CURSOR,
+        5 => ffi::GLFW_VRESIZE_CURSOR,
+        _ => ffi::GLFW_ARROW_CURSOR,
+    };
+    unsafe { ffi::glfw_create_standard_cursor(shape).cast() }
+}
+
+unsafe fn runtime_destroy_cursor(cursor: *mut c_void) {
+    unsafe { ffi::glfw_destroy_cursor(cursor.cast()) };
+}
+
+unsafe fn runtime_set_cursor(window: *mut c_void, cursor: *mut c_void) {
+    unsafe { ffi::glfw_set_cursor(window.cast(), cursor.cast()) };
+}
+
+unsafe fn runtime_set_cursor_mode(window: *mut c_void, hidden: i32) {
+    let mode = if hidden == 0 {
+        ffi::GLFW_CURSOR_NORMAL
+    } else {
+        ffi::GLFW_CURSOR_HIDDEN
+    };
+    unsafe { ffi::glfw_set_input_mode(window.cast(), ffi::GLFW_CURSOR, mode) };
 }
 
 unsafe fn runtime_wake_event_loop(_: *mut c_void) {

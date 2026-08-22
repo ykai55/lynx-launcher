@@ -4,9 +4,9 @@
 
 **Blocked by:** 04 — Complete Rust-host launcher input.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Lynx clipboard reads and writes use the pinned GLFW/X11 desktop clipboard with callback-safe storage.
-- [ ] Supported Lynx cursor requests map to native cursors and unsupported requests retain the current deterministic fallback.
-- [ ] Cursor and clipboard resources remain valid through callback use and are released during ordered teardown.
-- [ ] Shared graphical and teardown tests cover the observable desktop behavior without browser assumptions.
+- [x] Lynx clipboard reads and writes use the pinned GLFW/X11 desktop clipboard with callback-safe storage.
+- [x] Supported Lynx cursor requests map to native cursors and unsupported requests retain the current deterministic fallback.
+- [x] Cursor and clipboard resources remain valid through callback use and are released during ordered teardown.
+- [x] Shared graphical and teardown tests cover the observable desktop behavior without browser assumptions.

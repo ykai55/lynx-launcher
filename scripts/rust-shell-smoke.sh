@@ -9,8 +9,9 @@ require_command grep
 require_command mktemp
 require_command readlink
 require_command setsid
+require_command sleep
+require_command tail
 require_command timeout
-require_visible_capture_commands
 
 click_driver="${host_build_dir}/x11_click_test_driver"
 [[ -x "${rust_host_binary}" ]] ||
@@ -18,11 +19,11 @@ click_driver="${host_build_dir}/x11_click_test_driver"
 [[ -x "${click_driver}" ]] ||
   die "X11 test driver is not built; run scripts/build.sh first"
 
-iterations="${LYNX_LAUNCHER_RUST_SHELL_ITERATIONS:-1}"
+iterations="${LYNX_LAUNCHER_RUST_SHELL_ITERATIONS:-10}"
 [[ "${iterations}" =~ ^[1-9][0-9]*$ ]] ||
   die "LYNX_LAUNCHER_RUST_SHELL_ITERATIONS must be a positive integer"
 
-log_root="${repo_root}/.logs/ticket-05/rust-input-smoke"
+log_root="${repo_root}/.logs/ticket-06/rust-desktop-smoke"
 mkdir -p -- "${log_root}"
 run_directory="$(mktemp -d "${log_root}/run.XXXXXX")"
 fixture_root="${run_directory}/fixture"
@@ -64,11 +65,20 @@ fixture_environment=(
   'LC_ALL=C'
   'LYNX_LAUNCHER_E2E_SNAPSHOT_TRACE=1'
   'LYNX_LAUNCHER_E2E_SYSTEM_SCALE=1.25'
+  'LYNX_LAUNCHER_E2E_CURSOR_FALLBACK_PROBE=1'
 )
 host_pid=""
 host_identity=""
 host_log=""
+clipboard_owner_pid=""
+clipboard_owner_identity=""
+display_server_pid=""
+display_server_identity=""
+display_server_expected=""
+clipboard_test=false
+clipboard_display=""
 expected_host="$(readlink -f -- "${rust_host_binary}")"
+expected_driver="$(readlink -f -- "${click_driver}")"
 
 process_identity() {
   local pid="$1" stat remainder
@@ -80,6 +90,20 @@ process_identity() {
   [[ "${#fields[@]}" -gt 19 ]] || return 1
   printf '%s:%s:%s\n' \
     "$(readlink -f -- "/proc/${pid}/exe")" "${fields[2]}" "${fields[19]}"
+}
+
+capture_expected_identity() {
+  local pid="$1" expected="$2" identity deadline=$((SECONDS + 2))
+  while ((SECONDS < deadline)); do
+    identity="$(process_identity "${pid}" 2>/dev/null || true)"
+    if [[ "${identity}" == "${expected}:"* ]]; then
+      printf '%s\n' "${identity}"
+      return 0
+    fi
+    kill -0 "${pid}" 2>/dev/null || return 1
+    sleep 0.02
+  done
+  return 1
 }
 
 capture_host_identity() {
@@ -112,7 +136,130 @@ stop_host() {
   host_identity=""
 }
 
-trap stop_host EXIT
+stop_clipboard_owner() {
+  [[ -n "${clipboard_owner_pid}" ]] || return 0
+  stop_verified_process "${clipboard_owner_pid}" "${clipboard_owner_identity}" \
+    "clipboard selection owner"
+  clipboard_owner_pid=""
+  clipboard_owner_identity=""
+}
+
+stop_verified_process() {
+  local pid="$1" identity="$2" label="$3" current deadline
+  current="$(process_identity "${pid}" 2>/dev/null || true)"
+  if [[ -z "${current}" ]]; then
+    wait "${pid}" 2>/dev/null || true
+    return 0
+  fi
+  if [[ -z "${identity}" || "${current}" != "${identity}" ]]; then
+    printf 'warning: refusing to signal %s PID %s because its identity changed\n' \
+      "${label}" "${pid}" >&2
+    return 1
+  fi
+  kill -TERM -- "${pid}" 2>/dev/null || true
+  deadline=$((SECONDS + 2))
+  while [[ "$(process_identity "${pid}" 2>/dev/null || true)" == "${identity}" ]] &&
+    ((SECONDS < deadline)); do
+    sleep 0.02
+  done
+  if [[ "$(process_identity "${pid}" 2>/dev/null || true)" == "${identity}" ]]; then
+    kill -KILL -- "${pid}" 2>/dev/null || true
+    deadline=$((SECONDS + 2))
+    while [[ "$(process_identity "${pid}" 2>/dev/null || true)" == "${identity}" ]] &&
+      ((SECONDS < deadline)); do
+      sleep 0.02
+    done
+  fi
+  wait "${pid}" 2>/dev/null || true
+  if [[ "$(process_identity "${pid}" 2>/dev/null || true)" == "${identity}" ]]; then
+    printf 'warning: %s PID %s retained its identity after SIGKILL\n' \
+      "${label}" "${pid}" >&2
+    return 1
+  fi
+}
+
+verify_cleanup_helper() {
+  local pid identity expected
+  sleep 30 &
+  pid=$!
+  expected="$(readlink -f -- "$(command -v sleep)")"
+  identity="$(capture_expected_identity "${pid}" "${expected}")" ||
+    die "could not verify the cleanup helper fixture identity"
+  stop_verified_process "${pid}" "${identity}" "cleanup helper fixture"
+  if kill -0 "${pid}" 2>/dev/null; then
+    die "cleanup helper left its fixture process alive"
+  fi
+
+  bash -c 'trap "" TERM; exec tail -f /dev/null' &
+  pid=$!
+  expected="$(readlink -f -- "$(command -v tail)")"
+  identity="$(capture_expected_identity "${pid}" "${expected}")" ||
+    die "could not verify the cleanup escalation fixture identity"
+  stop_verified_process "${pid}" "${identity}" "cleanup escalation fixture"
+  if kill -0 "${pid}" 2>/dev/null; then
+    die "cleanup helper did not SIGKILL its TERM-resistant fixture"
+  fi
+}
+
+cleanup() {
+  stop_host
+  stop_clipboard_owner
+  if [[ -n "${display_server_pid}" ]]; then
+    if ! stop_verified_process "${display_server_pid}" "${display_server_identity}" \
+      "isolated X server"; then
+      return
+    fi
+    display_server_pid=""
+    display_server_identity=""
+  fi
+}
+
+prepare_isolated_clipboard_display() {
+  if [[ "${LYNX_LAUNCHER_TEST_ISOLATED_DISPLAY:-}" == 1 ]]; then
+    clipboard_display="${DISPLAY}"
+    clipboard_test=true
+    return
+  fi
+  local display_file="${run_directory}/xwayland.display"
+  local server_log="${run_directory}/xwayland.log"
+  local deadline display_number server_kind
+  exec {xwayland_display_fd}>"${display_file}"
+  if [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v Xwayland >/dev/null 2>&1; then
+    server_kind="Xwayland"
+    Xwayland -displayfd "${xwayland_display_fd}" -geometry 1600x1200 -noreset \
+      >"${server_log}" 2>&1 &
+  elif command -v Xvfb >/dev/null 2>&1; then
+    server_kind="Xvfb"
+    Xvfb -displayfd "${xwayland_display_fd}" -screen 0 1600x1200x24 \
+      -nolisten tcp -noreset >"${server_log}" 2>&1 &
+  else
+    exec {xwayland_display_fd}>&-
+    die "isolated clipboard smoke requires standalone Xwayland with WAYLAND_DISPLAY, or Xvfb"
+  fi
+  display_server_pid=$!
+  exec {xwayland_display_fd}>&-
+  display_server_expected="$(readlink -f -- "$(command -v "${server_kind}")")"
+  display_server_identity="$(capture_expected_identity \
+    "${display_server_pid}" "${display_server_expected}")" ||
+    die "could not verify the isolated ${server_kind} process identity"
+  deadline=$((SECONDS + 3))
+  while [[ ! -s "${display_file}" ]] && ((SECONDS < deadline)); do
+    kill -0 "${display_server_pid}" 2>/dev/null || break
+    sleep 0.02
+  done
+  [[ -s "${display_file}" ]] || die "isolated Xwayland did not become ready"
+  display_number="$(<"${display_file}")"
+  [[ "${display_number}" =~ ^[0-9]+$ ]] || die "isolated Xwayland returned an invalid display"
+  clipboard_display=":${display_number}"
+  clipboard_test=true
+  printf 'Rust clipboard smoke uses isolated %s DISPLAY=%s.\n' \
+    "${server_kind}" "${clipboard_display}"
+}
+
+trap cleanup EXIT
+require_visible_capture_commands
+verify_cleanup_helper
+
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -194,6 +341,7 @@ assert_success_log() {
     '[host-rs] view entered foreground' \
     '[host-rs] metrics logical=1120x760 dpr=1.25 framebuffer-scale=1x1' \
     '[host-rs] Launcher.getApplications resolved 3 applications' \
+    '[host-rs] unknown cursor callback probe requested arrow fallback' \
     '[host-rs] runtime core initialized' \
     '[host-rs] runtime core shutdown complete'; do
     if ! grep -Fq -- "${marker}" "${path}"; then
@@ -219,7 +367,7 @@ assert_input_trace() {
   for marker in \
     '[host-rs] key dispatch type=repeat physical=458977 logical=8589934850 synthesized=false' \
     '[host-rs] pointer dispatch phase=hover signal=scroll x=250 y=380 scroll-logical-y=-100 scroll-physical-y=-125 buttons=0' \
-    '[host-rs] key dispatch type=up physical=458977 logical=8589934850 synthesized=true' \
+    '[host-rs] key dispatch type=up physical=458981 logical=8589934851 synthesized=true' \
     '[host-rs] pointer dispatch phase=cancel signal=none x=275 y=200 scroll-logical-y=0 scroll-physical-y=0 buttons=1' \
     '[host-rs] pointer dispatch phase=remove signal=none x=275 y=200 scroll-logical-y=0 scroll-physical-y=0 buttons=0' \
     '[host-rs] view entered background'; do
@@ -285,6 +433,9 @@ for ((iteration = 1; iteration <= iterations; iteration += 1)); do
     --x 0 --y 220 --width 1120 --height 300 \
     --red 0 --green 255 --blue 0 --tolerance 8 \
     --minimum-matches 512 --timeout-ms 3000 --scale 1.25
+  "${click_driver}" --pid "${host_pid}" expect-cursor-shapes \
+    --x 220 --y 160 --other-x 800 --other-y 80 \
+    --timeout-ms 3000 --scale 1.25
   "${click_driver}" --pid "${host_pid}" click --x 220 --y 160 --scale 1.25
   sleep 0.2
   "${click_driver}" --pid "${host_pid}" click --x 220 --y 160 --scale 1.25
@@ -317,7 +468,7 @@ for ((iteration = 1; iteration <= iterations; iteration += 1)); do
     --x 200 --y 304 --direction up --scale 1.25
   "${click_driver}" --pid "${host_pid}" repeat-key --key left-shift
   "${click_driver}" --pid "${host_pid}" hold-input \
-    --key left-shift --x 220 --y 160 --scale 1.25
+    --key right-shift --x 220 --y 160 --scale 1.25
   "${click_driver}" --pid "${host_pid}" defocus
 
   if ! wait_for_host_exit; then
@@ -408,5 +559,67 @@ if grep -Fq -- '[host-rs] Launcher.getApplications resolved ' "${host_log}"; the
   die "Rust rejection process unexpectedly resolved the application Promise"
 fi
 printf 'Rust native Promise rejection smoke passed.\n'
+
+prepare_isolated_clipboard_display
+if [[ "${clipboard_test}" == true ]]; then
+  clipboard_owner_log="${run_directory}/clipboard-owner.log"
+  env -u NIRI_SOCKET DISPLAY="${clipboard_display}" \
+    "${click_driver}" clipboard-owner --text cobalt >"${clipboard_owner_log}" 2>&1 &
+  clipboard_owner_pid=$!
+  clipboard_owner_identity="$(capture_expected_identity "${clipboard_owner_pid}" "${expected_driver}")" ||
+    die "could not verify the clipboard owner process identity"
+  clipboard_owner_deadline=$((SECONDS + 3))
+  while ! grep -Fq -- 'clipboard owner ready' "${clipboard_owner_log}" &&
+    ((SECONDS < clipboard_owner_deadline)); do
+    kill -0 "${clipboard_owner_pid}" 2>/dev/null || break
+    sleep 0.02
+  done
+  grep -Fq -- 'clipboard owner ready' "${clipboard_owner_log}" ||
+    die "isolated X11 clipboard owner did not become ready"
+  host_log="${run_directory}/clipboard-integration.log"
+  setsid env -u NIRI_SOCKET "${fixture_environment[@]}" \
+    DISPLAY="${clipboard_display}" LYNX_LAUNCHER_E2E_IGNORE_FOCUS_LOSS=1 \
+    "${rust_host_binary}" --run-for 4 >"${host_log}" 2>&1 &
+  host_pid=$!
+  host_identity="$(capture_host_identity)" ||
+    die "could not capture the Rust clipboard process identity"
+  if ! wait_for_log '[host-rs] first screen layout completed' ||
+    ! wait_for_log '[host-rs] first GL frame presented'; then
+    dump_log "${host_log}"
+    die "Rust clipboard process did not render the launcher"
+  fi
+  env -u NIRI_SOCKET DISPLAY="${clipboard_display}" \
+    "${click_driver}" --pid "${host_pid}" click --x 220 --y 160 --scale 1.25
+  sleep 0.1
+  env -u NIRI_SOCKET DISPLAY="${clipboard_display}" \
+    "${click_driver}" --pid "${host_pid}" shortcut --key ctrl-v
+  env -u NIRI_SOCKET DISPLAY="${clipboard_display}" \
+    "${click_driver}" --pid "${host_pid}" expect-pixel \
+    --x 40 --y 265 --width 76 --height 76 \
+    --red 0 --green 255 --blue 0 --tolerance 8 \
+    --minimum-matches 512 --timeout-ms 3000 --scale 1.25
+  env -u NIRI_SOCKET DISPLAY="${clipboard_display}" \
+    "${click_driver}" --pid "${host_pid}" shortcut --key ctrl-a
+  env -u NIRI_SOCKET DISPLAY="${clipboard_display}" \
+    "${click_driver}" --pid "${host_pid}" shortcut --key ctrl-c
+  env -u NIRI_SOCKET DISPLAY="${clipboard_display}" \
+    "${click_driver}" clipboard-read --text cobalt --timeout-ms 3000
+  if ! wait_for_log '[host-rs] clipboard read callback completed' ||
+    ! wait_for_log '[host-rs] clipboard write callback completed'; then
+    dump_log "${host_log}"
+    die "Rust clipboard process did not execute both Lynx clipboard callbacks"
+  fi
+  stop_clipboard_owner
+  if ! wait_for_host_exit; then
+    dump_log "${host_log}"
+    die "Rust clipboard process did not exit cleanly"
+  fi
+  assert_success_log "${host_log}" "Rust clipboard process"
+  grep -Fq -- '[host-rs] auto-exit after bounded run' "${host_log}" || {
+    dump_log "${host_log}"
+    die "Rust clipboard process did not complete its bounded run"
+  }
+  printf 'Rust isolated clipboard read/write smoke passed.\n'
+fi
 
 printf 'Rust shell smoke passed. Logs: %s\n' "${run_directory}"

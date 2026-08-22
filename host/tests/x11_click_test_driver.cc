@@ -1,6 +1,8 @@
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/cursorfont.h>
+#include <X11/extensions/Xfixes.h>
 #include <X11/keysym.h>
 
 #include <sys/wait.h>
@@ -46,8 +48,10 @@ enum class Action {
   kExpectPixel,
   kExpectNoPixel,
   kExpectRegionsDiffer,
+  kExpectCursorShapes,
   kScroll,
   kRepeatKey,
+  kShortcut,
   kHoldInput,
 };
 
@@ -78,6 +82,8 @@ const char* Usage() {
   return "usage:\n"
          "  x11_click_test_driver --self-test-server-clock\n"
          "  x11_click_test_driver --self-test-visible-pixels\n"
+         "  x11_click_test_driver clipboard-owner --text ASCII\n"
+         "  x11_click_test_driver clipboard-read --text ASCII --timeout-ms N\n"
          "  x11_click_test_driver --pid PID click --x X --y Y "
          "[--scale SCALE]\n"
          "  x11_click_test_driver --pid PID defocus\n"
@@ -86,7 +92,8 @@ const char* Usage() {
          "  x11_click_test_driver --pid PID scroll --x X --y Y "
          "--direction up|down [--scale SCALE]\n"
          "  x11_click_test_driver --pid PID repeat-key --key left-shift\n"
-         "  x11_click_test_driver --pid PID hold-input --key left-shift "
+         "  x11_click_test_driver --pid PID shortcut --key ctrl-v|ctrl-a|ctrl-c\n"
+         "  x11_click_test_driver --pid PID hold-input --key right-shift "
          "--x X --y Y [--scale SCALE]\n"
          "  x11_click_test_driver --pid PID expect-pixel --x X --y Y "
          "--width W --height H --red R --green G --blue B --tolerance N "
@@ -97,7 +104,9 @@ const char* Usage() {
          "  x11_click_test_driver --pid PID expect-regions-differ --x X "
          "--y Y --other-x X --other-y Y --width W --height H --red R "
          "--green G --blue B --tolerance N --minimum-differences N "
-         "--timeout-ms N [--scale SCALE]";
+         "--timeout-ms N [--scale SCALE]\n"
+         "  x11_click_test_driver --pid PID expect-cursor-shapes --x X --y Y "
+         "--other-x X --other-y Y --timeout-ms N [--scale SCALE]";
 }
 
 uint64_t ParseUnsigned(const std::string& value, const std::string& name,
@@ -182,10 +191,14 @@ Options ParseOptions(int argc, char** argv) {
     options.action = Action::kExpectNoPixel;
   } else if (action == "expect-regions-differ") {
     options.action = Action::kExpectRegionsDiffer;
+  } else if (action == "expect-cursor-shapes") {
+    options.action = Action::kExpectCursorShapes;
   } else if (action == "scroll") {
     options.action = Action::kScroll;
   } else if (action == "repeat-key") {
     options.action = Action::kRepeatKey;
+  } else if (action == "shortcut") {
+    options.action = Action::kShortcut;
   } else if (action == "hold-input") {
     options.action = Action::kHoldInput;
   } else {
@@ -283,9 +296,22 @@ Options ParseOptions(int argc, char** argv) {
     if (!options.key || *options.key != "left-shift" || argc != 6) {
       throw std::runtime_error(Usage());
     }
+  } else if (options.action == Action::kShortcut) {
+    if (!options.key ||
+        (*options.key != "ctrl-v" && *options.key != "ctrl-a" &&
+         *options.key != "ctrl-c") ||
+        argc != 6) {
+      throw std::runtime_error(Usage());
+    }
   } else if (options.action == Action::kHoldInput) {
-    if (!options.key || *options.key != "left-shift" || !options.x || !options.y ||
+    if (!options.key || *options.key != "right-shift" || !options.x || !options.y ||
         argc != 10 + (options.scale ? 2 : 0)) {
+      throw std::runtime_error(Usage());
+    }
+  } else if (options.action == Action::kExpectCursorShapes) {
+    if (!options.x || !options.y || !options.other_x || !options.other_y ||
+        !options.timeout_ms || *options.timeout_ms == 0 ||
+        argc != 14 + (options.scale ? 2 : 0)) {
       throw std::runtime_error(Usage());
     }
   } else if (options.action == Action::kExpectPixel ||
@@ -679,7 +705,9 @@ void SendText(Display* display, Window root, Window window,
 }
 
 KeyCode TestKeyCode(Display* display, const std::string& key) {
-  const KeySym symbol = key == "left-shift" ? XK_Shift_L : NoSymbol;
+  const KeySym symbol = key == "left-shift"    ? XK_Shift_L
+                        : key == "right-shift" ? XK_Shift_R
+                                                 : NoSymbol;
   const KeyCode keycode = XKeysymToKeycode(display, symbol);
   if (symbol == NoSymbol || keycode == 0) {
     throw std::runtime_error("the active X11 keymap cannot produce " + key);
@@ -713,6 +741,28 @@ void SendRepeatKey(Display* display, Window root, Window window,
           "repeat KeyPress");
   SendKey(display, root, window, keycode, KeyRelease, ShiftMask, clock,
           "KeyRelease");
+  XSync(display, False);
+}
+
+void SendShortcut(Display* display, Window root, Window window,
+                  const std::string& shortcut, ServerClock& clock) {
+  const KeyCode control = XKeysymToKeycode(display, XK_Control_L);
+  const KeySym symbol = shortcut == "ctrl-v"   ? XK_v
+                        : shortcut == "ctrl-a" ? XK_a
+                                                 : XK_c;
+  const KeyCode key = XKeysymToKeycode(display, symbol);
+  if (control == 0 || key == 0) {
+    throw std::runtime_error("the active X11 keymap cannot produce " +
+                             shortcut);
+  }
+  SendKey(display, root, window, control, KeyPress, 0, clock,
+          "Control KeyPress");
+  SendKey(display, root, window, key, KeyPress, ControlMask, clock,
+          "shortcut KeyPress");
+  SendKey(display, root, window, key, KeyRelease, ControlMask, clock,
+          "shortcut KeyRelease");
+  SendKey(display, root, window, control, KeyRelease, ControlMask, clock,
+          "Control KeyRelease");
   XSync(display, False);
 }
 
@@ -1472,10 +1522,239 @@ void ExpectRegionsDiffer(Display* display, Window window,
       std::to_string(*options.minimum_differences));
 }
 
+void RunClipboardOwner(const std::string& text) {
+  Display* display = XOpenDisplay(nullptr);
+  if (!display) {
+    throw std::runtime_error("could not open DISPLAY");
+  }
+  const Window window = XCreateSimpleWindow(
+      display, DefaultRootWindow(display), 0, 0, 1, 1, 0, 0, 0);
+  const Atom clipboard = XInternAtom(display, "CLIPBOARD", False);
+  const Atom utf8 = XInternAtom(display, "UTF8_STRING", False);
+  const Atom targets = XInternAtom(display, "TARGETS", False);
+  XSetSelectionOwner(display, clipboard, window, CurrentTime);
+  XSync(display, False);
+  if (XGetSelectionOwner(display, clipboard) != window) {
+    XDestroyWindow(display, window);
+    XCloseDisplay(display);
+    throw std::runtime_error("could not own the X11 CLIPBOARD selection");
+  }
+  std::cout << "clipboard owner ready\n" << std::flush;
+
+  for (;;) {
+    XEvent event{};
+    XNextEvent(display, &event);
+    if (event.type != SelectionRequest) {
+      continue;
+    }
+    const XSelectionRequestEvent& request = event.xselectionrequest;
+    XEvent response{};
+    response.xselection.type = SelectionNotify;
+    response.xselection.display = request.display;
+    response.xselection.requestor = request.requestor;
+    response.xselection.selection = request.selection;
+    response.xselection.target = request.target;
+    response.xselection.time = request.time;
+    response.xselection.property = None;
+    const Atom property = request.property == None ? request.target
+                                                   : request.property;
+    if (request.target == targets) {
+      const Atom supported[] = {targets, utf8, XA_STRING};
+      XChangeProperty(display, request.requestor, property, XA_ATOM, 32,
+                      PropModeReplace,
+                      reinterpret_cast<const unsigned char*>(supported), 3);
+      response.xselection.property = property;
+    } else if (request.target == utf8 || request.target == XA_STRING) {
+      XChangeProperty(display, request.requestor, property, request.target, 8,
+                      PropModeReplace,
+                      reinterpret_cast<const unsigned char*>(text.data()),
+                      static_cast<int>(text.size()));
+      response.xselection.property = property;
+    }
+    XSendEvent(display, request.requestor, False, 0, &response);
+    XFlush(display);
+  }
+}
+
+void ExpectClipboardText(const std::string& expected, int timeout_ms) {
+  Display* display = XOpenDisplay(nullptr);
+  if (!display) {
+    throw std::runtime_error("could not open DISPLAY");
+  }
+  struct DisplayGuard {
+    Display* display;
+    ~DisplayGuard() { XCloseDisplay(display); }
+  } display_guard{display};
+  const Window window = XCreateSimpleWindow(
+      display, DefaultRootWindow(display), 0, 0, 1, 1, 0, 0, 0);
+  struct WindowGuard {
+    Display* display;
+    Window window;
+    ~WindowGuard() { XDestroyWindow(display, window); }
+  } window_guard{display, window};
+  const Atom clipboard = XInternAtom(display, "CLIPBOARD", False);
+  const Atom utf8 = XInternAtom(display, "UTF8_STRING", False);
+  const Atom property = XInternAtom(display, "LYNX_LAUNCHER_CLIPBOARD", False);
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+  do {
+    XDeleteProperty(display, window, property);
+    XConvertSelection(display, clipboard, utf8, property, window, CurrentTime);
+    XFlush(display);
+    const auto request_deadline =
+        std::min(deadline, std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(250));
+    while (std::chrono::steady_clock::now() < request_deadline) {
+      while (XPending(display) > 0) {
+        XEvent event{};
+        XNextEvent(display, &event);
+        if (event.type != SelectionNotify ||
+            event.xselection.selection != clipboard ||
+            event.xselection.property == None) {
+          continue;
+        }
+        Atom actual_type = None;
+        int actual_format = 0;
+        unsigned long count = 0;
+        unsigned long remaining = 0;
+        unsigned char* data = nullptr;
+        const int status = XGetWindowProperty(
+            display, window, property, 0, 4096, True, AnyPropertyType,
+            &actual_type, &actual_format, &count, &remaining, &data);
+        const std::string value =
+            status == Success && actual_format == 8 && data
+                ? std::string(reinterpret_cast<char*>(data), count)
+                : std::string();
+        if (data) {
+          XFree(data);
+        }
+        if (value == expected) {
+          std::cout << "clipboard contains expected text\n";
+          return;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  } while (std::chrono::steady_clock::now() < deadline);
+  throw std::runtime_error("X11 CLIPBOARD did not contain expected text");
+}
+
+struct CursorFingerprint {
+  unsigned short width;
+  unsigned short height;
+  unsigned short xhot;
+  unsigned short yhot;
+  std::vector<unsigned long> pixels;
+
+  bool operator==(const CursorFingerprint&) const = default;
+};
+
+CursorFingerprint ActiveCursor(Display* display) {
+  XFixesCursorImage* image = XFixesGetCursorImage(display);
+  if (!image) {
+    throw std::runtime_error("XFixes could not read the active cursor image");
+  }
+  CursorFingerprint result{image->width, image->height, image->xhot,
+                           image->yhot,
+                           std::vector<unsigned long>(
+                               image->pixels,
+                               image->pixels + image->width * image->height)};
+  XFree(image);
+  return result;
+}
+
+CursorFingerprint ReferenceCursor(Display* display, Window root,
+                                  unsigned int shape) {
+  XSetWindowAttributes attributes{};
+  attributes.override_redirect = True;
+  const Window window = XCreateWindow(
+      display, root, 0, 0, 8, 8, 0, CopyFromParent, InputOnly, CopyFromParent,
+      CWOverrideRedirect, &attributes);
+  const Cursor cursor = XCreateFontCursor(display, shape);
+  XDefineCursor(display, window, cursor);
+  XMapRaised(display, window);
+  XWarpPointer(display, None, window, 0, 0, 0, 0, 4, 4);
+  XSync(display, False);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const CursorFingerprint result = ActiveCursor(display);
+  XDestroyWindow(display, window);
+  XFreeCursor(display, cursor);
+  XSync(display, False);
+  return result;
+}
+
+void ExpectCursorShapes(Display* display, Window root, Window window,
+                        const Options& options) {
+  Window root_return = None;
+  Window child_return = None;
+  int root_x = 0;
+  int root_y = 0;
+  int window_x = 0;
+  int window_y = 0;
+  unsigned int mask = 0;
+  if (!XQueryPointer(display, root, &root_return, &child_return, &root_x,
+                     &root_y, &window_x, &window_y, &mask)) {
+    throw std::runtime_error("could not save the X11 pointer position");
+  }
+  struct PointerRestore {
+    Display* display;
+    Window root;
+    int x;
+    int y;
+    ~PointerRestore() {
+      XWarpPointer(display, None, root, 0, 0, 0, 0, x, y);
+      XSync(display, False);
+    }
+  } restore{display, root, root_x, root_y};
+
+  const CursorFingerprint arrow = ReferenceCursor(display, root, XC_left_ptr);
+  const CursorFingerprint ibeam = ReferenceCursor(display, root, XC_xterm);
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(*options.timeout_ms);
+
+  XWarpPointer(display, None, window, 0, 0, 0, 0, *options.other_x,
+               *options.other_y);
+  XSync(display, False);
+  while (!(ActiveCursor(display) == arrow)) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      throw std::runtime_error(
+          "ordinary launcher region did not request the arrow cursor");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+
+  XWarpPointer(display, None, window, 0, 0, 0, 0, *options.x, *options.y);
+  XSync(display, False);
+  while (!(ActiveCursor(display) == ibeam)) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      throw std::runtime_error(
+          "search input did not request the X11 I-beam cursor");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  std::cout << "verified arrow fallback and search I-beam cursor images\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 4 && std::string(argv[1]) == "clipboard-owner" &&
+        std::string(argv[2]) == "--text" && argv[3][0] != '\0') {
+      RunClipboardOwner(argv[3]);
+      return 0;
+    }
+    if (argc == 6 && std::string(argv[1]) == "clipboard-read" &&
+        std::string(argv[2]) == "--text" && argv[3][0] != '\0' &&
+        std::string(argv[4]) == "--timeout-ms") {
+      const int timeout_ms = static_cast<int>(
+          ParseUnsigned(argv[5], "--timeout-ms", 60000));
+      if (timeout_ms == 0) {
+        throw std::runtime_error("--timeout-ms must be greater than zero");
+      }
+      ExpectClipboardText(argv[3], timeout_ms);
+      return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--self-test-server-clock") {
       SelfTestServerClock();
       return 0;
@@ -1535,6 +1814,11 @@ int main(int argc, char** argv) {
       SendRepeatKey(display, root, window, *options.key, clock);
       return 0;
     }
+    if (options.action == Action::kShortcut) {
+      ServerClock clock(display, root, window);
+      SendShortcut(display, root, window, *options.key, clock);
+      return 0;
+    }
 
     Options physical = options;
     const double inferred_scale = std::min(
@@ -1559,6 +1843,16 @@ int main(int argc, char** argv) {
     if (*physical.x >= attributes.width || *physical.y >= attributes.height) {
       throw std::runtime_error(
           "coordinates are outside the specified PID window");
+    }
+    if (options.action == Action::kExpectCursorShapes &&
+        (*physical.other_x >= attributes.width ||
+         *physical.other_y >= attributes.height)) {
+      throw std::runtime_error(
+          "secondary coordinates are outside the specified PID window");
+    }
+    if (options.action == Action::kExpectCursorShapes) {
+      ExpectCursorShapes(display, root, window, physical);
+      return 0;
     }
     if (options.action == Action::kExpectPixel ||
         options.action == Action::kExpectNoPixel ||

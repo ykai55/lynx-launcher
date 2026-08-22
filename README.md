@@ -213,7 +213,17 @@ startup focus-loss 用例验证 runtime userdata 安装前的 FocusOut 不会丢
 seam 还会注入一次测试专用 discovery 错误。重复次数同时应用于 first-frame 与 bounded input
 模式；每轮都执行完整过滤、launch rejection、`ActionError` 像素、真实键入、scroll/repeat、
 held-input cancellation 和 focus teardown，并要求 clean shutdown；日志保存在
-`.logs/ticket-05/rust-input-smoke/`。也可单独执行并增加重复次数：
+`.logs/ticket-06/rust-desktop-smoke/`。
+
+desktop integration gate 还通过 XFixes cursor image fingerprint 核对普通区域的 arrow
+fallback 与搜索输入框的 I-beam，并执行 10 次 cursor teardown。clipboard read/write 使用独立
+X selection namespace：Wayland session 优先启动 standalone `Xwayland`，否则回退 `Xvfb`；
+两者都不可用时 gate 会明确失败，不会在用户的 `DISPLAY` 上接管 `CLIPBOARD`，也不会静默
+跳过。CI 若已提供专用 X server，可设置 `LYNX_LAUNCHER_TEST_ISOLATED_DISPLAY=1` 明确声明
+当前 `DISPLAY` 可用于 selection ownership。隔离测试用外部 owner 提供 `cobalt`，经真实
+Ctrl+V 验证 Lynx get callback，再经 Ctrl+A/C 和独立 reader 验证 set callback。
+
+也可单独执行并调整重复次数（默认 10）：
 
 ```sh
 ./scripts/rust-shell-smoke.sh

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString, OsStr};
 use std::io;
@@ -92,6 +93,36 @@ impl GlApi {
             get_current_context,
             swap_buffers,
             get_proc_address,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct DesktopApi {
+    get_clipboard: unsafe fn(*mut c_void) -> *const c_char,
+    set_clipboard: unsafe fn(*mut c_void, *const c_char),
+    create_cursor: unsafe fn(c_int) -> *mut c_void,
+    destroy_cursor: unsafe fn(*mut c_void),
+    set_cursor: unsafe fn(*mut c_void, *mut c_void),
+    set_cursor_mode: unsafe fn(*mut c_void, c_int),
+}
+
+impl DesktopApi {
+    pub const fn new(
+        get_clipboard: unsafe fn(*mut c_void) -> *const c_char,
+        set_clipboard: unsafe fn(*mut c_void, *const c_char),
+        create_cursor: unsafe fn(c_int) -> *mut c_void,
+        destroy_cursor: unsafe fn(*mut c_void),
+        set_cursor: unsafe fn(*mut c_void, *mut c_void),
+        set_cursor_mode: unsafe fn(*mut c_void, c_int),
+    ) -> Self {
+        Self {
+            get_clipboard,
+            set_clipboard,
+            create_cursor,
+            destroy_cursor,
+            set_cursor,
+            set_cursor_mode,
         }
     }
 }
@@ -798,6 +829,12 @@ static GLOBAL_UI_RUNNER_CONFIGURED: OnceLock<bool> = OnceLock::new();
 static LYNX_LOG_INITIALIZED: OnceLock<()> = OnceLock::new();
 static LYNX_LOG_CALLBACK_FAILED: AtomicBool = AtomicBool::new(false);
 static RENDERER_CALLBACK_ENTRY_FAILED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    // Lynx copies the returned UTF-8 into a u16string synchronously before the
+    // renderer callback can run again on this thread. Per-thread storage keeps
+    // concurrent callback pointers independent and is reclaimed at thread exit.
+    static CLIPBOARD_CALLBACK_RESULT: RefCell<CString> = RefCell::new(CString::default());
+}
 #[cfg(test)]
 static LYNX_LOG_INITIALIZATION_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -831,6 +868,11 @@ struct RendererState {
     window: WindowHandle,
     gl: GlApi,
     wake: EventWake,
+    desktop: DesktopApi,
+    platform_thread: ThreadId,
+    desktop_operations: Mutex<DesktopOperationQueue>,
+    desktop_callbacks_idle: Condvar,
+    cursors: Mutex<[CursorHandle; 6]>,
     tasks: ScheduledQueue<TaskToken>,
     callbacks: Mutex<RendererCallbackLifecycle>,
     callbacks_idle: Condvar,
@@ -841,6 +883,30 @@ struct RendererState {
     first_present: AtomicBool,
     text_input_active: AtomicBool,
     snapshot_trace: bool,
+}
+
+struct DesktopOperationQueue {
+    accepting: bool,
+    callbacks_in_flight: usize,
+    operations: VecDeque<DesktopOperation>,
+}
+
+enum DesktopOperation {
+    ReadClipboard(Arc<ClipboardRead>),
+    SetClipboard(CString),
+    ActivateCursor(c_int),
+}
+
+#[derive(Default)]
+struct ClipboardRead {
+    result: Mutex<Option<ClipboardReadResult>>,
+    complete_changed: Condvar,
+}
+
+enum ClipboardReadResult {
+    Success(CString),
+    RuntimeFailure,
+    ClosingCancelled,
 }
 
 struct RendererCallbackLifecycle {
@@ -864,19 +930,38 @@ impl Default for RendererCallbackLifecycle {
 #[derive(Clone, Copy)]
 struct WindowHandle(*mut c_void);
 
+#[derive(Clone, Copy)]
+struct CursorHandle(*mut c_void);
+
 // GLFW permits its context to move to the first renderer thread. Runtime
 // initialization guarantees that the window outlives all renderer callbacks.
 unsafe impl Send for WindowHandle {}
 unsafe impl Sync for WindowHandle {}
+unsafe impl Send for CursorHandle {}
 
 impl RendererState {
-    fn new(window: *mut c_void, gl: GlApi, wake: EventWake, snapshot_trace: bool) -> Self {
+    fn new(
+        window: *mut c_void,
+        gl: GlApi,
+        desktop: DesktopApi,
+        wake: EventWake,
+        snapshot_trace: bool,
+    ) -> Self {
         let tasks = ScheduledQueue::new();
         assert!(tasks.start_accepting());
         Self {
             window: WindowHandle(window),
             gl,
             wake,
+            desktop,
+            platform_thread: thread::current().id(),
+            desktop_operations: Mutex::new(DesktopOperationQueue {
+                accepting: true,
+                callbacks_in_flight: 0,
+                operations: VecDeque::new(),
+            }),
+            desktop_callbacks_idle: Condvar::new(),
+            cursors: Mutex::new([CursorHandle(std::ptr::null_mut()); 6]),
             tasks,
             callbacks: Mutex::new(RendererCallbackLifecycle::default()),
             callbacks_idle: Condvar::new(),
@@ -887,6 +972,239 @@ impl RendererState {
             first_present: AtomicBool::new(false),
             text_input_active: AtomicBool::new(false),
             snapshot_trace,
+        }
+    }
+
+    fn enqueue_desktop_operation(&self, operation: DesktopOperation) -> bool {
+        let mut queue = self
+            .desktop_operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !queue.accepting {
+            return false;
+        }
+        queue.operations.push_back(operation);
+        drop(queue);
+        if !self.wake.wake() {
+            self.callback_failed.store(true, Ordering::Release);
+        }
+        true
+    }
+
+    fn begin_desktop_callback(&self) -> Option<DesktopCallbackGuard<'_>> {
+        let mut state = self
+            .desktop_operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !state.accepting {
+            return None;
+        }
+        let Some(in_flight) = state.callbacks_in_flight.checked_add(1) else {
+            self.callback_failed.store(true, Ordering::Release);
+            return None;
+        };
+        state.callbacks_in_flight = in_flight;
+        Some(DesktopCallbackGuard { state: self })
+    }
+
+    fn read_clipboard_on_platform(&self) -> Result<CString, ()> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let value = unsafe { (self.desktop.get_clipboard)(self.window.0) };
+            if value.is_null() {
+                CString::default()
+            } else {
+                // GLFW owns this pointer only until the next clipboard call.
+                unsafe { CStr::from_ptr(value) }.to_owned()
+            }
+        }))
+        .map_err(|_| ())
+    }
+
+    fn clipboard_data(&self) -> *const c_char {
+        let result = if thread::current().id() == self.platform_thread {
+            match self.read_clipboard_on_platform() {
+                Ok(value) => ClipboardReadResult::Success(value),
+                Err(()) => ClipboardReadResult::RuntimeFailure,
+            }
+        } else {
+            let read = Arc::new(ClipboardRead::default());
+            if !self.enqueue_desktop_operation(DesktopOperation::ReadClipboard(read.clone())) {
+                return c"".as_ptr();
+            }
+            let result = read
+                .result
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut result = read
+                .complete_changed
+                .wait_while(result, |result| result.is_none())
+                .unwrap_or_else(|error| error.into_inner());
+            result
+                .take()
+                .expect("clipboard command completed without a result")
+        };
+        let result = match result {
+            ClipboardReadResult::Success(value) => value,
+            ClipboardReadResult::ClosingCancelled => return c"".as_ptr(),
+            ClipboardReadResult::RuntimeFailure => {
+                self.record_callback_failure();
+                return c"".as_ptr();
+            }
+        };
+        if self.snapshot_trace {
+            eprintln!("[host-rs] clipboard read callback completed");
+        }
+        CLIPBOARD_CALLBACK_RESULT.with(|storage| {
+            let mut storage = storage.borrow_mut();
+            *storage = result;
+            storage.as_ptr()
+        })
+    }
+
+    fn set_clipboard_data(&self, value: CString) {
+        if thread::current().id() == self.platform_thread {
+            unsafe { (self.desktop.set_clipboard)(self.window.0, value.as_ptr()) };
+            if self.snapshot_trace {
+                eprintln!("[host-rs] clipboard write callback completed");
+            }
+        } else {
+            let _ = self.enqueue_desktop_operation(DesktopOperation::SetClipboard(value));
+        }
+    }
+
+    fn activate_cursor(&self, cursor_type: c_int) {
+        if thread::current().id() == self.platform_thread {
+            self.activate_cursor_on_platform(cursor_type);
+        } else {
+            let _ = self.enqueue_desktop_operation(DesktopOperation::ActivateCursor(cursor_type));
+        }
+    }
+
+    fn activate_cursor_on_platform(&self, cursor_type: c_int) {
+        if cursor_type == lynx_sys::LYNX_CURSOR_TYPE_NONE {
+            unsafe { (self.desktop.set_cursor_mode)(self.window.0, 1) };
+            return;
+        }
+        unsafe { (self.desktop.set_cursor_mode)(self.window.0, 0) };
+        let (slot, shape) = match cursor_type {
+            lynx_sys::LYNX_CURSOR_TYPE_CLICK
+            | lynx_sys::LYNX_CURSOR_TYPE_GRAB
+            | lynx_sys::LYNX_CURSOR_TYPE_GRABBING => (1, 1),
+            lynx_sys::LYNX_CURSOR_TYPE_TEXT | lynx_sys::LYNX_CURSOR_TYPE_VERTICAL_TEXT => (2, 2),
+            lynx_sys::LYNX_CURSOR_TYPE_PRECISE => (3, 3),
+            lynx_sys::LYNX_CURSOR_TYPE_RESIZE_LEFT_RIGHT
+            | lynx_sys::LYNX_CURSOR_TYPE_RESIZE_LEFT
+            | lynx_sys::LYNX_CURSOR_TYPE_RESIZE_RIGHT
+            | lynx_sys::LYNX_CURSOR_TYPE_RESIZE_COLUMN => (4, 4),
+            lynx_sys::LYNX_CURSOR_TYPE_RESIZE_UP_DOWN
+            | lynx_sys::LYNX_CURSOR_TYPE_RESIZE_UP
+            | lynx_sys::LYNX_CURSOR_TYPE_RESIZE_DOWN
+            | lynx_sys::LYNX_CURSOR_TYPE_RESIZE_ROW => (5, 5),
+            _ => (0, 0),
+        };
+        let mut cursors = self
+            .cursors
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if cursors[slot].0.is_null() {
+            cursors[slot] = CursorHandle(unsafe { (self.desktop.create_cursor)(shape) });
+        }
+        unsafe { (self.desktop.set_cursor)(self.window.0, cursors[slot].0) };
+    }
+
+    fn run_desktop_operations(&self) {
+        debug_assert_eq!(thread::current().id(), self.platform_thread);
+        loop {
+            let operation = self
+                .desktop_operations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .operations
+                .pop_front();
+            let Some(operation) = operation else {
+                break;
+            };
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &operation {
+                    DesktopOperation::ReadClipboard(_) => self.read_clipboard_on_platform(),
+                    DesktopOperation::SetClipboard(value) => {
+                        unsafe { (self.desktop.set_clipboard)(self.window.0, value.as_ptr()) };
+                        if self.snapshot_trace {
+                            eprintln!("[host-rs] clipboard write callback completed");
+                        }
+                        Ok(CString::default())
+                    }
+                    DesktopOperation::ActivateCursor(cursor_type) => {
+                        self.activate_cursor_on_platform(*cursor_type);
+                        Ok(CString::default())
+                    }
+                }));
+            if let DesktopOperation::ReadClipboard(read) = operation {
+                *read
+                    .result
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(match result {
+                    Ok(Ok(value)) => ClipboardReadResult::Success(value),
+                    Ok(Err(())) | Err(_) => ClipboardReadResult::RuntimeFailure,
+                });
+                read.complete_changed.notify_all();
+            } else if !matches!(result, Ok(Ok(_))) {
+                self.record_callback_failure();
+            }
+        }
+    }
+
+    fn close_desktop_operations(&self) {
+        let operations = self
+            .desktop_operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut operations = operations;
+        operations.accepting = false;
+        let cancelled = operations.operations.drain(..).collect::<Vec<_>>();
+        drop(operations);
+        for operation in cancelled {
+            if let DesktopOperation::ReadClipboard(read) = operation {
+                *read
+                    .result
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) =
+                    Some(ClipboardReadResult::ClosingCancelled);
+                read.complete_changed.notify_all();
+            }
+        }
+        let state = self
+            .desktop_operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        drop(
+            self.desktop_callbacks_idle
+                .wait_while(state, |state| state.callbacks_in_flight != 0)
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+    }
+
+    fn close_desktop_operations_before<R>(&self, release: impl FnOnce() -> R) -> R {
+        self.close_desktop_operations();
+        release()
+    }
+
+    fn destroy_cursors(&self) {
+        let mut cursors = self
+            .cursors
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let owned = std::mem::replace(&mut *cursors, [CursorHandle(std::ptr::null_mut()); 6]);
+        drop(cursors);
+        for cursor in owned {
+            if !cursor.0.is_null()
+                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    (self.desktop.destroy_cursor)(cursor.0)
+                }))
+                .is_err()
+            {
+                self.record_callback_failure();
+            }
         }
     }
 
@@ -1106,6 +1424,25 @@ impl RendererState {
     }
 }
 
+struct DesktopCallbackGuard<'a> {
+    state: &'a RendererState,
+}
+
+impl Drop for DesktopCallbackGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .desktop_operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        debug_assert!(state.callbacks_in_flight > 0);
+        state.callbacks_in_flight -= 1;
+        if state.callbacks_in_flight == 0 {
+            self.state.desktop_callbacks_idle.notify_all();
+        }
+    }
+}
+
 struct GlContextRollback<'a> {
     state: &'a RendererState,
     previous: *mut c_void,
@@ -1282,6 +1619,7 @@ impl RuntimeCore {
     pub unsafe fn initialize(
         window: *mut c_void,
         gl: GlApi,
+        desktop: DesktopApi,
         wake: EventWake,
         view_options: &RuntimeViewOptions,
     ) -> io::Result<Self> {
@@ -1290,6 +1628,17 @@ impl RuntimeCore {
                 "cannot initialize the Lynx renderer without a GLFW window",
             ));
         }
+        let cursor_fallback_probe =
+            match std::env::var_os("LYNX_LAUNCHER_E2E_CURSOR_FALLBACK_PROBE") {
+                None => false,
+                Some(value) if value == OsStr::new("1") => true,
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "LYNX_LAUNCHER_E2E_CURSOR_FALLBACK_PROBE must be 1 when set",
+                    ));
+                }
+            };
         let view_state = Arc::new(ViewState::load(view_options, wake)?);
         let ui_runner = configure_global_ui_runner()?;
         let ui_activation =
@@ -1298,6 +1647,7 @@ impl RuntimeCore {
         let renderer_state = Arc::new(RendererState::new(
             window,
             gl,
+            desktop,
             wake,
             view_state.snapshot_trace,
         ));
@@ -1351,10 +1701,33 @@ impl RuntimeCore {
                 renderer.as_ptr(),
                 Some(renderer_post_task_callback),
             );
+            lynx_sys::lynx_windowless_renderer_bind_get_clipboard_data(
+                renderer.as_ptr(),
+                Some(get_clipboard_data_callback),
+            );
+            lynx_sys::lynx_windowless_renderer_bind_set_clipboard_data(
+                renderer.as_ptr(),
+                Some(set_clipboard_data_callback),
+            );
+            lynx_sys::lynx_windowless_renderer_bind_activate_system_cursor(
+                renderer.as_ptr(),
+                Some(activate_system_cursor_callback),
+            );
             lynx_sys::lynx_windowless_renderer_bind_show_text_input(
                 renderer.as_ptr(),
                 Some(show_text_input_callback),
             );
+        }
+
+        if cursor_fallback_probe {
+            unsafe {
+                activate_system_cursor_callback(
+                    renderer.as_ptr(),
+                    lynx_sys::LYNX_CURSOR_TYPE_UNKNOWN,
+                    std::ptr::null(),
+                )
+            };
+            eprintln!("[host-rs] unknown cursor callback probe requested arrow fallback");
         }
 
         Ok(Self {
@@ -1502,7 +1875,9 @@ impl RuntimeCore {
 
     pub fn run_due_tasks(&self) -> io::Result<()> {
         self.ensure_healthy()?;
+        self.renderer_state.run_desktop_operations();
         self.ui_runner.run_due()?;
+        self.renderer_state.run_desktop_operations();
         loop {
             let now_nanos = monotonic_nanos()?;
             let Some(task) = self.renderer_state.tasks.pop_due(now_nanos) else {
@@ -1521,7 +1896,9 @@ impl RuntimeCore {
                     lynx_sys::lynx_windowless_renderer_run_task(renderer.as_ptr(), task.into_raw())
                 };
             }
+            self.renderer_state.run_desktop_operations();
         }
+        self.renderer_state.run_desktop_operations();
         self.ensure_healthy()
     }
 
@@ -1705,16 +2082,20 @@ impl RuntimeCore {
             ));
         }
 
-        if let Some(view) = self.view.take() {
-            // SAFETY: The view is live and task queues still accept release work.
-            unsafe {
-                lynx_sys::lynx_view_enter_background(view.as_ptr());
-                lynx_sys::lynx_view_release(view.as_ptr());
+        let renderer_state = Arc::clone(&self.renderer_state);
+        renderer_state.close_desktop_operations_before(|| {
+            if let Some(view) = self.view.take() {
+                // SAFETY: Desktop callbacks are closed, while renderer/UI task
+                // queues still accept work required by view release.
+                unsafe {
+                    lynx_sys::lynx_view_enter_background(view.as_ptr());
+                    lynx_sys::lynx_view_release(view.as_ptr());
+                }
+                if self.view_state.snapshot_trace {
+                    eprintln!("[host-rs] view entered background for shutdown");
+                }
             }
-            if self.view_state.snapshot_trace {
-                eprintln!("[host-rs] view entered background for shutdown");
-            }
-        }
+        });
         if let Some(client) = self.view_client.take() {
             // SAFETY: View release has quiesced its client callbacks.
             unsafe { lynx_sys::lynx_view_client_release(client.as_ptr()) };
@@ -1791,11 +2172,6 @@ impl RuntimeCore {
             errors.push(error.to_string());
         }
 
-        let health_result = self.ensure_healthy();
-        if let Err(error) = health_result {
-            errors.push(error.to_string());
-        }
-
         if !self.native_callbacks_not_quiesced() {
             if let Some(generation) = ui_draining {
                 if let Err(error) = self.ui_runner.finish_deactivation(generation) {
@@ -1805,6 +2181,14 @@ impl RuntimeCore {
                     errors.push(error.to_string());
                 }
             }
+        }
+
+        // Native cursors outlive renderer/fetcher callbacks and the UI runner,
+        // but are still destroyed on the platform thread before GLFW's window.
+        self.renderer_state.destroy_cursors();
+
+        if let Err(error) = self.ensure_healthy() {
+            errors.push(error.to_string());
         }
 
         if errors.is_empty() {
@@ -2827,6 +3211,7 @@ fn with_renderer_state<R>(
             return ContainedCallback::Rejected;
         };
         let Some(_guard) = state.begin_callback(is_post) else {
+            state.callback_failed.store(true, Ordering::Release);
             return ContainedCallback::Rejected;
         };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(&state))) {
@@ -2905,6 +3290,49 @@ unsafe extern "C" fn renderer_post_task_callback(
     });
 }
 
+unsafe extern "C" fn get_clipboard_data_callback(
+    renderer: *mut LynxWindowlessRenderer,
+) -> *const c_char {
+    with_renderer_state(renderer, c"".as_ptr(), false, |state| {
+        let Some(_desktop_callback) = state.begin_desktop_callback() else {
+            return c"".as_ptr();
+        };
+        state.clipboard_data()
+    })
+}
+
+unsafe extern "C" fn set_clipboard_data_callback(
+    renderer: *mut LynxWindowlessRenderer,
+    value: *const c_char,
+) {
+    with_renderer_state(renderer, (), false, |state| {
+        let Some(_desktop_callback) = state.begin_desktop_callback() else {
+            return;
+        };
+        let value = if value.is_null() {
+            CString::default()
+        } else {
+            // Lynx owns the input only for this callback; preserve its bytes
+            // without imposing UTF-8 validation, matching the C++ host.
+            unsafe { CStr::from_ptr(value) }.to_owned()
+        };
+        state.set_clipboard_data(value);
+    });
+}
+
+unsafe extern "C" fn activate_system_cursor_callback(
+    renderer: *mut LynxWindowlessRenderer,
+    cursor_type: c_int,
+    _path: *const c_char,
+) {
+    with_renderer_state(renderer, (), false, |state| {
+        let Some(_desktop_callback) = state.begin_desktop_callback() else {
+            return;
+        };
+        state.activate_cursor(cursor_type);
+    });
+}
+
 unsafe extern "C" fn show_text_input_callback(renderer: *mut LynxWindowlessRenderer, show: bool) {
     with_renderer_state(renderer, (), false, |state| {
         state.text_input_active.store(show, Ordering::Release);
@@ -2920,6 +3348,13 @@ mod tests {
 
     static MAKE_CURRENT_COUNT: AtomicUsize = AtomicUsize::new(0);
     static SWAP_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static CURSOR_CREATE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static CLIPBOARD_GET_PANIC: AtomicBool = AtomicBool::new(false);
+    static CURSOR_DESTROY_PANIC_ONCE: AtomicBool = AtomicBool::new(false);
+    static CLIPBOARD_SET_VALUE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static CURSOR_SHAPES: Mutex<Vec<c_int>> = Mutex::new(Vec::new());
+    static CURSOR_MODES: Mutex<Vec<c_int>> = Mutex::new(Vec::new());
+    static DESTROYED_CURSORS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     static GLOBAL_HEALTH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     thread_local! {
@@ -2985,6 +3420,48 @@ mod tests {
         std::ptr::dangling_mut::<c_void>()
     }
 
+    unsafe fn get_clipboard(_: *mut c_void) -> *const c_char {
+        if CLIPBOARD_GET_PANIC.swap(false, Ordering::AcqRel) {
+            panic!("controlled clipboard read panic");
+        }
+        c"test clipboard".as_ptr()
+    }
+
+    unsafe fn set_clipboard(_: *mut c_void, value: *const c_char) {
+        *CLIPBOARD_SET_VALUE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            unsafe { CStr::from_ptr(value) }.to_bytes().to_vec();
+    }
+
+    unsafe fn create_cursor(shape: c_int) -> *mut c_void {
+        let handle = CURSOR_CREATE_COUNT.fetch_add(1, Ordering::AcqRel) + 1;
+        CURSOR_SHAPES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(shape);
+        handle as *mut c_void
+    }
+
+    unsafe fn destroy_cursor(cursor: *mut c_void) {
+        DESTROYED_CURSORS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(cursor as usize);
+        if CURSOR_DESTROY_PANIC_ONCE.swap(false, Ordering::AcqRel) {
+            panic!("controlled cursor destroy panic");
+        }
+    }
+
+    unsafe fn set_cursor(_: *mut c_void, _: *mut c_void) {}
+
+    unsafe fn set_cursor_mode(_: *mut c_void, mode: c_int) {
+        CURSOR_MODES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(mode);
+    }
+
     unsafe fn bind_context(window: *mut c_void) {
         CURRENT_CONTEXT.set(window as usize);
     }
@@ -3032,6 +3509,17 @@ mod tests {
             get_current_context,
             swap_buffers,
             get_proc_address,
+        )
+    }
+
+    fn test_desktop_api() -> DesktopApi {
+        DesktopApi::new(
+            get_clipboard,
+            set_clipboard,
+            create_cursor,
+            destroy_cursor,
+            set_cursor,
+            set_cursor_mode,
         )
     }
 
@@ -3468,6 +3956,7 @@ mod tests {
             renderer_state: Arc::new(RendererState::new(
                 std::ptr::dangling_mut::<c_void>(),
                 test_gl_api(),
+                test_desktop_api(),
                 test_wake(),
                 false,
             )),
@@ -3593,6 +4082,218 @@ mod tests {
     }
 
     #[test]
+    fn desktop_close_cancels_foreign_read_before_view_release_hook() {
+        let _guard = GLOBAL_HEALTH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = Arc::new(RendererState::new(
+            std::ptr::dangling_mut::<c_void>(),
+            test_gl_api(),
+            test_desktop_api(),
+            test_wake(),
+            false,
+        ));
+        let renderer = create_registered_test_renderer(&state);
+        let renderer_address = renderer.as_ptr() as usize;
+        let (first_tx, first_rx) = mpsc::sync_channel(0);
+        let (continue_tx, continue_rx) = mpsc::sync_channel(0);
+        let foreign = thread::spawn(move || {
+            let first = unsafe {
+                get_clipboard_data_callback(renderer_address as *mut LynxWindowlessRenderer)
+            };
+            first_tx
+                .send(unsafe { CStr::from_ptr(first) }.to_bytes().to_vec())
+                .unwrap();
+            continue_rx.recv().unwrap();
+            (unsafe {
+                get_clipboard_data_callback(renderer_address as *mut LynxWindowlessRenderer)
+            }) as usize
+        });
+        while state
+            .desktop_operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .operations
+            .is_empty()
+        {
+            thread::yield_now();
+        }
+
+        state.run_desktop_operations();
+        assert_eq!(first_rx.recv().unwrap(), b"test clipboard");
+        continue_tx.send(()).unwrap();
+        while state
+            .desktop_operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .operations
+            .is_empty()
+        {
+            thread::yield_now();
+        }
+        let release_hook_ran = AtomicBool::new(false);
+        state.close_desktop_operations_before(|| {
+            assert_eq!(
+                state
+                    .desktop_operations
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .callbacks_in_flight,
+                0,
+                "the view release hook ran before desktop callbacks quiesced"
+            );
+            release_hook_ran.store(true, Ordering::Release);
+        });
+        assert!(release_hook_ran.load(Ordering::Acquire));
+        let cancelled = foreign.join().unwrap() as *const c_char;
+        assert!(unsafe { CStr::from_ptr(cancelled) }.to_bytes().is_empty());
+        assert!(!state.callback_failed.load(Ordering::Acquire));
+        assert!(state
+            .desktop_operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .operations
+            .is_empty());
+        let late = unsafe { get_clipboard_data_callback(renderer.as_ptr()) };
+        assert!(unsafe { CStr::from_ptr(late) }.to_bytes().is_empty());
+        assert!(state
+            .desktop_operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .operations
+            .is_empty());
+        release_registered_test_renderer(renderer, &state);
+        let mut runtime = RuntimeCore {
+            view: None,
+            view_client: None,
+            fetcher: None,
+            renderer: None,
+            renderer_state: Arc::clone(&state),
+            view_state: test_view_state(),
+            ui_runner: global_ui_runner(),
+            ui_activation: None,
+            _thread_bound: PhantomData,
+        };
+        assert!(runtime.ensure_healthy().is_ok());
+        assert!(runtime.shutdown().is_ok());
+    }
+
+    #[test]
+    fn clipboard_read_panic_returns_static_empty_and_latches_health() {
+        let _guard = GLOBAL_HEALTH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = Arc::new(RendererState::new(
+            std::ptr::dangling_mut::<c_void>(),
+            test_gl_api(),
+            test_desktop_api(),
+            test_wake(),
+            false,
+        ));
+        CLIPBOARD_GET_PANIC.store(true, Ordering::Release);
+
+        let value = state.clipboard_data();
+
+        assert!(unsafe { CStr::from_ptr(value) }.to_bytes().is_empty());
+        assert!(state.callback_failed.load(Ordering::Acquire));
+        let runtime = RuntimeCore {
+            view: None,
+            view_client: None,
+            fetcher: None,
+            renderer: None,
+            renderer_state: Arc::clone(&state),
+            view_state: test_view_state(),
+            ui_runner: global_ui_runner(),
+            ui_activation: None,
+            _thread_bound: PhantomData,
+        };
+        assert!(runtime.ensure_healthy().is_err());
+    }
+
+    #[test]
+    fn clipboard_bytes_and_cursor_fallback_match_the_cpp_host() {
+        let _guard = GLOBAL_HEALTH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        CLIPBOARD_SET_VALUE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        CURSOR_SHAPES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        CURSOR_MODES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        DESTROYED_CURSORS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        CURSOR_CREATE_COUNT.store(0, Ordering::Release);
+        CURSOR_DESTROY_PANIC_ONCE.store(false, Ordering::Release);
+        let state = Arc::new(RendererState::new(
+            std::ptr::dangling_mut::<c_void>(),
+            test_gl_api(),
+            test_desktop_api(),
+            test_wake(),
+            false,
+        ));
+        let renderer = create_registered_test_renderer(&state);
+
+        unsafe { set_clipboard_data_callback(renderer.as_ptr(), std::ptr::null()) };
+        assert!(CLIPBOARD_SET_VALUE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty());
+        let invalid_utf8 = CString::new(vec![0xff]).unwrap();
+        unsafe { set_clipboard_data_callback(renderer.as_ptr(), invalid_utf8.as_ptr()) };
+        assert_eq!(
+            *CLIPBOARD_SET_VALUE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            vec![0xff]
+        );
+        state.activate_cursor(lynx_sys::LYNX_CURSOR_TYPE_NONE);
+        state.activate_cursor(lynx_sys::LYNX_CURSOR_TYPE_CLICK);
+        state.activate_cursor(lynx_sys::LYNX_CURSOR_TYPE_CLICK);
+        state.activate_cursor(lynx_sys::LYNX_CURSOR_TYPE_TEXT);
+        state.activate_cursor(lynx_sys::LYNX_CURSOR_TYPE_ZOOM_IN);
+
+        assert_eq!(
+            *CURSOR_MODES
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            vec![1, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            *CURSOR_SHAPES
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            vec![1, 2, 0]
+        );
+        assert_eq!(CURSOR_CREATE_COUNT.load(Ordering::Acquire), 3);
+        release_registered_test_renderer(renderer, &state);
+        CURSOR_DESTROY_PANIC_ONCE.store(true, Ordering::Release);
+        state.destroy_cursors();
+        let mut destroyed = DESTROYED_CURSORS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        destroyed.sort_unstable();
+        assert_eq!(destroyed, vec![1, 2, 3]);
+        assert!(state.callback_failed.load(Ordering::Acquire));
+        state.destroy_cursors();
+        let mut destroyed = DESTROYED_CURSORS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        destroyed.sort_unstable();
+        assert_eq!(destroyed, vec![1, 2, 3]);
+    }
+
+    #[test]
     fn first_successful_render_thread_remains_the_gl_owner() {
         MAKE_CURRENT_COUNT.store(0, Ordering::Release);
         SWAP_COUNT.store(0, Ordering::Release);
@@ -3600,6 +4301,7 @@ mod tests {
         let state = Arc::new(RendererState::new(
             std::ptr::dangling_mut::<c_void>(),
             test_gl_api(),
+            test_desktop_api(),
             test_wake(),
             false,
         ));
@@ -3639,6 +4341,7 @@ mod tests {
         let state = Arc::new(RendererState::new(
             std::ptr::dangling_mut::<c_void>(),
             gl,
+            test_desktop_api(),
             test_wake(),
             false,
         ));
@@ -3670,7 +4373,13 @@ mod tests {
             swap_buffers,
             get_proc_address,
         );
-        let state = Arc::new(RendererState::new(window, gl, test_wake(), false));
+        let state = Arc::new(RendererState::new(
+            window,
+            gl,
+            test_desktop_api(),
+            test_wake(),
+            false,
+        ));
         let renderer = create_registered_test_renderer(&state);
 
         assert!(!unsafe { gl_make_current_callback(renderer.as_ptr()) });
@@ -3697,7 +4406,13 @@ mod tests {
             swap_buffers,
             get_proc_address,
         );
-        let state = Arc::new(RendererState::new(window, gl, test_wake(), false));
+        let state = Arc::new(RendererState::new(
+            window,
+            gl,
+            test_desktop_api(),
+            test_wake(),
+            false,
+        ));
         let renderer = create_registered_test_renderer(&state);
 
         assert!(!unsafe { gl_make_current_callback(renderer.as_ptr()) });
@@ -3734,7 +4449,13 @@ mod tests {
             swap_buffers,
             get_proc_address,
         );
-        let state = Arc::new(RendererState::new(window, gl, test_wake(), false));
+        let state = Arc::new(RendererState::new(
+            window,
+            gl,
+            test_desktop_api(),
+            test_wake(),
+            false,
+        ));
         assert!(state.make_current());
         let renderer = create_registered_test_renderer(&state);
 
@@ -3756,6 +4477,7 @@ mod tests {
         let state = Arc::new(RendererState::new(
             std::ptr::dangling_mut::<c_void>(),
             test_gl_api(),
+            test_desktop_api(),
             wake,
             false,
         ));

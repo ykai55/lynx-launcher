@@ -149,6 +149,12 @@ pub type LynxGlProcResolverCallback =
     Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer, *const c_char) -> *mut c_void>;
 pub type LynxRendererPostTaskCallback =
     Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer, LynxTask, u64)>;
+pub type LynxGetClipboardDataCallback =
+    Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer) -> *const c_char>;
+pub type LynxSetClipboardDataCallback =
+    Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer, *const c_char)>;
+pub type LynxActivateSystemCursorCallback =
+    Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer, c_int, *const c_char)>;
 pub type LynxShowTextInputCallback =
     Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer, bool)>;
 pub type LynxResourceFetcherFinalizer =
@@ -173,6 +179,46 @@ pub type NapiAsyncCompleteCallback = Option<unsafe extern "C" fn(NapiEnv, c_int,
 pub const LYNX_LOG_INFO: c_int = 2;
 pub const LYNX_RENDERER_TYPE_GL_DIRECT: c_int = 2;
 pub const LYNX_RESOURCE_TYPE_LYNX_CORE_JS: c_int = 7;
+pub const LYNX_CURSOR_TYPE_UNKNOWN: c_int = 1;
+pub const LYNX_CURSOR_TYPE_NET: c_int = 2;
+pub const LYNX_CURSOR_TYPE_FILE: c_int = 3;
+pub const LYNX_CURSOR_TYPE_AUTO: c_int = 4;
+pub const LYNX_CURSOR_TYPE_NONE: c_int = 5;
+pub const LYNX_CURSOR_TYPE_BASIC: c_int = 6;
+pub const LYNX_CURSOR_TYPE_CLICK: c_int = 7;
+pub const LYNX_CURSOR_TYPE_FORBIDDEN: c_int = 8;
+pub const LYNX_CURSOR_TYPE_WAIT: c_int = 9;
+pub const LYNX_CURSOR_TYPE_PROGRESS: c_int = 10;
+pub const LYNX_CURSOR_TYPE_CONTEXT_MENU: c_int = 11;
+pub const LYNX_CURSOR_TYPE_HELP: c_int = 12;
+pub const LYNX_CURSOR_TYPE_TEXT: c_int = 13;
+pub const LYNX_CURSOR_TYPE_VERTICAL_TEXT: c_int = 14;
+pub const LYNX_CURSOR_TYPE_CELL: c_int = 15;
+pub const LYNX_CURSOR_TYPE_PRECISE: c_int = 16;
+pub const LYNX_CURSOR_TYPE_MOVE: c_int = 17;
+pub const LYNX_CURSOR_TYPE_GRAB: c_int = 18;
+pub const LYNX_CURSOR_TYPE_GRABBING: c_int = 19;
+pub const LYNX_CURSOR_TYPE_NO_DROP: c_int = 20;
+pub const LYNX_CURSOR_TYPE_ALIAS: c_int = 21;
+pub const LYNX_CURSOR_TYPE_SYSTEM_MOUSE_CURSOR: c_int = 22;
+pub const LYNX_CURSOR_TYPE_DISAPPEARING: c_int = 23;
+pub const LYNX_CURSOR_TYPE_ALL_SCROLL: c_int = 24;
+pub const LYNX_CURSOR_TYPE_RESIZE_LEFT_RIGHT: c_int = 25;
+pub const LYNX_CURSOR_TYPE_RESIZE_UP_DOWN: c_int = 26;
+pub const LYNX_CURSOR_TYPE_RESIZE_UP_LEFT_DOWN_RIGHT: c_int = 27;
+pub const LYNX_CURSOR_TYPE_RESIZE_UP_RIGHT_DOWN_LEFT: c_int = 28;
+pub const LYNX_CURSOR_TYPE_RESIZE_UP: c_int = 29;
+pub const LYNX_CURSOR_TYPE_RESIZE_DOWN: c_int = 30;
+pub const LYNX_CURSOR_TYPE_RESIZE_LEFT: c_int = 31;
+pub const LYNX_CURSOR_TYPE_RESIZE_RIGHT: c_int = 32;
+pub const LYNX_CURSOR_TYPE_RESIZE_UP_LEFT: c_int = 33;
+pub const LYNX_CURSOR_TYPE_RESIZE_UP_RIGHT: c_int = 34;
+pub const LYNX_CURSOR_TYPE_RESIZE_DOWN_LEFT: c_int = 35;
+pub const LYNX_CURSOR_TYPE_RESIZE_DOWN_RIGHT: c_int = 36;
+pub const LYNX_CURSOR_TYPE_RESIZE_COLUMN: c_int = 37;
+pub const LYNX_CURSOR_TYPE_RESIZE_ROW: c_int = 38;
+pub const LYNX_CURSOR_TYPE_ZOOM_IN: c_int = 39;
+pub const LYNX_CURSOR_TYPE_ZOOM_OUT: c_int = 40;
 pub const LYNX_POINTER_PHASE_CANCEL: c_int = 0;
 pub const LYNX_POINTER_PHASE_UP: c_int = 1;
 pub const LYNX_POINTER_PHASE_DOWN: c_int = 2;
@@ -250,6 +296,18 @@ unsafe extern "C" {
     pub fn lynx_windowless_renderer_send_key_event(
         renderer: *mut LynxWindowlessRenderer,
         event: *mut LynxKeyEvent,
+    );
+    pub fn lynx_windowless_renderer_bind_get_clipboard_data(
+        renderer: *mut LynxWindowlessRenderer,
+        callback: LynxGetClipboardDataCallback,
+    );
+    pub fn lynx_windowless_renderer_bind_set_clipboard_data(
+        renderer: *mut LynxWindowlessRenderer,
+        callback: LynxSetClipboardDataCallback,
+    );
+    pub fn lynx_windowless_renderer_bind_activate_system_cursor(
+        renderer: *mut LynxWindowlessRenderer,
+        callback: LynxActivateSystemCursorCallback,
     );
     pub fn lynx_windowless_renderer_bind_show_text_input(
         renderer: *mut LynxWindowlessRenderer,

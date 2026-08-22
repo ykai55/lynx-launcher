@@ -11,6 +11,11 @@ pub struct GlfwMonitor {
 }
 
 #[repr(C)]
+pub struct GlfwCursor {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
 pub struct Display {
     _private: [u8; 0],
 }
@@ -49,6 +54,15 @@ pub const GLFW_VISIBLE: c_int = 0x0002_0004;
 pub const GLFW_DECORATED: c_int = 0x0002_0005;
 pub const GLFW_FLOATING: c_int = 0x0002_0007;
 pub const GLFW_FOCUS_ON_SHOW: c_int = 0x0002_000c;
+pub const GLFW_CURSOR: c_int = 0x0003_3001;
+pub const GLFW_CURSOR_NORMAL: c_int = 0x0003_4001;
+pub const GLFW_CURSOR_HIDDEN: c_int = 0x0003_4002;
+pub const GLFW_ARROW_CURSOR: c_int = 0x0003_6001;
+pub const GLFW_IBEAM_CURSOR: c_int = 0x0003_6002;
+pub const GLFW_CROSSHAIR_CURSOR: c_int = 0x0003_6003;
+pub const GLFW_HAND_CURSOR: c_int = 0x0003_6004;
+pub const GLFW_HRESIZE_CURSOR: c_int = 0x0003_6005;
+pub const GLFW_VRESIZE_CURSOR: c_int = 0x0003_6006;
 pub const GLFW_CONTEXT_VERSION_MAJOR: c_int = 0x0002_2002;
 pub const GLFW_CONTEXT_VERSION_MINOR: c_int = 0x0002_2003;
 pub const GLFW_OPENGL_FORWARD_COMPAT: c_int = 0x0002_2006;
@@ -120,6 +134,18 @@ unsafe extern "C" {
     pub fn glfw_show_window(window: *mut GlfwWindow);
     #[link_name = "glfwFocusWindow"]
     pub fn glfw_focus_window(window: *mut GlfwWindow);
+    #[link_name = "glfwGetClipboardString"]
+    pub fn glfw_get_clipboard_string(window: *mut GlfwWindow) -> *const c_char;
+    #[link_name = "glfwSetClipboardString"]
+    pub fn glfw_set_clipboard_string(window: *mut GlfwWindow, value: *const c_char);
+    #[link_name = "glfwCreateStandardCursor"]
+    pub fn glfw_create_standard_cursor(shape: c_int) -> *mut GlfwCursor;
+    #[link_name = "glfwDestroyCursor"]
+    pub fn glfw_destroy_cursor(cursor: *mut GlfwCursor);
+    #[link_name = "glfwSetCursor"]
+    pub fn glfw_set_cursor(window: *mut GlfwWindow, cursor: *mut GlfwCursor);
+    #[link_name = "glfwSetInputMode"]
+    pub fn glfw_set_input_mode(window: *mut GlfwWindow, mode: c_int, value: c_int);
     #[link_name = "glfwSetCursorPosCallback"]
     pub fn glfw_set_cursor_position_callback(
         window: *mut GlfwWindow,
