@@ -10,6 +10,7 @@ require_command mktemp
 require_command readlink
 require_command setsid
 require_command timeout
+require_visible_capture_commands
 
 click_driver="${host_build_dir}/x11_click_test_driver"
 [[ -x "${rust_host_binary}" ]] ||
@@ -21,11 +22,12 @@ iterations="${LYNX_LAUNCHER_RUST_SHELL_ITERATIONS:-1}"
 [[ "${iterations}" =~ ^[1-9][0-9]*$ ]] ||
   die "LYNX_LAUNCHER_RUST_SHELL_ITERATIONS must be a positive integer"
 
-log_root="${repo_root}/.logs/ticket-03/rust-shell-smoke"
+log_root="${repo_root}/.logs/ticket-05/rust-input-smoke"
 mkdir -p -- "${log_root}"
 run_directory="$(mktemp -d "${log_root}/run.XXXXXX")"
 fixture_root="${run_directory}/fixture"
 data_home="${fixture_root}/data"
+target_helper="${fixture_root}/launch-target.sh"
 mkdir -p -- \
   "${data_home}/applications" \
   "${data_home}/icons/hicolor/64x64/apps" \
@@ -33,34 +35,35 @@ mkdir -p -- \
 printf '%s\n' \
   '[Desktop Entry]' \
   'Type=Application' \
-  'Name=Alpha Resolved' \
-  'Icon=lynx-rust-resolved' \
+  'Name=Alpha Decoy' \
   'Exec=/bin/true' \
   >"${data_home}/applications/00-resolved.desktop"
 printf '%s\n' \
   '[Desktop Entry]' \
   'Type=Application' \
-  'Name=Bravo Missing' \
+  'Name=Bravo Decoy' \
   'Icon=lynx-rust-missing' \
   'Exec=/bin/true' \
   >"${data_home}/applications/10-missing.desktop"
 printf '%s\n' \
   '[Desktop Entry]' \
   'Type=Application' \
-  'Name=Charlie Third' \
-  'Exec=/bin/true' \
+  'Name=Cobalt Target Fixture' \
+  'Icon=lynx-rust-target' \
+  "Exec=${target_helper}" \
   >"${data_home}/applications/20-third.desktop"
 printf '%s\n' \
   '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">' \
   '  <rect width="64" height="64" fill="#00ff00"/>' \
   '</svg>' \
-  >"${data_home}/icons/hicolor/64x64/apps/lynx-rust-resolved.svg"
+  >"${data_home}/icons/hicolor/64x64/apps/lynx-rust-target.svg"
 fixture_environment=(
   "XDG_DATA_HOME=${data_home}"
   "XDG_DATA_DIRS=${fixture_root}/empty-data"
   'XDG_CURRENT_DESKTOP=LYNX_RUST_E2E'
   'LC_ALL=C'
   'LYNX_LAUNCHER_E2E_SNAPSHOT_TRACE=1'
+  'LYNX_LAUNCHER_E2E_SYSTEM_SCALE=1.25'
 )
 host_pid=""
 host_identity=""
@@ -164,9 +167,9 @@ assert_clean_host_log() {
 assert_snapshot_trace() {
   local path="$1" label="$2" count
   local -a expected=(
-    '[host-rs] snapshot index=0 id=00-resolved.desktop name=Alpha Resolved icon=present'
-    '[host-rs] snapshot index=1 id=10-missing.desktop name=Bravo Missing icon=missing'
-    '[host-rs] snapshot index=2 id=20-third.desktop name=Charlie Third icon=missing'
+    '[host-rs] snapshot index=0 id=00-resolved.desktop name=Alpha Decoy icon=missing'
+    '[host-rs] snapshot index=1 id=10-missing.desktop name=Bravo Decoy icon=missing'
+    '[host-rs] snapshot index=2 id=20-third.desktop name=Cobalt Target Fixture icon=present'
   )
   count="$(grep -Fc -- '[host-rs] snapshot index=' "${path}" || true)"
   if [[ "${count}" != 3 ]]; then
@@ -188,6 +191,8 @@ assert_success_log() {
     '[host-rs] first shell GL frame presented' \
     '[host-rs] first screen layout completed' \
     '[host-rs] first GL frame presented' \
+    '[host-rs] view entered foreground' \
+    '[host-rs] metrics logical=1120x760 dpr=1.25 framebuffer-scale=1x1' \
     '[host-rs] Launcher.getApplications resolved 3 applications' \
     '[host-rs] runtime core initialized' \
     '[host-rs] runtime core shutdown complete'; do
@@ -199,7 +204,50 @@ assert_success_log() {
   assert_snapshot_trace "${path}" "${label}"
 }
 
+assert_input_trace() {
+  local path="$1" label="$2" key_down_count key_up_count
+  key_down_count="$(grep -Ec -- \
+    '\[host-rs\] key dispatch type=down physical=[1-9][0-9]* logical=[0-9]+ synthesized=false' \
+    "${path}" || true)"
+  key_up_count="$(grep -Ec -- \
+    '\[host-rs\] key dispatch type=up physical=[1-9][0-9]* logical=[0-9]+ synthesized=false' \
+    "${path}" || true)"
+  if ((key_down_count < 6 || key_up_count < 6)); then
+    dump_log "${path}"
+    die "${label} did not dispatch real key down/up events for the query"
+  fi
+  for marker in \
+    '[host-rs] key dispatch type=repeat physical=458977 logical=8589934850 synthesized=false' \
+    '[host-rs] pointer dispatch phase=hover signal=scroll x=250 y=380 scroll-logical-y=-100 scroll-physical-y=-125 buttons=0' \
+    '[host-rs] key dispatch type=up physical=458977 logical=8589934850 synthesized=true' \
+    '[host-rs] pointer dispatch phase=cancel signal=none x=275 y=200 scroll-logical-y=0 scroll-physical-y=0 buttons=1' \
+    '[host-rs] pointer dispatch phase=remove signal=none x=275 y=200 scroll-logical-y=0 scroll-physical-y=0 buttons=0' \
+    '[host-rs] view entered background'; do
+    if ! grep -Fq -- "${marker}" "${path}"; then
+      dump_log "${path}"
+      die "${label} did not emit ${marker}"
+    fi
+  done
+
+  local background_seen=false line
+  while IFS= read -r line; do
+    if [[ "${line}" == *'[host-rs] view entered background'* ]]; then
+      background_seen=true
+      continue
+    fi
+    if [[ "${background_seen}" == true &&
+      ("${line}" == *'[host-rs] pointer dispatch '* ||
+        "${line}" == *'[host-rs] key dispatch '* ||
+        "${line}" == *'[host-rs] character '*) ]]; then
+      dump_log "${path}"
+      die "${label} dispatched input after entering background: ${line}"
+    fi
+  done <"${path}"
+}
+
 for ((iteration = 1; iteration <= iterations; iteration += 1)); do
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'exit 0' >"${target_helper}"
+  chmod +x -- "${target_helper}"
   first_frame_log="${run_directory}/first-frame-${iteration}.log"
   if ! timeout --foreground 10s env "${fixture_environment[@]}" \
     "${rust_host_binary}" --exit-after-first-frame \
@@ -226,20 +274,50 @@ for ((iteration = 1; iteration <= iterations; iteration += 1)); do
     ! wait_for_log '[host-rs] first screen layout completed' ||
     ! wait_for_log '[host-rs] first GL frame presented' ||
     ! wait_for_log '[host-rs] Launcher.getApplications resolved 3 applications' ||
-    ! wait_for_log '[host-rs] snapshot index=2 id=20-third.desktop name=Charlie Third icon=missing'; then
+    ! wait_for_log '[host-rs] snapshot index=2 id=20-third.desktop name=Cobalt Target Fixture icon=present'; then
     dump_log "${host_log}"
     die "Rust shell iteration ${iteration} did not render the real launcher"
   fi
+  rm -f -- "${target_helper}"
 
   "${click_driver}" --pid "${host_pid}" expect-popup
   "${click_driver}" --pid "${host_pid}" expect-pixel \
+    --x 0 --y 220 --width 1120 --height 300 \
+    --red 0 --green 255 --blue 0 --tolerance 8 \
+    --minimum-matches 512 --timeout-ms 3000 --scale 1.25
+  "${click_driver}" --pid "${host_pid}" click --x 220 --y 160 --scale 1.25
+  sleep 0.2
+  "${click_driver}" --pid "${host_pid}" click --x 220 --y 160 --scale 1.25
+  sleep 0.1
+  "${click_driver}" --pid "${host_pid}" type --text cobalt
+  "${click_driver}" --pid "${host_pid}" click --x 220 --y 160 --scale 1.25
+  "${click_driver}" --pid "${host_pid}" expect-pixel \
     --x 40 --y 265 --width 76 --height 76 \
     --red 0 --green 255 --blue 0 --tolerance 8 \
-    --minimum-matches 512 --timeout-ms 3000
+    --minimum-matches 512 --timeout-ms 3000 --scale 1.25
+  "${click_driver}" --pid "${host_pid}" expect-no-pixel \
+    --x 360 --y 270 --width 700 --height 100 \
+    --red 241 --green 234 --blue 217 --tolerance 20 \
+    --maximum-matches 20 --timeout-ms 3000 --scale 1.25
+  "${click_driver}" --pid "${host_pid}" click --x 200 --y 305 --scale 1.25
+  if ! wait_for_log \
+    '[host-rs] Launcher.launchApplication Promise rejected: No such file or directory (os error 2)'; then
+    dump_log "${host_log}"
+    die "Rust shell iteration ${iteration} did not reject the real target spawn failure"
+  fi
   "${click_driver}" --pid "${host_pid}" expect-pixel \
-    --x 550 --y 250 --width 100 --height 120 \
-    --red 232 --green 189 --blue 108 --tolerance 8 \
-    --minimum-matches 800 --timeout-ms 3000
+    --x 45 --y 205 --width 1030 --height 75 \
+    --red 255 --green 107 --blue 61 --tolerance 12 \
+    --minimum-matches 10 --timeout-ms 3000 --scale 1.25
+  "${click_driver}" --pid "${host_pid}" expect-pixel \
+    --x 40 --y 345 --width 90 --height 75 \
+    --red 0 --green 255 --blue 0 --tolerance 8 \
+    --minimum-matches 128 --timeout-ms 3000 --scale 1.25
+  "${click_driver}" --pid "${host_pid}" scroll \
+    --x 200 --y 304 --direction up --scale 1.25
+  "${click_driver}" --pid "${host_pid}" repeat-key --key left-shift
+  "${click_driver}" --pid "${host_pid}" hold-input \
+    --key left-shift --x 220 --y 160 --scale 1.25
   "${click_driver}" --pid "${host_pid}" defocus
 
   if ! wait_for_host_exit; then
@@ -247,6 +325,7 @@ for ((iteration = 1; iteration <= iterations; iteration += 1)); do
     die "Rust shell iteration ${iteration} did not exit cleanly after focus loss"
   fi
   assert_success_log "${host_log}" "Rust bounded iteration ${iteration}"
+  assert_input_trace "${host_log}" "Rust bounded iteration ${iteration}"
   grep -Fq -- '[host-rs] window lost focus; exiting' "${host_log}" || {
     dump_log "${host_log}"
     die "Rust shell iteration ${iteration} did not handle focus loss"
@@ -254,6 +333,46 @@ for ((iteration = 1; iteration <= iterations; iteration += 1)); do
   printf 'Rust first-frame and bounded iteration %s/%s passed.\n' \
     "${iteration}" "${iterations}"
 done
+
+host_log="${run_directory}/startup-focus-loss.log"
+setsid env "${fixture_environment[@]}" \
+  LYNX_LAUNCHER_E2E_STARTUP_FOCUS_WAIT=1 \
+  "${rust_host_binary}" --run-for 12 >"${host_log}" 2>&1 &
+host_pid=$!
+host_identity="$(capture_host_identity)" ||
+  die "could not capture the Rust startup-focus process identity"
+startup_focus_sent=false
+startup_focus_deadline=$((SECONDS + 3))
+while ((SECONDS < startup_focus_deadline)); do
+  if "${click_driver}" --pid "${host_pid}" defocus \
+    >"${run_directory}/startup-focus-driver.log" 2>&1; then
+    startup_focus_sent=true
+    break
+  fi
+  [[ "$(process_identity "${host_pid}" 2>/dev/null || true)" == "${host_identity}" ]] || break
+  sleep 0.01
+done
+if [[ "${startup_focus_sent}" != true ]]; then
+  dump_log "${host_log}"
+  die "could not inject focus loss during the Rust startup event pump"
+fi
+if ! wait_for_host_exit; then
+  dump_log "${host_log}"
+  die "Rust startup-focus process did not exit cleanly"
+fi
+assert_clean_host_log "${host_log}" "Rust startup-focus process"
+for marker in \
+  '[host-rs] startup window lost focus; closing' \
+  '[host-rs] runtime core initialized' \
+  '[host-rs] view entered foreground' \
+  '[host-rs] view entered background' \
+  '[host-rs] runtime core shutdown complete'; do
+  if ! grep -Fq -- "${marker}" "${host_log}"; then
+    dump_log "${host_log}"
+    die "Rust startup-focus process did not emit ${marker}"
+  fi
+done
+printf 'Rust startup focus-loss smoke passed.\n'
 
 host_log="${run_directory}/native-rejection.log"
 setsid env "${fixture_environment[@]}" \
@@ -273,7 +392,7 @@ fi
 "${click_driver}" --pid "${host_pid}" expect-pixel \
   --x 510 --y 300 --width 100 --height 120 \
   --red 255 --green 107 --blue 61 --tolerance 8 \
-  --minimum-matches 800 --timeout-ms 3000
+  --minimum-matches 800 --timeout-ms 3000 --scale 1.25
 "${click_driver}" --pid "${host_pid}" defocus
 if ! wait_for_host_exit; then
   dump_log "${host_log}"

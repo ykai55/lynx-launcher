@@ -29,11 +29,58 @@ static_assert(offsetof(lynx_windowless_ui_task_runner_config_t,
 static_assert(offsetof(lynx_windowless_ui_task_runner_config_t,
                        post_task_callback) == 24);
 
+static_assert(sizeof(lynx_pointer_event_t) == 120);
+static_assert(alignof(lynx_pointer_event_t) == 8);
+static_assert(offsetof(lynx_pointer_event_t, struct_size) == 0);
+static_assert(offsetof(lynx_pointer_event_t, phase) == 8);
+static_assert(offsetof(lynx_pointer_event_t, timestamp) == 16);
+static_assert(offsetof(lynx_pointer_event_t, x) == 24);
+static_assert(offsetof(lynx_pointer_event_t, y) == 32);
+static_assert(offsetof(lynx_pointer_event_t, device) == 40);
+static_assert(offsetof(lynx_pointer_event_t, signal_kind) == 44);
+static_assert(offsetof(lynx_pointer_event_t, scroll_delta_x) == 48);
+static_assert(offsetof(lynx_pointer_event_t, scroll_delta_y) == 56);
+static_assert(offsetof(lynx_pointer_event_t, device_kind) == 64);
+static_assert(offsetof(lynx_pointer_event_t, buttons) == 72);
+static_assert(offsetof(lynx_pointer_event_t, pan_x) == 80);
+static_assert(offsetof(lynx_pointer_event_t, pan_y) == 88);
+static_assert(offsetof(lynx_pointer_event_t, scale) == 96);
+static_assert(offsetof(lynx_pointer_event_t, rotation) == 104);
+static_assert(offsetof(lynx_pointer_event_t, is_precise_scroll) == 112);
+
+static_assert(sizeof(lynx_key_event_t) == 56);
+static_assert(alignof(lynx_key_event_t) == 8);
+static_assert(offsetof(lynx_key_event_t, struct_size) == 0);
+static_assert(offsetof(lynx_key_event_t, timestamp) == 8);
+static_assert(offsetof(lynx_key_event_t, type) == 16);
+static_assert(offsetof(lynx_key_event_t, physical) == 24);
+static_assert(offsetof(lynx_key_event_t, logical) == 32);
+static_assert(offsetof(lynx_key_event_t, character) == 40);
+static_assert(offsetof(lynx_key_event_t, synthesized) == 48);
+
 static_assert(sizeof(lynx_log_level_e) == sizeof(int));
 static_assert(sizeof(lynx_windowless_renderer_type_e) == sizeof(int));
 static_assert(LYNX_LOG_INFO == 2);
 static_assert(kRendererTypeGLDirect == 2);
 static_assert(kLynxResourceTypeLynxCoreJS == 7);
+static_assert(kLynxPointerPhaseCancel == 0);
+static_assert(kLynxPointerPhaseUp == 1);
+static_assert(kLynxPointerPhaseDown == 2);
+static_assert(kLynxPointerPhaseMove == 3);
+static_assert(kLynxPointerPhaseAdd == 4);
+static_assert(kLynxPointerPhaseRemove == 5);
+static_assert(kLynxPointerPhaseHover == 6);
+static_assert(kLynxPointerSignalKindNone == 0);
+static_assert(kLynxPointerSignalKindScroll == 1);
+static_assert(kLynxPointerDeviceKindMouse == 1);
+static_assert(kLynxPointerMouseButtonsMousePrimary == 1);
+static_assert(kLynxPointerMouseButtonsMouseSecondary == 2);
+static_assert(kLynxPointerMouseButtonsMouseMiddle == 4);
+static_assert(kLynxPointerMouseButtonsMouseBack == 8);
+static_assert(kLynxPointerMouseButtonsMouseForward == 16);
+static_assert(kLynxKeyEventTypeUp == 1);
+static_assert(kLynxKeyEventTypeDown == 2);
+static_assert(kLynxKeyEventTypeRepeat == 3);
 
 static_assert(std::is_same_v<lynx_log_callback_t,
                              void (*)(lynx_log_level_e, const char*,
@@ -101,7 +148,18 @@ static_assert(std::is_same_v<decltype(&lynx_windowless_renderer_run_task),
                              void (*)(lynx_windowless_renderer_t*,
                                       lynx_task_t)>);
 static_assert(std::is_same_v<decltype(&lynx_windowless_renderer_release),
-                             void (*)(lynx_windowless_renderer_t*)>);
+                              void (*)(lynx_windowless_renderer_t*)>);
+static_assert(std::is_same_v<
+              decltype(&lynx_windowless_renderer_send_pointer_event),
+              void (*)(lynx_windowless_renderer_t*, lynx_pointer_event_t*)>);
+static_assert(std::is_same_v<
+              decltype(&lynx_windowless_renderer_send_key_event),
+              void (*)(lynx_windowless_renderer_t*, lynx_key_event_t*)>);
+static_assert(std::is_same_v<show_text_input,
+                             void (*)(lynx_windowless_renderer_t*, bool)>);
+static_assert(std::is_same_v<
+              decltype(&lynx_windowless_renderer_bind_show_text_input),
+              void (*)(lynx_windowless_renderer_t*, show_text_input)>);
 
 static_assert(std::is_same_v<
               decltype(&lynx_generic_resource_fetcher_create_with_finalizer),
@@ -198,7 +256,11 @@ static_assert(std::is_same_v<decltype(&lynx_load_meta_release),
 
 static_assert(std::is_same_v<decltype(&napi_get_undefined_weak),
                              napi_status_weak (*)(napi_env_weak,
-                                                  napi_value_weak*)>);
+                                                   napi_value_weak*)>);
+static_assert(std::is_same_v<decltype(&napi_get_value_string_utf8_weak),
+                             napi_status_weak (*)(napi_env_weak,
+                                                  napi_value_weak, char*, size_t,
+                                                  size_t*)>);
 static_assert(std::is_same_v<decltype(&napi_create_promise_weak),
                              napi_status_weak (*)(napi_env_weak,
                                                   napi_deferred_weak*,
@@ -211,6 +273,19 @@ static_assert(std::is_same_v<decltype(&napi_reject_deferred_weak),
                              napi_status_weak (*)(napi_env_weak,
                                                   napi_deferred_weak,
                                                   napi_value_weak)>);
+static_assert(std::is_same_v<
+              decltype(&napi_create_async_work_weak),
+              napi_status_weak (*)(napi_env_weak, napi_value_weak,
+                                   napi_value_weak,
+                                   napi_async_execute_callback_weak,
+                                   napi_async_complete_callback_weak, void*,
+                                   napi_async_work_weak*)>);
+static_assert(std::is_same_v<decltype(&napi_delete_async_work_weak),
+                             napi_status_weak (*)(napi_env_weak,
+                                                  napi_async_work_weak)>);
+static_assert(std::is_same_v<decltype(&napi_queue_async_work_weak),
+                             napi_status_weak (*)(node_api_basic_env_weak,
+                                                  napi_async_work_weak)>);
 
 static_assert(std::is_same_v<decltype(&lynx_sys_view_builder_set_screen_size),
                              void (*)(lynx_view_builder_t*, float, float,
@@ -246,6 +321,11 @@ auto volatile kBindProcResolver =
     &lynx_windowless_renderer_bind_on_gl_proc_resolver;
 auto volatile kBindPostTask = &lynx_windowless_renderer_bind_on_post_task;
 auto volatile kRunRendererTask = &lynx_windowless_renderer_run_task;
+auto volatile kSendPointerEvent =
+    &lynx_windowless_renderer_send_pointer_event;
+auto volatile kSendKeyEvent = &lynx_windowless_renderer_send_key_event;
+auto volatile kBindShowTextInput =
+    &lynx_windowless_renderer_bind_show_text_input;
 auto volatile kReleaseRenderer = &lynx_windowless_renderer_release;
 auto volatile kCreateFetcher =
     &lynx_generic_resource_fetcher_create_with_finalizer;
@@ -291,6 +371,7 @@ auto volatile kNapiGetUndefined = &napi_get_undefined_weak;
 auto volatile kNapiCreateObject = &napi_create_object_weak;
 auto volatile kNapiCreateArray = &napi_create_array_with_length_weak;
 auto volatile kNapiCreateString = &napi_create_string_utf8_weak;
+auto volatile kNapiGetString = &napi_get_value_string_utf8_weak;
 auto volatile kNapiCreateFunction = &napi_create_function_weak;
 auto volatile kNapiCreateError = &napi_create_error_weak;
 auto volatile kNapiSetNamedProperty = &napi_set_named_property_weak;
@@ -300,6 +381,9 @@ auto volatile kNapiThrowError = &napi_throw_error_weak;
 auto volatile kNapiCreatePromise = &napi_create_promise_weak;
 auto volatile kNapiResolveDeferred = &napi_resolve_deferred_weak;
 auto volatile kNapiRejectDeferred = &napi_reject_deferred_weak;
+auto volatile kNapiCreateAsyncWork = &napi_create_async_work_weak;
+auto volatile kNapiDeleteAsyncWork = &napi_delete_async_work_weak;
+auto volatile kNapiQueueAsyncWork = &napi_queue_async_work_weak;
 auto volatile kSetScreenSize = &lynx_sys_view_builder_set_screen_size;
 auto volatile kSetBuilderFrame = &lynx_sys_view_builder_set_frame;
 auto volatile kSetFontScale = &lynx_sys_view_builder_set_font_scale;

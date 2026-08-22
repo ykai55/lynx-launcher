@@ -4,10 +4,17 @@ use std::mem::{align_of, offset_of, size_of};
 use lynx_sys::{
     LynxDataDestructor, LynxFetchResourceCallback, LynxGlClearCurrentCallback,
     LynxGlCreateFboCallback, LynxGlMakeCurrentCallback, LynxGlPresentCallback,
-    LynxGlProcResolverCallback, LynxLogCallback, LynxRendererFinalizer,
-    LynxRendererPostTaskCallback, LynxResourceFetcherFinalizer, LynxTask, LynxUiPostTaskCallback,
-    LynxUiRunsOnCurrentThreadCallback, LynxUiTaskRunnerConfig, LynxViewClientCallback,
-    LynxViewClientErrorCallback, NapiCallback, NapiModuleCreator, LYNX_LOG_INFO,
+    LynxGlProcResolverCallback, LynxKeyEvent, LynxLogCallback, LynxPointerEvent,
+    LynxRendererFinalizer, LynxRendererPostTaskCallback, LynxResourceFetcherFinalizer,
+    LynxShowTextInputCallback, LynxTask, LynxUiPostTaskCallback, LynxUiRunsOnCurrentThreadCallback,
+    LynxUiTaskRunnerConfig, LynxViewClientCallback, LynxViewClientErrorCallback,
+    NapiAsyncCompleteCallback, NapiAsyncExecuteCallback, NapiCallback, NapiModuleCreator,
+    LYNX_KEY_EVENT_TYPE_DOWN, LYNX_KEY_EVENT_TYPE_REPEAT, LYNX_KEY_EVENT_TYPE_UP, LYNX_LOG_INFO,
+    LYNX_POINTER_BUTTON_BACK, LYNX_POINTER_BUTTON_FORWARD, LYNX_POINTER_BUTTON_MIDDLE,
+    LYNX_POINTER_BUTTON_PRIMARY, LYNX_POINTER_BUTTON_SECONDARY, LYNX_POINTER_DEVICE_KIND_MOUSE,
+    LYNX_POINTER_PHASE_ADD, LYNX_POINTER_PHASE_CANCEL, LYNX_POINTER_PHASE_DOWN,
+    LYNX_POINTER_PHASE_HOVER, LYNX_POINTER_PHASE_MOVE, LYNX_POINTER_PHASE_REMOVE,
+    LYNX_POINTER_PHASE_UP, LYNX_POINTER_SIGNAL_KIND_NONE, LYNX_POINTER_SIGNAL_KIND_SCROLL,
     LYNX_RENDERER_TYPE_GL_DIRECT, LYNX_RESOURCE_TYPE_LYNX_CORE_JS, NAPI_AUTO_LENGTH, NAPI_OK,
 };
 
@@ -33,6 +40,38 @@ fn ui_runner_config_layout_matches_the_verified_sdk() {
 }
 
 #[test]
+fn input_event_layouts_match_the_verified_sdk() {
+    assert_eq!(size_of::<LynxPointerEvent>(), 120);
+    assert_eq!(align_of::<LynxPointerEvent>(), 8);
+    assert_eq!(offset_of!(LynxPointerEvent, struct_size), 0);
+    assert_eq!(offset_of!(LynxPointerEvent, phase), 8);
+    assert_eq!(offset_of!(LynxPointerEvent, timestamp), 16);
+    assert_eq!(offset_of!(LynxPointerEvent, x), 24);
+    assert_eq!(offset_of!(LynxPointerEvent, y), 32);
+    assert_eq!(offset_of!(LynxPointerEvent, device), 40);
+    assert_eq!(offset_of!(LynxPointerEvent, signal_kind), 44);
+    assert_eq!(offset_of!(LynxPointerEvent, scroll_delta_x), 48);
+    assert_eq!(offset_of!(LynxPointerEvent, scroll_delta_y), 56);
+    assert_eq!(offset_of!(LynxPointerEvent, device_kind), 64);
+    assert_eq!(offset_of!(LynxPointerEvent, buttons), 72);
+    assert_eq!(offset_of!(LynxPointerEvent, pan_x), 80);
+    assert_eq!(offset_of!(LynxPointerEvent, pan_y), 88);
+    assert_eq!(offset_of!(LynxPointerEvent, scale), 96);
+    assert_eq!(offset_of!(LynxPointerEvent, rotation), 104);
+    assert_eq!(offset_of!(LynxPointerEvent, is_precise_scroll), 112);
+
+    assert_eq!(size_of::<LynxKeyEvent>(), 56);
+    assert_eq!(align_of::<LynxKeyEvent>(), 8);
+    assert_eq!(offset_of!(LynxKeyEvent, struct_size), 0);
+    assert_eq!(offset_of!(LynxKeyEvent, timestamp), 8);
+    assert_eq!(offset_of!(LynxKeyEvent, event_type), 16);
+    assert_eq!(offset_of!(LynxKeyEvent, physical), 24);
+    assert_eq!(offset_of!(LynxKeyEvent, logical), 32);
+    assert_eq!(offset_of!(LynxKeyEvent, character), 40);
+    assert_eq!(offset_of!(LynxKeyEvent, synthesized), 48);
+}
+
+#[test]
 fn callbacks_and_constants_match_the_verified_sdk() {
     let _: LynxLogCallback = None::<unsafe extern "C" fn(c_int, *const c_char, *const c_char)>;
     let _: LynxUiRunsOnCurrentThreadCallback = None::<unsafe extern "C" fn(*mut c_void) -> bool>;
@@ -52,6 +91,8 @@ fn callbacks_and_constants_match_the_verified_sdk() {
     >;
     let _: LynxRendererPostTaskCallback =
         None::<unsafe extern "C" fn(*mut lynx_sys::LynxWindowlessRenderer, LynxTask, u64)>;
+    let _: LynxShowTextInputCallback =
+        None::<unsafe extern "C" fn(*mut lynx_sys::LynxWindowlessRenderer, bool)>;
     let _: LynxResourceFetcherFinalizer =
         None::<unsafe extern "C" fn(*mut lynx_sys::LynxGenericResourceFetcher, *mut c_void)>;
     let _: LynxFetchResourceCallback = None::<
@@ -76,6 +117,9 @@ fn callbacks_and_constants_match_the_verified_sdk() {
             *mut c_void,
         ) -> lynx_sys::NapiValue,
     >;
+    let _: NapiAsyncExecuteCallback = None::<unsafe extern "C" fn(lynx_sys::NapiEnv, *mut c_void)>;
+    let _: NapiAsyncCompleteCallback =
+        None::<unsafe extern "C" fn(lynx_sys::NapiEnv, c_int, *mut c_void)>;
 
     for callback_size in [
         size_of::<LynxLogCallback>(),
@@ -88,6 +132,7 @@ fn callbacks_and_constants_match_the_verified_sdk() {
         size_of::<LynxGlCreateFboCallback>(),
         size_of::<LynxGlProcResolverCallback>(),
         size_of::<LynxRendererPostTaskCallback>(),
+        size_of::<LynxShowTextInputCallback>(),
         size_of::<LynxResourceFetcherFinalizer>(),
         size_of::<LynxFetchResourceCallback>(),
         size_of::<LynxDataDestructor>(),
@@ -95,6 +140,8 @@ fn callbacks_and_constants_match_the_verified_sdk() {
         size_of::<LynxViewClientErrorCallback>(),
         size_of::<NapiCallback>(),
         size_of::<NapiModuleCreator>(),
+        size_of::<NapiAsyncExecuteCallback>(),
+        size_of::<NapiAsyncCompleteCallback>(),
     ] {
         assert_eq!(callback_size, size_of::<*mut c_void>());
     }
@@ -102,6 +149,24 @@ fn callbacks_and_constants_match_the_verified_sdk() {
     assert_eq!(LYNX_LOG_INFO, 2);
     assert_eq!(LYNX_RENDERER_TYPE_GL_DIRECT, 2);
     assert_eq!(LYNX_RESOURCE_TYPE_LYNX_CORE_JS, 7);
+    assert_eq!(LYNX_POINTER_PHASE_CANCEL, 0);
+    assert_eq!(LYNX_POINTER_PHASE_UP, 1);
+    assert_eq!(LYNX_POINTER_PHASE_DOWN, 2);
+    assert_eq!(LYNX_POINTER_PHASE_MOVE, 3);
+    assert_eq!(LYNX_POINTER_PHASE_ADD, 4);
+    assert_eq!(LYNX_POINTER_PHASE_REMOVE, 5);
+    assert_eq!(LYNX_POINTER_PHASE_HOVER, 6);
+    assert_eq!(LYNX_POINTER_SIGNAL_KIND_NONE, 0);
+    assert_eq!(LYNX_POINTER_SIGNAL_KIND_SCROLL, 1);
+    assert_eq!(LYNX_POINTER_DEVICE_KIND_MOUSE, 1);
+    assert_eq!(LYNX_POINTER_BUTTON_PRIMARY, 1);
+    assert_eq!(LYNX_POINTER_BUTTON_SECONDARY, 2);
+    assert_eq!(LYNX_POINTER_BUTTON_MIDDLE, 4);
+    assert_eq!(LYNX_POINTER_BUTTON_BACK, 8);
+    assert_eq!(LYNX_POINTER_BUTTON_FORWARD, 16);
+    assert_eq!(LYNX_KEY_EVENT_TYPE_UP, 1);
+    assert_eq!(LYNX_KEY_EVENT_TYPE_DOWN, 2);
+    assert_eq!(LYNX_KEY_EVENT_TYPE_REPEAT, 3);
     assert_eq!(NAPI_OK, 0);
     assert_eq!(NAPI_AUTO_LENGTH, usize::MAX);
 }
@@ -136,6 +201,12 @@ fn runtime_function_declarations_match_the_reviewed_signatures() {
         lynx_windowless_renderer_bind_on_post_task;
     let _: unsafe extern "C" fn(*mut LynxWindowlessRenderer, LynxTask) =
         lynx_windowless_renderer_run_task;
+    let _: unsafe extern "C" fn(*mut LynxWindowlessRenderer, *mut LynxPointerEvent) =
+        lynx_windowless_renderer_send_pointer_event;
+    let _: unsafe extern "C" fn(*mut LynxWindowlessRenderer, *mut LynxKeyEvent) =
+        lynx_windowless_renderer_send_key_event;
+    let _: unsafe extern "C" fn(*mut LynxWindowlessRenderer, LynxShowTextInputCallback) =
+        lynx_windowless_renderer_bind_show_text_input;
     let _: unsafe extern "C" fn(*mut LynxWindowlessRenderer) = lynx_windowless_renderer_release;
 
     let _: unsafe extern "C" fn(
@@ -215,6 +286,8 @@ fn runtime_function_declarations_match_the_reviewed_signatures() {
         napi_create_array_with_length_weak;
     let _: unsafe extern "C" fn(NapiEnv, *const c_char, usize, *mut NapiValue) -> c_int =
         napi_create_string_utf8_weak;
+    let _: unsafe extern "C" fn(NapiEnv, NapiValue, *mut c_char, usize, *mut usize) -> c_int =
+        napi_get_value_string_utf8_weak;
     let _: unsafe extern "C" fn(
         NapiEnv,
         *const c_char,
@@ -245,6 +318,17 @@ fn runtime_function_declarations_match_the_reviewed_signatures() {
         napi_resolve_deferred_weak;
     let _: unsafe extern "C" fn(NapiEnv, NapiDeferred, NapiValue) -> c_int =
         napi_reject_deferred_weak;
+    let _: unsafe extern "C" fn(
+        NapiEnv,
+        NapiValue,
+        NapiValue,
+        NapiAsyncExecuteCallback,
+        NapiAsyncCompleteCallback,
+        *mut c_void,
+        *mut NapiAsyncWork,
+    ) -> c_int = napi_create_async_work_weak;
+    let _: unsafe extern "C" fn(NapiEnv, NapiAsyncWork) -> c_int = napi_delete_async_work_weak;
+    let _: unsafe extern "C" fn(NapiEnv, NapiAsyncWork) -> c_int = napi_queue_async_work_weak;
 }
 
 #[cfg(lynx_sys_cmake_link)]
@@ -276,6 +360,9 @@ fn declarations_link_against_the_shim_and_verified_sdk() {
         lynx_windowless_renderer_bind_on_gl_proc_resolver as *const (),
         lynx_windowless_renderer_bind_on_post_task as *const (),
         lynx_windowless_renderer_run_task as *const (),
+        lynx_windowless_renderer_send_pointer_event as *const (),
+        lynx_windowless_renderer_send_key_event as *const (),
+        lynx_windowless_renderer_bind_show_text_input as *const (),
         lynx_windowless_renderer_release as *const (),
         lynx_generic_resource_fetcher_create_with_finalizer as *const (),
         lynx_generic_resource_fetcher_get_user_data as *const (),
@@ -316,6 +403,7 @@ fn declarations_link_against_the_shim_and_verified_sdk() {
         napi_create_object_weak as *const (),
         napi_create_array_with_length_weak as *const (),
         napi_create_string_utf8_weak as *const (),
+        napi_get_value_string_utf8_weak as *const (),
         napi_create_function_weak as *const (),
         napi_create_error_weak as *const (),
         napi_set_named_property_weak as *const (),
@@ -325,6 +413,9 @@ fn declarations_link_against_the_shim_and_verified_sdk() {
         napi_create_promise_weak as *const (),
         napi_resolve_deferred_weak as *const (),
         napi_reject_deferred_weak as *const (),
+        napi_create_async_work_weak as *const (),
+        napi_delete_async_work_weak as *const (),
+        napi_queue_async_work_weak as *const (),
         lynx_sys_view_builder_set_screen_size as *const (),
         lynx_sys_view_builder_set_frame as *const (),
         lynx_sys_view_builder_set_font_scale as *const (),

@@ -17,6 +17,6 @@ export async function getApplications(): Promise<Application[]> {
   return validateApplications(applications)
 }
 
-export async function launchApplication(id: string): Promise<void> {
-  await launcherModule().launchApplication(id)
+export function launchApplication(id: string): Promise<void> {
+  return launcherModule().launchApplication(id)
 }

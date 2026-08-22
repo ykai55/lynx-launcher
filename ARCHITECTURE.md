@@ -30,8 +30,9 @@ frame, focus exit, bounded event loop, process-global UI runner, deadline queues
 GLDirect renderer, restricted core-resource fetcher, builder, view, client, and
 load metadata with deterministic teardown. It loads the staged ReactLynx bundle
 and exposes a Promise-based application snapshot through the SDK's verified weak
-N-API symbols. Input and application launch parity remain later migration stages;
-the C++ binary remains the default host.
+N-API symbols. Pointer, wheel, keyboard, character, focus, metric, and async
+application-launch parity are implemented. The C++ binary remains the default
+host.
 
 ## Layers
 
@@ -63,7 +64,7 @@ executable rather than the caller's current directory. Core JS is copied both to
 for the engine preloader's default lookup.
 
 `host-rs/src/support.rs` preserves those pure path, file, URI, XSettings, scroll,
-UTF-8, and window-metric semantics as the first migration tracer. `lynx-sys/`
+UTF-8, key-mapping, input-bookkeeping, and window-metric semantics. `lynx-sys/`
 contains the reviewed runtime, renderer, view/resource, and weak N-API ABI,
 strict by-value view wrappers, and dynamic-loader path probe. The Rust runtime
 tracer configures the process-global UI runner once, executes absolute UI
@@ -74,14 +75,37 @@ through renderer release. View, client, native-module, and fetcher userdata shar
 an `Arc`-owned state that outlives SDK callbacks, while the fetcher owns one
 explicit reference consumed by its finalizer.
 
+The binary-private Rust window module keeps `RuntimeCore`, metrics, and input in
+a stable boxed userdata object. GLFW callbacks recover only a shared reference;
+short `RefCell` borrows serialize platform-thread mutation rather than creating a
+long-lived arbitrary `&mut`. Every callback contains panics, atomically latches
+failure, wakes the loop, and requests close. Input follows the C++ USB HID and
+logical-key mappings, tracks down/repeat/up, synthesizes missing key-up and
+pointer cancel/remove events, and gates UTF-8 character events on Lynx text-input
+activation. Focus loss and normal shutdown first close a one-way input-acceptance
+gate, then cancel active state. Later GLFW cursor, pointer, key, character, and
+synthetic release callbacks return before borrowing state or dispatching, so no
+input can follow the view's background transition.
+
+Before runtime userdata exists, a separate panic-contained focus callback is
+installed ahead of show/focus and the initial GLFW event pump. It latches any
+FocusOut and requests close. Formal callback registration replaces it only after
+the stable window state exists, then reconciles the latched close flag with
+GLFW's current focus attribute so an early loss backgrounds and shuts down the
+new view instead of being forgotten.
+
 The Rust fetcher returns only the staged core bytes for the Lynx-core resource
 type and rejects every other request. Bundle file URIs percent-encode raw Linux
 path bytes, and the ICU C path is constructed directly from `OsStr` bytes rather
-than a lossy UTF-8 conversion. The view prefetches an ordered application and
-icon snapshot through the Rust platform API. `Launcher.getApplications()`
-resolves that snapshot as a real Promise or rejects with its native discovery
-error; `launchApplication()` is registered but deliberately rejects until the
-launch parity stage.
+than a lossy UTF-8 conversion. The view owns one Rust `Launcher` and prefetches
+its ordered application and icon snapshot. `Launcher.getApplications()` resolves
+that snapshot as a real Promise or rejects with its native discovery error.
+`launchApplication()` validates one UTF-8 ID, returns its Promise immediately,
+and queues weak N-API async work. Execute calls the same launcher's direct Rust
+interface on a worker; completion resolves with `undefined` or rejects with the
+native detail on the JS thread. The queued allocation retains an `Arc<ViewState>`
+but never accesses its window wake from execute or completion, and completion
+deletes the async-work handle before releasing the allocation.
 
 Shutdown backgrounds and releases the view and client while queues still accept
 release work, then stops and drains renderer and UI work before releasing the
@@ -93,8 +117,8 @@ finished, so another host cannot activate or reset health early. If native
 callbacks cannot be proven quiescent, the lease remains draining and the window
 path forgets the runtime, window, and GLFW owners before delegating cleanup to
 process exit. All Rust callbacks contain panics. The binary-private window
-module supplies raw GLFW, X11, and OpenGL operations; input remains exclusively
-in the C++ host for now.
+module supplies raw GLFW, X11, and OpenGL operations and translates GLFW input
+into the reviewed Lynx pointer/key ABI.
 
 ### ReactLynx UI
 
@@ -125,13 +149,19 @@ ABI. This alternate path is not yet the default host.
 ### Launch
 
 1. The UI calls `Launcher.launchApplication(id)` and awaits the returned promise.
-2. C++ converts the JavaScript string to a length-delimited UTF-8 `LynxSlice`.
-3. Rust finds the previously discovered application and builds a process command
-   without invoking a shell.
-4. Rust starts a named reaper thread, reports whether `spawn` succeeded, and
-   waits for the child off the UI thread.
-5. C++ resolves or rejects the N-API promise; the UI clears its pending state or
-   displays the error.
+2. The active host validates one JavaScript string as a length-delimited UTF-8 ID.
+3. The C++ host crosses the platform C ABI; the Rust host queues N-API async work
+   whose execute callback calls the retained Rust `Launcher` directly.
+4. Rust finds the previously discovered application, builds a process command
+   without a shell, and starts a named reaper thread. Launch returns after the
+   reaper reports the `spawn` result; only the reaper waits for child exit.
+5. The C++ callback or Rust async completion resolves with `undefined` or rejects
+   with native detail; the UI clears pending state or displays the error.
+
+The test-only `LYNX_LAUNCHER_E2E_LAUNCH_WORK_DELAY_MS` gate is disabled by
+default, strictly accepts 0 through 5000 milliseconds, and delays only the Rust
+worker before it calls `Launcher::launch`. It exists solely to make pending-work
+shutdown ownership deterministic in E2E tests.
 
 ## Threads and ownership
 
@@ -142,11 +172,17 @@ ABI. This alternate path is not yet the default host.
 - Renderer work uses a separate synchronized queue. The first render thread to
   acquire the OpenGL context becomes its stable owner; callbacks reject access
   from another render thread. Context ownership is also tracked per thread.
-- Shutdown cancels input, backgrounds/releases the view and client while their
-  renderer/UI queues still accept release work, then stops and drains those
-  queues before releasing renderer and fetcher. The Rust path waits for fetcher
-  finalization before ending its UI draining generation; unsafe timeout paths do
-  not run ordinary cursor/window/GLFW destruction.
+- Shutdown cancels input, closes Rust launch-work registration, and waits with a
+  fixed bound for every registered async launch to settle and successfully
+  delete its N-API work handle. Only then does it background/release the view and
+  client while renderer/UI queues still accept release work, drain those queues,
+  and release renderer and fetcher. Launch-work timeout, async-work deletion
+  failure, and fetcher/renderer quiescence failure preserve the live runtime and
+  delegate native cleanup to process exit rather than freeing callback userdata.
+- Focus loss stops accepting input, cancels active keys and pointers, backgrounds
+  the Rust view, and closes the popup. The terminal gate ignores later synthetic
+  GLFW releases and focus gains. Normal shutdown also closes the gate before
+  cancellation and view background/release.
 - Rust `LynxLauncher`, list, icon, and error values are opaque heap handles.
   Every successful allocation has one matching destroy call. Slices borrowed
   from a handle are valid only until that handle is destroyed.
@@ -170,6 +206,11 @@ the host. On a Wayland desktop this runs through XWayland and therefore requires
 `DISPLAY`. Enabling native Wayland is more than a build switch: clipboard, text
 input/IME, cursor, scale, and context behavior must be validated before the host
 can claim that backend.
+
+Graphical pixel gates are observation-only. The X11 driver first attempts root
+readback; under niri/XWayland it validates compositor geometry and uses bounded
+direct `niri`/`grim` capture. Capture polling never sends Expose or wake events,
+and every capture subprocess shares the caller's assertion deadline.
 
 The Rust shell links the same CMake `glfw` static target directly rather than a
 system or crate-provided GLFW. Its `[host-rs] first shell GL frame presented`

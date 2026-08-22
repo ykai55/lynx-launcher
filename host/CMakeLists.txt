@@ -256,6 +256,10 @@ if(BUILD_TESTING)
   )
 
   add_test(NAME host_support_test COMMAND host_support_test)
+  add_test(NAME x11_server_clock_wrap_test
+           COMMAND x11_click_test_driver --self-test-server-clock)
+  add_test(NAME x11_visible_pixels_test
+           COMMAND x11_click_test_driver --self-test-visible-pixels)
   add_test(NAME lynx_sys_abi_test COMMAND lynx_sys_abi_test)
   add_test(NAME lynx_sys_rust_abi_test
     COMMAND "${CMAKE_COMMAND}" -E env

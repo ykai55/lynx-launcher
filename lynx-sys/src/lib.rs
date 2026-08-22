@@ -74,16 +74,55 @@ pub struct NapiDeferredWeak {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+pub struct NapiAsyncWorkWeak {
+    _private: [u8; 0],
+}
+
 pub type NapiEnv = *mut NapiEnvWeak;
 pub type NapiValue = *mut NapiValueWeak;
 pub type NapiCallbackInfo = *mut NapiCallbackInfoWeak;
 pub type NapiDeferred = *mut NapiDeferredWeak;
+pub type NapiAsyncWork = *mut NapiAsyncWorkWeak;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct LynxTask {
     pub runner: *mut LynxTaskRunner,
     pub task: u64,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct LynxPointerEvent {
+    pub struct_size: usize,
+    pub phase: c_int,
+    pub timestamp: usize,
+    pub x: f64,
+    pub y: f64,
+    pub device: i32,
+    pub signal_kind: c_int,
+    pub scroll_delta_x: f64,
+    pub scroll_delta_y: f64,
+    pub device_kind: c_int,
+    pub buttons: i64,
+    pub pan_x: f64,
+    pub pan_y: f64,
+    pub scale: f64,
+    pub rotation: f64,
+    pub is_precise_scroll: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct LynxKeyEvent {
+    pub struct_size: usize,
+    pub timestamp: f64,
+    pub event_type: c_int,
+    pub physical: u64,
+    pub logical: u64,
+    pub character: *const c_char,
+    pub synthesized: bool,
 }
 
 pub type LynxUiRunsOnCurrentThreadCallback = Option<unsafe extern "C" fn(*mut c_void) -> bool>;
@@ -110,6 +149,8 @@ pub type LynxGlProcResolverCallback =
     Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer, *const c_char) -> *mut c_void>;
 pub type LynxRendererPostTaskCallback =
     Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer, LynxTask, u64)>;
+pub type LynxShowTextInputCallback =
+    Option<unsafe extern "C" fn(*mut LynxWindowlessRenderer, bool)>;
 pub type LynxResourceFetcherFinalizer =
     Option<unsafe extern "C" fn(*mut LynxGenericResourceFetcher, *mut c_void)>;
 pub type LynxFetchResourceCallback = Option<
@@ -126,10 +167,30 @@ pub type LynxViewClientErrorCallback =
 pub type NapiCallback = Option<unsafe extern "C" fn(NapiEnv, NapiCallbackInfo) -> NapiValue>;
 pub type NapiModuleCreator =
     Option<unsafe extern "C" fn(NapiEnv, NapiValue, *const c_char, *mut c_void) -> NapiValue>;
+pub type NapiAsyncExecuteCallback = Option<unsafe extern "C" fn(NapiEnv, *mut c_void)>;
+pub type NapiAsyncCompleteCallback = Option<unsafe extern "C" fn(NapiEnv, c_int, *mut c_void)>;
 
 pub const LYNX_LOG_INFO: c_int = 2;
 pub const LYNX_RENDERER_TYPE_GL_DIRECT: c_int = 2;
 pub const LYNX_RESOURCE_TYPE_LYNX_CORE_JS: c_int = 7;
+pub const LYNX_POINTER_PHASE_CANCEL: c_int = 0;
+pub const LYNX_POINTER_PHASE_UP: c_int = 1;
+pub const LYNX_POINTER_PHASE_DOWN: c_int = 2;
+pub const LYNX_POINTER_PHASE_MOVE: c_int = 3;
+pub const LYNX_POINTER_PHASE_ADD: c_int = 4;
+pub const LYNX_POINTER_PHASE_REMOVE: c_int = 5;
+pub const LYNX_POINTER_PHASE_HOVER: c_int = 6;
+pub const LYNX_POINTER_SIGNAL_KIND_NONE: c_int = 0;
+pub const LYNX_POINTER_SIGNAL_KIND_SCROLL: c_int = 1;
+pub const LYNX_POINTER_DEVICE_KIND_MOUSE: c_int = 1;
+pub const LYNX_POINTER_BUTTON_PRIMARY: i64 = 1 << 0;
+pub const LYNX_POINTER_BUTTON_SECONDARY: i64 = 1 << 1;
+pub const LYNX_POINTER_BUTTON_MIDDLE: i64 = 1 << 2;
+pub const LYNX_POINTER_BUTTON_BACK: i64 = 1 << 3;
+pub const LYNX_POINTER_BUTTON_FORWARD: i64 = 1 << 4;
+pub const LYNX_KEY_EVENT_TYPE_UP: c_int = 1;
+pub const LYNX_KEY_EVENT_TYPE_DOWN: c_int = 2;
+pub const LYNX_KEY_EVENT_TYPE_REPEAT: c_int = 3;
 pub const NAPI_OK: c_int = 0;
 pub const NAPI_AUTO_LENGTH: usize = usize::MAX;
 
@@ -182,6 +243,18 @@ unsafe extern "C" {
         callback: LynxRendererPostTaskCallback,
     );
     pub fn lynx_windowless_renderer_run_task(renderer: *mut LynxWindowlessRenderer, task: LynxTask);
+    pub fn lynx_windowless_renderer_send_pointer_event(
+        renderer: *mut LynxWindowlessRenderer,
+        event: *mut LynxPointerEvent,
+    );
+    pub fn lynx_windowless_renderer_send_key_event(
+        renderer: *mut LynxWindowlessRenderer,
+        event: *mut LynxKeyEvent,
+    );
+    pub fn lynx_windowless_renderer_bind_show_text_input(
+        renderer: *mut LynxWindowlessRenderer,
+        callback: LynxShowTextInputCallback,
+    );
     pub fn lynx_windowless_renderer_release(renderer: *mut LynxWindowlessRenderer);
 
     pub fn lynx_generic_resource_fetcher_create_with_finalizer(
@@ -283,6 +356,13 @@ unsafe extern "C" {
         length: usize,
         result: *mut NapiValue,
     ) -> c_int;
+    pub fn napi_get_value_string_utf8_weak(
+        env: NapiEnv,
+        value: NapiValue,
+        buffer: *mut c_char,
+        buffer_size: usize,
+        result: *mut usize,
+    ) -> c_int;
     pub fn napi_create_function_weak(
         env: NapiEnv,
         name: *const c_char,
@@ -337,6 +417,17 @@ unsafe extern "C" {
         deferred: NapiDeferred,
         rejection: NapiValue,
     ) -> c_int;
+    pub fn napi_create_async_work_weak(
+        env: NapiEnv,
+        async_resource: NapiValue,
+        async_resource_name: NapiValue,
+        execute: NapiAsyncExecuteCallback,
+        complete: NapiAsyncCompleteCallback,
+        data: *mut c_void,
+        result: *mut NapiAsyncWork,
+    ) -> c_int;
+    pub fn napi_delete_async_work_weak(env: NapiEnv, work: NapiAsyncWork) -> c_int;
+    pub fn napi_queue_async_work_weak(env: NapiEnv, work: NapiAsyncWork) -> c_int;
 
     pub fn lynx_sys_view_builder_set_screen_size(
         builder: *mut LynxViewBuilder,

@@ -62,8 +62,8 @@ UI 不依赖浏览器 DOM；C++ host 拥有 embedder、图形、输入和任务�
 
 迁移中的 `host-rs` 是 side-by-side Lynx view tracer：它验证 Rust CLI、support logic、
 platform direct interface、staged `liblynx.so` linkage、pinned GLFW/X11/OpenGL 窗口，
-并加载 packaged core 与 bundle 渲染真实 launcher 首帧。它尚未迁移完整输入和应用启动，
-也不替代上图中的 C++ host。
+加载 packaged core 与 bundle 渲染真实 launcher，并已迁移 pointer、wheel、keyboard、character、
+focus、scale handling 和直接 Rust application launch。它仍不替代上图中的默认 C++ host。
 
 ## 目录
 
@@ -71,7 +71,7 @@ platform direct interface、staged `liblynx.so` linkage、pinned GLFW/X11/OpenGL
 | --- | --- |
 | `platform/` | Rust 应用发现、启动、图标解析、稳定 C ABI 及测试。 |
 | `lynx-sys/` | 最小 Lynx raw binding 与 native library path probe。 |
-| `host-rs/` | Rust host 迁移 tracer；当前支持 resource/link check、popup GL shell 和真实 Lynx view 首帧。 |
+| `host-rs/` | Rust host 迁移 tracer；当前支持 resource/link check、popup GL shell、真实 Lynx view、input，以及 async application launch。 |
 | `ui/` | ReactLynx/TypeScript UI，Rspeedy 输出 bundle。 |
 | `host/` | C++20 embedder、GLFW/OpenGL、N-API bridge、CMake 与 native tests。 |
 | `scripts/` | 首选的 bootstrap、构建、测试、运行和图形测试入口。 |
@@ -111,7 +111,9 @@ Rspeedy/Corepack 行为随本机版本漂移。
   运行时需要 `libfontconfig.so.1` 和至少一款覆盖所需字符的已安装字体。
 - Rustup；它读取 `rust-toolchain.toml` 并提供 rustfmt、Clippy 和 Cargo。
 - 支持 `.nvmrc` 的 Node version manager 和 Corepack；本地 Node 可能需要先启用 Corepack。
-- 图形运行和图形测试需要 X11 或 XWayland session，并设置 `DISPLAY`。
+- 图形运行和图形测试需要 X11 或 XWayland session，并设置 `DISPLAY`。native X11
+  root capture 不要求额外截图工具；niri/XWayland 的可见像素门禁要求 `niri` 与 `grim`
+  都在 `PATH`，脚本会在启动 driver 前明确检查。
 
 ## 构建与运行
 
@@ -172,8 +174,9 @@ window mode 使用 CMake 构建的 pinned GLFW static archive，先提交独立�
 再由 Rust-owned fetcher、builder、view、client 和 weak N-API `Launcher` module 加载 staged
 core 与 bundle。`[host-rs] first shell GL frame presented` 仍不代表 Lynx readiness；只有
 `[host-rs] first screen layout completed` 与 `[host-rs] first GL frame presented` 同时出现后，
-`--exit-after-first-frame` 才会退出。当前 `getApplications()` 返回 platform direct snapshot，
-`launchApplication()` 明确 reject，默认图形入口仍是 `scripts/run.sh`。
+`--exit-after-first-frame` 才会退出。`getApplications()` 返回同一 Rust `Launcher` 的 platform
+direct snapshot；`launchApplication()` 立即返回真实 Promise，在 N-API worker 调用该 launcher，
+再由 JS-thread completion resolve/reject。默认图形入口仍是 `scripts/run.sh`。
 
 ## 测试
 
@@ -197,13 +200,20 @@ LYNX_LAUNCHER_SMOKE=1 LYNX_LAUNCHER_SMOKE_TIMEOUT=45s ./scripts/test.sh
 ```
 
 进程必须在 timeout 前同时报告 first-screen layout 和首个 GL present。
-该入口还会运行 Rust tracer 的 popup、真实 launcher 像素、application Promise、focus-loss
+该入口还会运行 Rust tracer 的 popup、真实 launcher 输入、application Promise、focus-loss
 退出和双条件首帧自动退出检查；静态 shell marker 继续单独断言，不能冒充 readiness。
-Rust smoke 使用隔离 XDG fixture，精确核对 3 个 application snapshot 的 ID、名称、顺序、
-resolved icon 与 fallback 像素，并通过同一 native module seam 注入一次测试专用 discovery
-错误，验证 Promise reject 和现有 UI error state。重复次数同时应用于 first-frame 与 bounded
-模式，每轮都要求 clean shutdown；日志保存在 `.logs/ticket-03/rust-shell-smoke/`。也可单独
-执行并增加重复次数：
+Rust smoke 使用隔离 XDG fixture 和可观察的 1.25 system scale，精确核对 3 个 application
+snapshot 的 ID、名称与顺序；通过共享 X11 driver 聚焦搜索框、输入 `cobalt`、确认只有目标
+绿色 icon 和过滤后像素、点击目标，并在 discovery 后删除 fixture executable，确认真实 spawn
+failure 的 rejected Promise 与 native detail 驱动现有 `ActionError`。输入检查使用 X server 的
+32-bit modular signed-delta 时间顺序验证真实 key
+down/up（含 49.7 天 wrap 自测），再覆盖 scroll DPR 换算、key repeat，以及 focus loss 对 held
+modifier 和 primary pointer 的合成释放；background 后禁止任何后续 input dispatch。另有
+startup focus-loss 用例验证 runtime userdata 安装前的 FocusOut 不会丢失。同一 native module
+seam 还会注入一次测试专用 discovery 错误。重复次数同时应用于 first-frame 与 bounded input
+模式；每轮都执行完整过滤、launch rejection、`ActionError` 像素、真实键入、scroll/repeat、
+held-input cancellation 和 focus teardown，并要求 clean shutdown；日志保存在
+`.logs/ticket-05/rust-input-smoke/`。也可单独执行并增加重复次数：
 
 ```sh
 ./scripts/rust-shell-smoke.sh
@@ -215,13 +225,21 @@ LYNX_LAUNCHER_RUST_SHELL_ITERATIONS=10 ./scripts/rust-shell-smoke.sh
 ```sh
 ./scripts/e2e-launch.sh
 LYNX_LAUNCHER_E2E_ITERATIONS=10 ./scripts/e2e-launch.sh
+LYNX_LAUNCHER_E2E_HOST=rust ./scripts/e2e-launch.sh
+LYNX_LAUNCHER_E2E_HOST=rust LYNX_LAUNCHER_E2E_SCENARIO=unknown \
+  LYNX_LAUNCHER_E2E_ITERATIONS=10 ./scripts/e2e-launch.sh
 ```
 
-测试创建三个隔离的临时 `.desktop` fixture，不启动已安装应用。它先用 `XGetImage`
-比较两个不同中文 glyph 的渲染区域，拒绝重复缺字方框；再通过 GLFW X11 key callbacks
+测试创建三个隔离的临时 `.desktop` fixture，不启动已安装应用。它通过纯观察的 root 或
+compositor capture 比较两个不同中文 glyph 的渲染区域，拒绝重复缺字方框；再通过 GLFW X11 key callbacks
 输入 ASCII query，验证筛选目标的独特色 hicolor SVG 已到达最终 icon region，点击卡片并
-确认只有目标 desktop ID 的 marker 出现。cleanup 在 signal 前核对 executable、process
-group 和 Linux process start identity，并用 `wait` 回收 child。
+确认只有目标 desktop ID 的 marker 出现。默认仍验证 C++ host。Rust 模式的 `success`、
+`spawn-failure`、`unknown` 和 `immediate-defocus` 场景可独立选择；`all` 为默认。success helper
+写入 started 后至少运行 5 秒，测试要求 Promise resolved 时 exited 尚不存在，证明 Promise
+不等待 child。failure 与 unknown 分别验证真实 spawn detail 和 `ApplicationNotFound`，两者都
+必须显示 `ActionError`。`LYNX_LAUNCHER_E2E_SUCCESS_ITERATIONS`、
+`LYNX_LAUNCHER_E2E_SPAWN_FAILURE_ITERATIONS`、`LYNX_LAUNCHER_E2E_UNKNOWN_ITERATIONS` 和
+`LYNX_LAUNCHER_E2E_IMMEDIATE_DEFOCUS_ITERATIONS` 可在 `all` 模式分别覆盖重复次数。
 
 ### Teardown stress
 

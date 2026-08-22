@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -10,6 +11,152 @@ pub struct WindowMetrics {
     pub pixel_ratio: f32,
     pub framebuffer_scale_x: f32,
     pub framebuffer_scale_y: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PressedKey {
+    pub physical: u64,
+    pub logical: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointerDispatch {
+    pub phase: i32,
+    pub signal_kind: i32,
+    pub scroll_delta_x: f64,
+    pub scroll_delta_y: f64,
+    pub buttons: i64,
+}
+
+#[derive(Debug, Default)]
+pub struct InputState {
+    cursor_x: f64,
+    cursor_y: f64,
+    pointer_buttons: i64,
+    pointer_added: bool,
+    pointer_inside: bool,
+    pressed_keys: HashMap<i32, PressedKey>,
+}
+
+impl InputState {
+    pub fn cursor_position(&self) -> (f64, f64) {
+        (self.cursor_x, self.cursor_y)
+    }
+
+    pub fn move_cursor(&mut self, x: f64, y: f64) -> Vec<PointerDispatch> {
+        self.cursor_x = x;
+        self.cursor_y = y;
+        self.pointer_event(if self.pointer_buttons == 0 {
+            lynx_sys::LYNX_POINTER_PHASE_HOVER
+        } else {
+            lynx_sys::LYNX_POINTER_PHASE_MOVE
+        })
+    }
+
+    pub fn set_pointer_inside(&mut self, entered: bool) -> Vec<PointerDispatch> {
+        self.pointer_inside = entered;
+        if entered && !self.pointer_added {
+            self.pointer_event(lynx_sys::LYNX_POINTER_PHASE_ADD)
+        } else if !entered && self.pointer_added && self.pointer_buttons == 0 {
+            self.pointer_event(lynx_sys::LYNX_POINTER_PHASE_REMOVE)
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn press_button(&mut self, mask: i64) -> Vec<PointerDispatch> {
+        let previous = self.pointer_buttons;
+        self.pointer_buttons |= mask;
+        self.pointer_event(if previous == 0 {
+            lynx_sys::LYNX_POINTER_PHASE_DOWN
+        } else {
+            lynx_sys::LYNX_POINTER_PHASE_MOVE
+        })
+    }
+
+    pub fn release_button(&mut self, mask: i64) -> Vec<PointerDispatch> {
+        self.pointer_buttons &= !mask;
+        let mut events = self.pointer_event(if self.pointer_buttons == 0 {
+            lynx_sys::LYNX_POINTER_PHASE_UP
+        } else {
+            lynx_sys::LYNX_POINTER_PHASE_MOVE
+        });
+        if self.pointer_buttons == 0 && !self.pointer_inside && self.pointer_added {
+            events.extend(self.pointer_event(lynx_sys::LYNX_POINTER_PHASE_REMOVE));
+        }
+        events
+    }
+
+    pub fn scroll(&mut self, x: f64, y: f64) -> Vec<PointerDispatch> {
+        let phase = if self.pointer_buttons == 0 {
+            lynx_sys::LYNX_POINTER_PHASE_HOVER
+        } else {
+            lynx_sys::LYNX_POINTER_PHASE_MOVE
+        };
+        let mut events = self.pointer_event(phase);
+        if let Some(event) = events.last_mut() {
+            event.signal_kind = lynx_sys::LYNX_POINTER_SIGNAL_KIND_SCROLL;
+            event.scroll_delta_x = scroll_delta_logical_pixels(x);
+            event.scroll_delta_y = scroll_delta_logical_pixels(y);
+        }
+        events
+    }
+
+    pub fn press_key(&mut self, key: i32, physical: u64, logical: u64) -> PressedKey {
+        let pressed = PressedKey { physical, logical };
+        self.pressed_keys.insert(key, pressed);
+        pressed
+    }
+
+    pub fn repeated_key(&self, key: i32) -> Option<PressedKey> {
+        self.pressed_keys.get(&key).copied()
+    }
+
+    pub fn release_key(&mut self, key: i32) -> Option<PressedKey> {
+        self.pressed_keys.remove(&key)
+    }
+
+    pub fn cancel(&mut self) -> (Vec<PressedKey>, Vec<PointerDispatch>) {
+        let keys = self.pressed_keys.drain().map(|(_, key)| key).collect();
+        let mut pointer_events = Vec::new();
+        if self.pointer_buttons != 0 {
+            pointer_events.extend(self.pointer_event(lynx_sys::LYNX_POINTER_PHASE_CANCEL));
+            self.pointer_buttons = 0;
+        }
+        if self.pointer_added {
+            pointer_events.extend(self.pointer_event(lynx_sys::LYNX_POINTER_PHASE_REMOVE));
+        }
+        self.pointer_inside = false;
+        (keys, pointer_events)
+    }
+
+    fn pointer_event(&mut self, phase: i32) -> Vec<PointerDispatch> {
+        let mut events = Vec::with_capacity(2);
+        if !self.pointer_added && phase != lynx_sys::LYNX_POINTER_PHASE_ADD {
+            self.pointer_added = true;
+            events.push(PointerDispatch {
+                phase: lynx_sys::LYNX_POINTER_PHASE_ADD,
+                signal_kind: lynx_sys::LYNX_POINTER_SIGNAL_KIND_NONE,
+                scroll_delta_x: 0.0,
+                scroll_delta_y: 0.0,
+                buttons: self.pointer_buttons,
+            });
+        }
+        if phase == lynx_sys::LYNX_POINTER_PHASE_ADD {
+            self.pointer_added = true;
+        }
+        events.push(PointerDispatch {
+            phase,
+            signal_kind: lynx_sys::LYNX_POINTER_SIGNAL_KIND_NONE,
+            scroll_delta_x: 0.0,
+            scroll_delta_y: 0.0,
+            buttons: self.pointer_buttons,
+        });
+        if phase == lynx_sys::LYNX_POINTER_PHASE_REMOVE {
+            self.pointer_added = false;
+        }
+        events
+    }
 }
 
 pub fn executable_directory(argv0: &OsStr) -> io::Result<PathBuf> {
@@ -107,6 +254,128 @@ pub fn utf8_from_codepoint(codepoint: u32) -> String {
     char::from_u32(codepoint)
         .map(|value| value.to_string())
         .unwrap_or_default()
+}
+
+pub fn physical_key(key: i32) -> u64 {
+    const KEY_A: i32 = 65;
+    const KEY_Z: i32 = 90;
+    const KEY_0: i32 = 48;
+    const KEY_1: i32 = 49;
+    const KEY_9: i32 = 57;
+    const KEY_F1: i32 = 290;
+    const KEY_F12: i32 = 301;
+
+    if (KEY_A..=KEY_Z).contains(&key) {
+        return 0x0007_0004 + (key - KEY_A) as u64;
+    }
+    if (KEY_1..=KEY_9).contains(&key) {
+        return 0x0007_001e + (key - KEY_1) as u64;
+    }
+    if (KEY_F1..=KEY_F12).contains(&key) {
+        return 0x0007_003a + (key - KEY_F1) as u64;
+    }
+    match key {
+        KEY_0 => 0x0007_0027,
+        257 => 0x0007_0028,
+        256 => 0x0007_0029,
+        259 => 0x0007_002a,
+        258 => 0x0007_002b,
+        32 => 0x0007_002c,
+        45 => 0x0007_002d,
+        61 => 0x0007_002e,
+        91 => 0x0007_002f,
+        93 => 0x0007_0030,
+        92 => 0x0007_0031,
+        59 => 0x0007_0033,
+        39 => 0x0007_0034,
+        96 => 0x0007_0035,
+        44 => 0x0007_0036,
+        46 => 0x0007_0037,
+        47 => 0x0007_0038,
+        280 => 0x0007_0039,
+        283 => 0x0007_0046,
+        281 => 0x0007_0047,
+        284 => 0x0007_0048,
+        260 => 0x0007_0049,
+        268 => 0x0007_004a,
+        266 => 0x0007_004b,
+        261 => 0x0007_004c,
+        269 => 0x0007_004d,
+        267 => 0x0007_004e,
+        262 => 0x0007_004f,
+        263 => 0x0007_0050,
+        264 => 0x0007_0051,
+        265 => 0x0007_0052,
+        341 => 0x0007_00e0,
+        340 => 0x0007_00e1,
+        342 => 0x0007_00e2,
+        343 => 0x0007_00e3,
+        345 => 0x0007_00e4,
+        344 => 0x0007_00e5,
+        346 => 0x0007_00e6,
+        347 => 0x0007_00e7,
+        _ => 0,
+    }
+}
+
+pub fn logical_key(key: i32) -> u64 {
+    const KEY_A: i32 = 65;
+    const KEY_Z: i32 = 90;
+    const KEY_0: i32 = 48;
+    const KEY_9: i32 = 57;
+    const KEY_F1: i32 = 290;
+    const KEY_F12: i32 = 301;
+
+    if (KEY_A..=KEY_Z).contains(&key) {
+        return ('a' as u64) + (key - KEY_A) as u64;
+    }
+    if (KEY_0..=KEY_9).contains(&key) {
+        return ('0' as u64) + (key - KEY_0) as u64;
+    }
+    if (KEY_F1..=KEY_F12).contains(&key) {
+        return 0x0001_0000_0801 + (key - KEY_F1) as u64;
+    }
+    match key {
+        257 => 0x0001_0000_000d,
+        256 => 0x0001_0000_001b,
+        259 => 0x0001_0000_0008,
+        258 => 0x0001_0000_0009,
+        32 => ' ' as u64,
+        45 => '-' as u64,
+        61 => '=' as u64,
+        91 => '[' as u64,
+        93 => ']' as u64,
+        92 => '\\' as u64,
+        59 => ';' as u64,
+        39 => '\'' as u64,
+        96 => '`' as u64,
+        44 => ',' as u64,
+        46 => '.' as u64,
+        47 => '/' as u64,
+        280 => 0x0001_0000_0104,
+        283 => 0x0001_0000_0608,
+        281 => 0x0001_0000_010c,
+        284 => 0x0001_0000_0509,
+        260 => 0x0001_0000_0407,
+        268 => 0x0001_0000_0306,
+        266 => 0x0001_0000_0308,
+        261 => 0x0001_0000_007f,
+        269 => 0x0001_0000_0305,
+        267 => 0x0001_0000_0307,
+        262 => 0x0001_0000_0303,
+        263 => 0x0001_0000_0302,
+        264 => 0x0001_0000_0301,
+        265 => 0x0001_0000_0304,
+        341 => 0x0002_0000_0100,
+        345 => 0x0002_0000_0101,
+        340 => 0x0002_0000_0102,
+        344 => 0x0002_0000_0103,
+        342 => 0x0002_0000_0104,
+        346 => 0x0002_0000_0105,
+        343 => 0x0002_0000_0106,
+        347 => 0x0002_0000_0107,
+        _ => 0x0001_0000_0001,
+    }
 }
 
 pub fn scroll_delta_logical_pixels(offset: f64) -> f64 {
@@ -353,6 +622,93 @@ mod tests {
     }
 
     #[test]
+    fn maps_glfw_keys_to_usb_hid_and_lynx_logical_ids() {
+        assert_eq!(physical_key(65), 0x0007_0004);
+        assert_eq!(physical_key(90), 0x0007_001d);
+        assert_eq!(physical_key(49), 0x0007_001e);
+        assert_eq!(physical_key(48), 0x0007_0027);
+        assert_eq!(physical_key(290), 0x0007_003a);
+        assert_eq!(physical_key(301), 0x0007_0045);
+        assert_eq!(physical_key(340), 0x0007_00e1);
+        assert_eq!(physical_key(-1), 0);
+
+        assert_eq!(logical_key(65), 'a' as u64);
+        assert_eq!(logical_key(90), 'z' as u64);
+        assert_eq!(logical_key(48), '0' as u64);
+        assert_eq!(logical_key(290), 0x0001_0000_0801);
+        assert_eq!(logical_key(257), 0x0001_0000_000d);
+        assert_eq!(logical_key(340), 0x0002_0000_0102);
+        assert_eq!(logical_key(-1), 0x0001_0000_0001);
+    }
+
+    #[test]
+    fn pressed_key_bookkeeping_requires_a_down_before_repeat_or_up() {
+        let mut input = InputState::default();
+        assert_eq!(input.repeated_key(65), None);
+        assert_eq!(input.release_key(65), None);
+
+        let pressed = input.press_key(65, physical_key(65), logical_key(65));
+        assert_eq!(input.repeated_key(65), Some(pressed));
+        assert_eq!(input.release_key(65), Some(pressed));
+        assert_eq!(input.repeated_key(65), None);
+        assert_eq!(input.release_key(65), None);
+    }
+
+    #[test]
+    fn cancellation_releases_keys_then_cancels_and_removes_pointer() {
+        let mut input = InputState::default();
+        input.press_key(65, physical_key(65), logical_key(65));
+        input.press_key(340, physical_key(340), logical_key(340));
+        assert_eq!(
+            input.set_pointer_inside(true),
+            vec![PointerDispatch {
+                phase: lynx_sys::LYNX_POINTER_PHASE_ADD,
+                signal_kind: lynx_sys::LYNX_POINTER_SIGNAL_KIND_NONE,
+                scroll_delta_x: 0.0,
+                scroll_delta_y: 0.0,
+                buttons: 0,
+            }]
+        );
+        input.press_button(lynx_sys::LYNX_POINTER_BUTTON_PRIMARY);
+
+        let (mut keys, pointer_events) = input.cancel();
+        keys.sort_by_key(|key| key.physical);
+        assert_eq!(
+            keys,
+            vec![
+                PressedKey {
+                    physical: 0x0007_0004,
+                    logical: 'a' as u64,
+                },
+                PressedKey {
+                    physical: 0x0007_00e1,
+                    logical: 0x0002_0000_0102,
+                },
+            ]
+        );
+        assert_eq!(
+            pointer_events,
+            vec![
+                PointerDispatch {
+                    phase: lynx_sys::LYNX_POINTER_PHASE_CANCEL,
+                    signal_kind: lynx_sys::LYNX_POINTER_SIGNAL_KIND_NONE,
+                    scroll_delta_x: 0.0,
+                    scroll_delta_y: 0.0,
+                    buttons: lynx_sys::LYNX_POINTER_BUTTON_PRIMARY,
+                },
+                PointerDispatch {
+                    phase: lynx_sys::LYNX_POINTER_PHASE_REMOVE,
+                    signal_kind: lynx_sys::LYNX_POINTER_SIGNAL_KIND_NONE,
+                    scroll_delta_x: 0.0,
+                    scroll_delta_y: 0.0,
+                    buttons: 0,
+                },
+            ]
+        );
+        assert_eq!(input.cancel(), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
     fn reads_xsettings_window_scale_and_rejects_invalid_data() {
         let name = b"Gdk/WindowScalingFactor";
         let mut xsettings = vec![0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0];
@@ -390,6 +746,16 @@ mod tests {
                 pixel_ratio: 2.0,
                 framebuffer_scale_x: 2.0,
                 framebuffer_scale_y: 2.0,
+            })
+        );
+        assert_eq!(
+            calculate_window_metrics(1400, 950, 1400, 950, 1.25),
+            Some(WindowMetrics {
+                logical_width: 1120.0,
+                logical_height: 760.0,
+                pixel_ratio: 1.25,
+                framebuffer_scale_x: 1.0,
+                framebuffer_scale_y: 1.0,
             })
         );
         assert_eq!(calculate_window_metrics(0, 760, 2240, 1520, 1.0), None);

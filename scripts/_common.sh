@@ -33,6 +33,13 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+require_visible_capture_commands() {
+  if [[ -n "${NIRI_SOCKET:-}" ]]; then
+    require_command niri
+    require_command grim
+  fi
+}
+
 pinned_lynx_sha() {
   local entry mode object stage path
   entry="$(git -C "${repo_root}" ls-files --stage -- third_party/lynx)" ||

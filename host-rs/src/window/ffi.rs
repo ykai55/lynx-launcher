@@ -16,6 +16,18 @@ pub struct Display {
 }
 
 pub type GlfwErrorCallback = Option<unsafe extern "C" fn(c_int, *const c_char)>;
+pub type GlfwCursorPositionCallback =
+    Option<unsafe extern "C" fn(*mut GlfwWindow, c_double, c_double)>;
+pub type GlfwCursorEnterCallback = Option<unsafe extern "C" fn(*mut GlfwWindow, c_int)>;
+pub type GlfwMouseButtonCallback =
+    Option<unsafe extern "C" fn(*mut GlfwWindow, c_int, c_int, c_int)>;
+pub type GlfwScrollCallback = Option<unsafe extern "C" fn(*mut GlfwWindow, c_double, c_double)>;
+pub type GlfwKeyCallback =
+    Option<unsafe extern "C" fn(*mut GlfwWindow, c_int, c_int, c_int, c_int)>;
+pub type GlfwCharCallback = Option<unsafe extern "C" fn(*mut GlfwWindow, c_uint)>;
+pub type GlfwWindowSizeCallback = Option<unsafe extern "C" fn(*mut GlfwWindow, c_int, c_int)>;
+pub type GlfwWindowContentScaleCallback =
+    Option<unsafe extern "C" fn(*mut GlfwWindow, c_float, c_float)>;
 pub type GlfwWindowFocusCallback = Option<unsafe extern "C" fn(*mut GlfwWindow, c_int)>;
 pub type GlfwGlProc = Option<unsafe extern "C" fn()>;
 pub type Atom = c_ulong;
@@ -23,6 +35,15 @@ pub type XWindow = c_ulong;
 
 pub const GLFW_TRUE: c_int = 1;
 pub const GLFW_FALSE: c_int = 0;
+pub const GLFW_RELEASE: c_int = 0;
+pub const GLFW_PRESS: c_int = 1;
+pub const GLFW_REPEAT: c_int = 2;
+pub const GLFW_MOUSE_BUTTON_LEFT: c_int = 0;
+pub const GLFW_MOUSE_BUTTON_RIGHT: c_int = 1;
+pub const GLFW_MOUSE_BUTTON_MIDDLE: c_int = 2;
+pub const GLFW_MOUSE_BUTTON_4: c_int = 3;
+pub const GLFW_MOUSE_BUTTON_5: c_int = 4;
+pub const GLFW_FOCUSED: c_int = 0x0002_0001;
 pub const GLFW_RESIZABLE: c_int = 0x0002_0003;
 pub const GLFW_VISIBLE: c_int = 0x0002_0004;
 pub const GLFW_DECORATED: c_int = 0x0002_0005;
@@ -75,16 +96,75 @@ unsafe extern "C" {
     pub fn glfw_window_should_close(window: *mut GlfwWindow) -> c_int;
     #[link_name = "glfwSetWindowShouldClose"]
     pub fn glfw_set_window_should_close(window: *mut GlfwWindow, value: c_int);
+    #[link_name = "glfwGetWindowAttrib"]
+    pub fn glfw_get_window_attrib(window: *mut GlfwWindow, attribute: c_int) -> c_int;
+    #[link_name = "glfwSetWindowUserPointer"]
+    pub fn glfw_set_window_user_pointer(window: *mut GlfwWindow, pointer: *mut c_void);
+    #[link_name = "glfwGetWindowUserPointer"]
+    pub fn glfw_get_window_user_pointer(window: *mut GlfwWindow) -> *mut c_void;
+    #[link_name = "glfwGetWindowSize"]
+    pub fn glfw_get_window_size(window: *mut GlfwWindow, width: *mut c_int, height: *mut c_int);
     #[link_name = "glfwGetFramebufferSize"]
     pub fn glfw_get_framebuffer_size(
         window: *mut GlfwWindow,
         width: *mut c_int,
         height: *mut c_int,
     );
+    #[link_name = "glfwGetWindowContentScale"]
+    pub fn glfw_get_window_content_scale(
+        window: *mut GlfwWindow,
+        x_scale: *mut c_float,
+        y_scale: *mut c_float,
+    );
     #[link_name = "glfwShowWindow"]
     pub fn glfw_show_window(window: *mut GlfwWindow);
     #[link_name = "glfwFocusWindow"]
     pub fn glfw_focus_window(window: *mut GlfwWindow);
+    #[link_name = "glfwSetCursorPosCallback"]
+    pub fn glfw_set_cursor_position_callback(
+        window: *mut GlfwWindow,
+        callback: GlfwCursorPositionCallback,
+    ) -> GlfwCursorPositionCallback;
+    #[link_name = "glfwSetCursorEnterCallback"]
+    pub fn glfw_set_cursor_enter_callback(
+        window: *mut GlfwWindow,
+        callback: GlfwCursorEnterCallback,
+    ) -> GlfwCursorEnterCallback;
+    #[link_name = "glfwSetMouseButtonCallback"]
+    pub fn glfw_set_mouse_button_callback(
+        window: *mut GlfwWindow,
+        callback: GlfwMouseButtonCallback,
+    ) -> GlfwMouseButtonCallback;
+    #[link_name = "glfwSetScrollCallback"]
+    pub fn glfw_set_scroll_callback(
+        window: *mut GlfwWindow,
+        callback: GlfwScrollCallback,
+    ) -> GlfwScrollCallback;
+    #[link_name = "glfwSetKeyCallback"]
+    pub fn glfw_set_key_callback(
+        window: *mut GlfwWindow,
+        callback: GlfwKeyCallback,
+    ) -> GlfwKeyCallback;
+    #[link_name = "glfwSetCharCallback"]
+    pub fn glfw_set_char_callback(
+        window: *mut GlfwWindow,
+        callback: GlfwCharCallback,
+    ) -> GlfwCharCallback;
+    #[link_name = "glfwSetFramebufferSizeCallback"]
+    pub fn glfw_set_framebuffer_size_callback(
+        window: *mut GlfwWindow,
+        callback: GlfwWindowSizeCallback,
+    ) -> GlfwWindowSizeCallback;
+    #[link_name = "glfwSetWindowSizeCallback"]
+    pub fn glfw_set_window_size_callback(
+        window: *mut GlfwWindow,
+        callback: GlfwWindowSizeCallback,
+    ) -> GlfwWindowSizeCallback;
+    #[link_name = "glfwSetWindowContentScaleCallback"]
+    pub fn glfw_set_window_content_scale_callback(
+        window: *mut GlfwWindow,
+        callback: GlfwWindowContentScaleCallback,
+    ) -> GlfwWindowContentScaleCallback;
     #[link_name = "glfwSetWindowFocusCallback"]
     pub fn glfw_set_window_focus_callback(
         window: *mut GlfwWindow,

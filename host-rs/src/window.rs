@@ -1,5 +1,6 @@
 mod ffi;
 
+use std::cell::{Cell, RefCell};
 use std::ffi::{c_void, CStr, CString};
 use std::io::{self, Write};
 use std::marker::PhantomData;
@@ -9,8 +10,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use lynx_launcher_host::runtime::{EventWake, GlApi, RuntimeCore, RuntimeViewOptions};
-use lynx_launcher_host::support::xsettings_window_scale;
+use lynx_launcher_host::support::{
+    calculate_window_metrics, logical_key, physical_key, utf8_from_codepoint,
+    xsettings_window_scale, InputState, PointerDispatch, PressedKey, WindowMetrics,
+};
 use lynx_launcher_host::{verify_linked_lynx, WindowRunOptions};
+use lynx_sys::{
+    LynxKeyEvent, LynxPointerEvent, LYNX_KEY_EVENT_TYPE_DOWN, LYNX_KEY_EVENT_TYPE_REPEAT,
+    LYNX_KEY_EVENT_TYPE_UP, LYNX_POINTER_BUTTON_BACK, LYNX_POINTER_BUTTON_FORWARD,
+    LYNX_POINTER_BUTTON_MIDDLE, LYNX_POINTER_BUTTON_PRIMARY, LYNX_POINTER_BUTTON_SECONDARY,
+    LYNX_POINTER_DEVICE_KIND_MOUSE,
+};
 
 const INITIAL_WIDTH: f32 = 1120.0;
 const INITIAL_HEIGHT: f32 = 760.0;
@@ -21,6 +31,7 @@ const NATIVE_CALLBACKS_LOG: &[u8] = b"[host-rs] fatal: native callbacks did not 
 skipping glfwDestroyWindow/glfwTerminate and exiting for OS cleanup\n";
 
 static CALLBACK_PANICKED: AtomicBool = AtomicBool::new(false);
+static STARTUP_FOCUS_LOST: AtomicBool = AtomicBool::new(false);
 
 struct GlfwRuntime {
     _thread_bound: PhantomData<Rc<()>>,
@@ -29,6 +40,7 @@ struct GlfwRuntime {
 impl GlfwRuntime {
     fn initialize() -> io::Result<Self> {
         CALLBACK_PANICKED.store(false, Ordering::Release);
+        STARTUP_FOCUS_LOST.store(false, Ordering::Release);
         unsafe { ffi::glfw_set_error_callback(Some(glfw_error)) };
         if unsafe { ffi::glfw_init() } == ffi::GLFW_FALSE {
             unsafe { ffi::glfw_set_error_callback(None) };
@@ -94,12 +106,237 @@ impl PopupWindow {
 impl Drop for PopupWindow {
     fn drop(&mut self) {
         unsafe {
-            ffi::glfw_set_window_focus_callback(self.raw(), None);
+            clear_window_callbacks(self.raw());
             if ffi::glfw_get_current_context() == self.raw() {
                 ffi::glfw_make_context_current(std::ptr::null_mut());
             }
             ffi::glfw_destroy_window(self.raw());
         }
+    }
+}
+
+struct WindowState {
+    window: NonNull<ffi::GlfwWindow>,
+    runtime: RefCell<RuntimeCore>,
+    input: RefCell<InputState>,
+    accepting_input: Cell<bool>,
+    metrics: Cell<WindowMetrics>,
+    system_scale: f32,
+    callback_failed: AtomicBool,
+    input_trace: bool,
+}
+
+impl WindowState {
+    fn new(
+        window: NonNull<ffi::GlfwWindow>,
+        runtime: RuntimeCore,
+        metrics: WindowMetrics,
+        system_scale: f32,
+    ) -> Self {
+        Self {
+            window,
+            runtime: RefCell::new(runtime),
+            input: RefCell::new(InputState::default()),
+            accepting_input: Cell::new(true),
+            metrics: Cell::new(metrics),
+            system_scale,
+            callback_failed: AtomicBool::new(false),
+            input_trace: std::env::var_os("LYNX_LAUNCHER_E2E_SNAPSHOT_TRACE").as_deref()
+                == Some(std::ffi::OsStr::new("1")),
+        }
+    }
+
+    fn register_callbacks(&self) {
+        let user_data = (self as *const Self).cast_mut().cast();
+        unsafe {
+            ffi::glfw_set_window_user_pointer(self.window.as_ptr(), user_data);
+            ffi::glfw_set_cursor_position_callback(
+                self.window.as_ptr(),
+                Some(cursor_position_callback),
+            );
+            ffi::glfw_set_cursor_enter_callback(self.window.as_ptr(), Some(cursor_enter_callback));
+            ffi::glfw_set_mouse_button_callback(self.window.as_ptr(), Some(mouse_button_callback));
+            ffi::glfw_set_scroll_callback(self.window.as_ptr(), Some(scroll_callback));
+            ffi::glfw_set_key_callback(self.window.as_ptr(), Some(key_callback));
+            ffi::glfw_set_char_callback(self.window.as_ptr(), Some(character_callback));
+            ffi::glfw_set_framebuffer_size_callback(
+                self.window.as_ptr(),
+                Some(framebuffer_size_callback),
+            );
+            ffi::glfw_set_window_size_callback(self.window.as_ptr(), Some(window_size_callback));
+            ffi::glfw_set_window_content_scale_callback(
+                self.window.as_ptr(),
+                Some(content_scale_callback),
+            );
+            ffi::glfw_set_window_focus_callback(self.window.as_ptr(), Some(window_focus_callback));
+        }
+    }
+
+    fn unregister_callbacks(&self) {
+        unsafe { clear_window_callbacks(self.window.as_ptr()) };
+    }
+
+    fn ensure_healthy(&self) -> io::Result<()> {
+        if self.callback_failed.load(Ordering::Acquire) {
+            return Err(io::Error::other("a GLFW window callback failed"));
+        }
+        self.runtime
+            .try_borrow()
+            .map_err(|_| io::Error::other("the Lynx runtime is already borrowed"))?
+            .ensure_healthy()
+    }
+
+    fn record_callback_failure(&self) {
+        self.accepting_input.set(false);
+        self.callback_failed.store(true, Ordering::Release);
+        unsafe {
+            ffi::glfw_set_window_should_close(self.window.as_ptr(), ffi::GLFW_TRUE);
+            ffi::glfw_post_empty_event();
+        }
+    }
+
+    fn update_metrics(&self) -> io::Result<()> {
+        let Some(metrics) = window_metrics(self.window.as_ptr(), self.system_scale)? else {
+            return Ok(());
+        };
+        self.runtime
+            .try_borrow()
+            .map_err(|_| io::Error::other("the Lynx runtime is already borrowed"))?
+            .update_view_metrics(
+                metrics.logical_width,
+                metrics.logical_height,
+                metrics.pixel_ratio,
+            )?;
+        self.metrics.set(metrics);
+        log_metrics(metrics);
+        Ok(())
+    }
+
+    fn send_pointer_events(&self, events: Vec<PointerDispatch>) -> io::Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let (cursor_x, cursor_y) = self
+            .input
+            .try_borrow()
+            .map_err(|_| io::Error::other("the input state is already borrowed"))?
+            .cursor_position();
+        let metrics = self.metrics.get();
+        let runtime = self
+            .runtime
+            .try_borrow()
+            .map_err(|_| io::Error::other("the Lynx runtime is already borrowed"))?;
+        for dispatch in events {
+            let mut event = LynxPointerEvent {
+                struct_size: std::mem::size_of::<LynxPointerEvent>(),
+                phase: dispatch.phase,
+                timestamp: 0,
+                x: cursor_x * f64::from(metrics.framebuffer_scale_x),
+                y: cursor_y * f64::from(metrics.framebuffer_scale_y),
+                device: 0,
+                signal_kind: dispatch.signal_kind,
+                scroll_delta_x: dispatch.scroll_delta_x * f64::from(metrics.pixel_ratio),
+                scroll_delta_y: dispatch.scroll_delta_y * f64::from(metrics.pixel_ratio),
+                device_kind: LYNX_POINTER_DEVICE_KIND_MOUSE,
+                buttons: dispatch.buttons,
+                pan_x: 0.0,
+                pan_y: 0.0,
+                scale: 1.0,
+                rotation: 0.0,
+                is_precise_scroll: 0,
+            };
+            runtime.send_pointer_event(&mut event)?;
+            if self.input_trace {
+                eprintln!(
+                    "[host-rs] pointer dispatch phase={} signal={} x={} y={} scroll-logical-y={} scroll-physical-y={} buttons={}",
+                    pointer_phase_name(dispatch.phase),
+                    pointer_signal_name(dispatch.signal_kind),
+                    event.x,
+                    event.y,
+                    dispatch.scroll_delta_y,
+                    event.scroll_delta_y,
+                    event.buttons
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn send_key(
+        &self,
+        event_type: i32,
+        key: PressedKey,
+        character: *const std::ffi::c_char,
+        synthesized: bool,
+    ) -> io::Result<()> {
+        let mut event = LynxKeyEvent {
+            struct_size: std::mem::size_of::<LynxKeyEvent>(),
+            timestamp: 0.0,
+            event_type,
+            physical: key.physical,
+            logical: key.logical,
+            character,
+            synthesized,
+        };
+        self.runtime
+            .try_borrow()
+            .map_err(|_| io::Error::other("the Lynx runtime is already borrowed"))?
+            .send_key_event(&mut event)?;
+        if self.input_trace {
+            eprintln!(
+                "[host-rs] key dispatch type={} physical={} logical={} synthesized={}",
+                key_event_type_name(event_type),
+                key.physical,
+                key.logical,
+                synthesized
+            );
+        }
+        Ok(())
+    }
+
+    fn cancel_input(&self) -> io::Result<()> {
+        let (keys, pointer_events) = self
+            .input
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("the input state is already borrowed"))?
+            .cancel();
+        {
+            let runtime = self
+                .runtime
+                .try_borrow()
+                .map_err(|_| io::Error::other("the Lynx runtime is already borrowed"))?;
+            runtime.cancel_text_input();
+        }
+        for key in keys {
+            self.send_key(LYNX_KEY_EVENT_TYPE_UP, key, std::ptr::null(), true)?;
+        }
+        self.send_pointer_events(pointer_events)
+    }
+
+    fn focus_changed(&self, focused: bool) -> io::Result<()> {
+        if focused {
+            if !self.accepting_input.get() {
+                return Ok(());
+            }
+            return self
+                .runtime
+                .try_borrow()
+                .map_err(|_| io::Error::other("the Lynx runtime is already borrowed"))?
+                .enter_foreground();
+        }
+
+        if !self.accepting_input.replace(false) {
+            return Ok(());
+        }
+        let cancel_result = self.cancel_input();
+        let background_result = self
+            .runtime
+            .try_borrow()
+            .map_err(|_| io::Error::other("the Lynx runtime is already borrowed"))?
+            .enter_background();
+        eprintln!("[host-rs] window lost focus; exiting");
+        unsafe { ffi::glfw_set_window_should_close(self.window.as_ptr(), ffi::GLFW_TRUE) };
+        cancel_result.and(background_result)
     }
 }
 
@@ -112,7 +349,7 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
     }
 
     let _glfw = GlfwRuntime::initialize()?;
-    let system_scale = system_window_scale();
+    let system_scale = system_window_scale()?;
     let width = scaled_dimension(INITIAL_WIDTH, system_scale)?;
     let height = scaled_dimension(INITIAL_HEIGHT, system_scale)?;
     eprintln!("[host-rs] system window scale: {system_scale}");
@@ -141,6 +378,9 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
     if framebuffer_width <= 0 || framebuffer_height <= 0 {
         return Err(io::Error::other("GLFW returned an empty framebuffer"));
     }
+    let initial_metrics = window_metrics(window.raw(), system_scale)?
+        .ok_or_else(|| io::Error::other("GLFW returned invalid initial window metrics"))?;
+    log_metrics(initial_metrics);
 
     let version = unsafe { ffi::gl_get_string(ffi::GL_VERSION) };
     if version.is_null() {
@@ -152,10 +392,25 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
     unsafe { ffi::glfw_make_context_current(std::ptr::null_mut()) };
     present_shell_frame(&window, framebuffer_width, framebuffer_height)?;
     unsafe {
+        ffi::glfw_set_window_focus_callback(window.raw(), Some(startup_window_focus_callback));
         ffi::glfw_show_window(window.raw());
         ffi::glfw_focus_window(window.raw());
-        ffi::glfw_set_window_focus_callback(window.raw(), Some(window_focus));
-        ffi::glfw_wait_events_timeout(0.25);
+        if std::env::var_os("LYNX_LAUNCHER_E2E_STARTUP_FOCUS_WAIT").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+            && std::env::var_os("LYNX_LAUNCHER_E2E_SNAPSHOT_TRACE").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+        {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !STARTUP_FOCUS_LOST.load(Ordering::Acquire) {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                ffi::glfw_wait_events_timeout(deadline.duration_since(now).as_secs_f64());
+            }
+        } else {
+            ffi::glfw_wait_events_timeout(0.25);
+        }
     }
     present_shell_frame(&window, framebuffer_width, framebuffer_height)?;
     ensure_callback_did_not_panic()?;
@@ -178,9 +433,9 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
         bundle: options.bundle.clone(),
         lynx_core: options.lynx_core.clone(),
         icu: options.icu.clone(),
-        logical_width: INITIAL_WIDTH,
-        logical_height: INITIAL_HEIGHT,
-        pixel_ratio: system_scale,
+        logical_width: initial_metrics.logical_width,
+        logical_height: initial_metrics.logical_height,
+        pixel_ratio: initial_metrics.pixel_ratio,
     };
     // SAFETY: `runtime` shuts down before `window` and `_glfw` are dropped;
     // the function table is static and the wake callback has no userdata.
@@ -201,17 +456,35 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
     let run_result = match runtime.initialize_view(&view_options) {
         Ok(()) => {
             eprintln!("[host-rs] runtime core initialized");
-            (|| {
-                runtime.run_due_tasks()?;
-                runtime.ensure_healthy()?;
+            let state = Box::new(WindowState::new(
+                window.raw,
+                runtime,
+                initial_metrics,
+                system_scale,
+            ));
+            state.register_callbacks();
+            let startup_focus_result = if STARTUP_FOCUS_LOST.swap(false, Ordering::AcqRel)
+                || unsafe { ffi::glfw_window_should_close(window.raw()) } != ffi::GLFW_FALSE
+                || unsafe { ffi::glfw_get_window_attrib(window.raw(), ffi::GLFW_FOCUSED) }
+                    != ffi::GLFW_TRUE
+            {
+                state.focus_changed(false)
+            } else {
+                Ok(())
+            };
+            let loop_result = (|| {
+                startup_focus_result?;
+                state.runtime.borrow().run_due_tasks()?;
+                state.ensure_healthy()?;
                 while unsafe { ffi::glfw_window_should_close(window.raw()) } == ffi::GLFW_FALSE {
                     ensure_callback_did_not_panic()?;
-                    runtime.run_due_tasks()?;
-                    if options.exit_after_first_frame && runtime.first_frame_ready() {
+                    state.runtime.borrow().run_due_tasks()?;
+                    if options.exit_after_first_frame && state.runtime.borrow().first_frame_ready()
+                    {
                         eprintln!("[host-rs] auto-exit after first rendered frame");
                         break;
                     }
-                    let mut timeout = runtime.wait_duration(MAXIMUM_EVENT_WAIT)?;
+                    let mut timeout = state.runtime.borrow().wait_duration(MAXIMUM_EVENT_WAIT)?;
                     if let Some(deadline) = deadline {
                         let now = Instant::now();
                         if now >= deadline {
@@ -222,39 +495,63 @@ pub fn run(options: WindowRunOptions) -> io::Result<()> {
                     }
                     unsafe { ffi::glfw_wait_events_timeout(timeout.as_secs_f64().max(0.0005)) };
                     ensure_callback_did_not_panic()?;
-                    runtime.ensure_healthy()?;
+                    state.ensure_healthy()?;
                 }
                 ensure_callback_did_not_panic()
-            })()
-        }
-        Err(error) => Err(error),
-    };
-    let shutdown_result = runtime.shutdown();
-    let requires_process_exit = runtime.requires_process_exit_without_glfw_cleanup();
-    let fatal_log = if runtime.native_callbacks_not_quiesced() {
-        NATIVE_CALLBACKS_LOG
-    } else {
-        STRANDED_GL_LOG
-    };
-    // A kind-only io::Error carries no formatted/custom payload and is saved
-    // before the fatal branch disables all native cleanup.
-    let fatal_error = io::Error::from(io::ErrorKind::Other);
-    if requires_process_exit {
-        // Do not format, log, or otherwise risk unwinding until every owner
-        // whose Drop would touch GLFW has been intentionally forgotten.
-        std::mem::forget(runtime);
-        std::mem::forget(window);
-        std::mem::forget(_glfw);
+            })();
 
-        // With native cleanup disabled, diagnostics are strictly best effort.
-        let _ = io::stderr().write_all(fatal_log);
-        return Err(fatal_error);
-    }
-    if shutdown_result.is_ok() {
-        eprintln!("[host-rs] runtime core shutdown complete");
-    }
-    run_result?;
-    shutdown_result
+            // Stop accepting GLFW input before cancellation so synthetic
+            // releases cannot recreate state while the view is shutting down.
+            state.accepting_input.set(false);
+            let cancel_result = state.cancel_input();
+            state.unregister_callbacks();
+            let shutdown_result = state.runtime.borrow_mut().shutdown();
+            let requires_process_exit = state
+                .runtime
+                .borrow()
+                .requires_process_exit_without_glfw_cleanup();
+            let native_callbacks_not_quiesced =
+                state.runtime.borrow().native_callbacks_not_quiesced();
+            if requires_process_exit {
+                let fatal_log = if native_callbacks_not_quiesced {
+                    NATIVE_CALLBACKS_LOG
+                } else {
+                    STRANDED_GL_LOG
+                };
+                let fatal_error = io::Error::from(io::ErrorKind::Other);
+                std::mem::forget(state);
+                std::mem::forget(window);
+                std::mem::forget(_glfw);
+                let _ = io::stderr().write_all(fatal_log);
+                return Err(fatal_error);
+            }
+            if shutdown_result.is_ok() {
+                eprintln!("[host-rs] runtime core shutdown complete");
+            }
+            cancel_result?;
+            loop_result?;
+            shutdown_result
+        }
+        Err(error) => {
+            let shutdown_result = runtime.shutdown();
+            if runtime.requires_process_exit_without_glfw_cleanup() {
+                let fatal_log = if runtime.native_callbacks_not_quiesced() {
+                    NATIVE_CALLBACKS_LOG
+                } else {
+                    STRANDED_GL_LOG
+                };
+                let fatal_error = io::Error::from(io::ErrorKind::Other);
+                std::mem::forget(runtime);
+                std::mem::forget(window);
+                std::mem::forget(_glfw);
+                let _ = io::stderr().write_all(fatal_log);
+                return Err(fatal_error);
+            }
+            shutdown_result?;
+            Err(error)
+        }
+    };
+    run_result
 }
 
 unsafe fn runtime_make_context_current(window: *mut c_void) {
@@ -307,7 +604,7 @@ fn scaled_dimension(logical: f32, scale: f32) -> io::Result<i32> {
     Ok(physical as i32)
 }
 
-fn system_window_scale() -> f32 {
+fn system_window_scale() -> io::Result<f32> {
     let mut content_scale_x = 1.0;
     let mut content_scale_y = 1.0;
     let monitor = unsafe { ffi::glfw_get_primary_monitor() };
@@ -327,7 +624,61 @@ fn system_window_scale() -> f32 {
             scale = scale.max(xsettings_scale);
         }
     }
-    scale.max(1.0)
+    scale = scale.max(1.0);
+    if std::env::var_os("LYNX_LAUNCHER_E2E_SNAPSHOT_TRACE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        if let Some(value) = std::env::var_os("LYNX_LAUNCHER_E2E_SYSTEM_SCALE") {
+            let value = value
+                .to_str()
+                .and_then(|value| value.parse::<f32>().ok())
+                .filter(|value| value.is_finite() && *value >= 1.0)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "LYNX_LAUNCHER_E2E_SYSTEM_SCALE must be a finite number at least 1",
+                    )
+                })?;
+            scale = value;
+        }
+    }
+    Ok(scale)
+}
+
+fn window_metrics(
+    window: *mut ffi::GlfwWindow,
+    system_scale: f32,
+) -> io::Result<Option<WindowMetrics>> {
+    let mut window_width = 0;
+    let mut window_height = 0;
+    let mut framebuffer_width = 0;
+    let mut framebuffer_height = 0;
+    let mut content_scale_x = 1.0;
+    let mut content_scale_y = 1.0;
+    unsafe {
+        ffi::glfw_get_window_size(window, &mut window_width, &mut window_height);
+        ffi::glfw_get_framebuffer_size(window, &mut framebuffer_width, &mut framebuffer_height);
+        ffi::glfw_get_window_content_scale(window, &mut content_scale_x, &mut content_scale_y);
+    }
+    ensure_callback_did_not_panic()?;
+    Ok(calculate_window_metrics(
+        window_width,
+        window_height,
+        framebuffer_width,
+        framebuffer_height,
+        system_scale.max(content_scale_x).max(content_scale_y),
+    ))
+}
+
+fn log_metrics(metrics: WindowMetrics) {
+    eprintln!(
+        "[host-rs] metrics logical={}x{} dpr={} framebuffer-scale={}x{}",
+        metrics.logical_width,
+        metrics.logical_height,
+        metrics.pixel_ratio,
+        metrics.framebuffer_scale_x,
+        metrics.framebuffer_scale_y
+    );
 }
 
 fn read_xsettings_scale(display: *mut ffi::Display) -> Option<f32> {
@@ -466,17 +817,313 @@ unsafe extern "C" fn glfw_error(code: i32, description: *const std::ffi::c_char)
     }
 }
 
-unsafe extern "C" fn window_focus(window: *mut ffi::GlfwWindow, focused: i32) {
-    if focused == ffi::GLFW_TRUE {
-        return;
-    }
+unsafe extern "C" fn startup_window_focus_callback(window: *mut ffi::GlfwWindow, focused: i32) {
     if std::panic::catch_unwind(|| {
-        eprintln!("[host-rs] window lost focus; exiting");
-        unsafe { ffi::glfw_set_window_should_close(window, ffi::GLFW_TRUE) };
+        if focused != ffi::GLFW_TRUE {
+            STARTUP_FOCUS_LOST.store(true, Ordering::Release);
+            if std::env::var_os("LYNX_LAUNCHER_E2E_SNAPSHOT_TRACE").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            {
+                eprintln!("[host-rs] startup window lost focus; closing");
+            }
+            unsafe {
+                ffi::glfw_set_window_should_close(window, ffi::GLFW_TRUE);
+                ffi::glfw_post_empty_event();
+            }
+        }
     })
     .is_err()
     {
         CALLBACK_PANICKED.store(true, Ordering::Release);
-        unsafe { ffi::glfw_set_window_should_close(window, ffi::GLFW_TRUE) };
+        STARTUP_FOCUS_LOST.store(true, Ordering::Release);
+        unsafe {
+            ffi::glfw_set_window_should_close(window, ffi::GLFW_TRUE);
+            ffi::glfw_post_empty_event();
+        }
     }
+}
+
+unsafe fn clear_window_callbacks(window: *mut ffi::GlfwWindow) {
+    unsafe {
+        ffi::glfw_set_cursor_position_callback(window, None);
+        ffi::glfw_set_cursor_enter_callback(window, None);
+        ffi::glfw_set_mouse_button_callback(window, None);
+        ffi::glfw_set_scroll_callback(window, None);
+        ffi::glfw_set_key_callback(window, None);
+        ffi::glfw_set_char_callback(window, None);
+        ffi::glfw_set_framebuffer_size_callback(window, None);
+        ffi::glfw_set_window_size_callback(window, None);
+        ffi::glfw_set_window_content_scale_callback(window, None);
+        ffi::glfw_set_window_focus_callback(window, None);
+        ffi::glfw_set_window_user_pointer(window, std::ptr::null_mut());
+    }
+}
+
+fn with_window_state(
+    window: *mut ffi::GlfwWindow,
+    callback: impl FnOnce(&WindowState) -> io::Result<()>,
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let pointer = unsafe { ffi::glfw_get_window_user_pointer(window) };
+        let state = NonNull::new(pointer.cast::<WindowState>())
+            .ok_or_else(|| io::Error::other("GLFW window userdata is unavailable"))?;
+        // SAFETY: Callback registration stores a stable Box address and clears
+        // every callback before that Box is released.
+        callback(unsafe { state.as_ref() })
+    }));
+    if matches!(result, Ok(Ok(()))) {
+        return;
+    }
+
+    let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let pointer = unsafe { ffi::glfw_get_window_user_pointer(window) };
+        let Some(state) = NonNull::new(pointer.cast::<WindowState>()) else {
+            return false;
+        };
+        // SAFETY: The pointer has the same callback-scoped lifetime described
+        // above and is only used through a shared reference.
+        unsafe { state.as_ref() }.record_callback_failure();
+        true
+    }))
+    .unwrap_or(false);
+    if !recorded {
+        CALLBACK_PANICKED.store(true, Ordering::Release);
+        unsafe {
+            ffi::glfw_set_window_should_close(window, ffi::GLFW_TRUE);
+            ffi::glfw_post_empty_event();
+        }
+    }
+}
+
+unsafe extern "C" fn cursor_position_callback(window: *mut ffi::GlfwWindow, x: f64, y: f64) {
+    with_window_state(window, |state| {
+        if !state.accepting_input.get() {
+            return Ok(());
+        }
+        let events = state
+            .input
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("the input state is already borrowed"))?
+            .move_cursor(x, y);
+        state.send_pointer_events(events)
+    });
+}
+
+unsafe extern "C" fn cursor_enter_callback(window: *mut ffi::GlfwWindow, entered: i32) {
+    with_window_state(window, |state| {
+        if !state.accepting_input.get() {
+            return Ok(());
+        }
+        let events = state
+            .input
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("the input state is already borrowed"))?
+            .set_pointer_inside(entered == ffi::GLFW_TRUE);
+        state.send_pointer_events(events)
+    });
+}
+
+fn mouse_button_mask(button: i32) -> i64 {
+    match button {
+        ffi::GLFW_MOUSE_BUTTON_LEFT => LYNX_POINTER_BUTTON_PRIMARY,
+        ffi::GLFW_MOUSE_BUTTON_RIGHT => LYNX_POINTER_BUTTON_SECONDARY,
+        ffi::GLFW_MOUSE_BUTTON_MIDDLE => LYNX_POINTER_BUTTON_MIDDLE,
+        ffi::GLFW_MOUSE_BUTTON_4 => LYNX_POINTER_BUTTON_BACK,
+        ffi::GLFW_MOUSE_BUTTON_5 => LYNX_POINTER_BUTTON_FORWARD,
+        _ => 0,
+    }
+}
+
+fn pointer_phase_name(phase: i32) -> &'static str {
+    match phase {
+        lynx_sys::LYNX_POINTER_PHASE_CANCEL => "cancel",
+        lynx_sys::LYNX_POINTER_PHASE_UP => "up",
+        lynx_sys::LYNX_POINTER_PHASE_DOWN => "down",
+        lynx_sys::LYNX_POINTER_PHASE_MOVE => "move",
+        lynx_sys::LYNX_POINTER_PHASE_ADD => "add",
+        lynx_sys::LYNX_POINTER_PHASE_REMOVE => "remove",
+        lynx_sys::LYNX_POINTER_PHASE_HOVER => "hover",
+        _ => "unknown",
+    }
+}
+
+fn pointer_signal_name(signal: i32) -> &'static str {
+    match signal {
+        lynx_sys::LYNX_POINTER_SIGNAL_KIND_NONE => "none",
+        lynx_sys::LYNX_POINTER_SIGNAL_KIND_SCROLL => "scroll",
+        _ => "unknown",
+    }
+}
+
+fn key_event_type_name(event_type: i32) -> &'static str {
+    match event_type {
+        LYNX_KEY_EVENT_TYPE_UP => "up",
+        LYNX_KEY_EVENT_TYPE_DOWN => "down",
+        LYNX_KEY_EVENT_TYPE_REPEAT => "repeat",
+        _ => "unknown",
+    }
+}
+
+unsafe extern "C" fn mouse_button_callback(
+    window: *mut ffi::GlfwWindow,
+    button: i32,
+    action: i32,
+    _modifiers: i32,
+) {
+    with_window_state(window, |state| {
+        if !state.accepting_input.get() {
+            return Ok(());
+        }
+        let mask = mouse_button_mask(button);
+        if mask == 0 {
+            return Ok(());
+        }
+        let mut input = state
+            .input
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("the input state is already borrowed"))?;
+        let events = if action == ffi::GLFW_PRESS {
+            input.press_button(mask)
+        } else if action == ffi::GLFW_RELEASE {
+            input.release_button(mask)
+        } else {
+            return Ok(());
+        };
+        drop(input);
+        state.send_pointer_events(events)
+    });
+}
+
+unsafe extern "C" fn scroll_callback(window: *mut ffi::GlfwWindow, x_offset: f64, y_offset: f64) {
+    with_window_state(window, |state| {
+        if !state.accepting_input.get() {
+            return Ok(());
+        }
+        let events = state
+            .input
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("the input state is already borrowed"))?
+            .scroll(x_offset, y_offset);
+        state.send_pointer_events(events)
+    });
+}
+
+unsafe extern "C" fn key_callback(
+    window: *mut ffi::GlfwWindow,
+    key: i32,
+    _scan_code: i32,
+    action: i32,
+    _modifiers: i32,
+) {
+    with_window_state(window, |state| {
+        if !state.accepting_input.get() {
+            return Ok(());
+        }
+        let physical = physical_key(key);
+        if physical == 0 {
+            return Ok(());
+        }
+        let logical = logical_key(key);
+        if state.input_trace {
+            eprintln!(
+                "[host-rs] key key={key} action={action} physical={physical} logical={logical}"
+            );
+        }
+        let pressed = if action == ffi::GLFW_PRESS {
+            Some((
+                LYNX_KEY_EVENT_TYPE_DOWN,
+                state
+                    .input
+                    .try_borrow_mut()
+                    .map_err(|_| io::Error::other("the input state is already borrowed"))?
+                    .press_key(key, physical, logical),
+            ))
+        } else if action == ffi::GLFW_REPEAT {
+            state
+                .input
+                .try_borrow()
+                .map_err(|_| io::Error::other("the input state is already borrowed"))?
+                .repeated_key(key)
+                .map(|pressed| (LYNX_KEY_EVENT_TYPE_REPEAT, pressed))
+        } else if action == ffi::GLFW_RELEASE {
+            state
+                .input
+                .try_borrow_mut()
+                .map_err(|_| io::Error::other("the input state is already borrowed"))?
+                .release_key(key)
+                .map(|pressed| (LYNX_KEY_EVENT_TYPE_UP, pressed))
+        } else {
+            None
+        };
+        let Some((event_type, pressed)) = pressed else {
+            return Ok(());
+        };
+        state.send_key(
+            event_type,
+            pressed,
+            if event_type == LYNX_KEY_EVENT_TYPE_UP {
+                std::ptr::null()
+            } else {
+                c"".as_ptr()
+            },
+            false,
+        )
+    });
+}
+
+unsafe extern "C" fn character_callback(window: *mut ffi::GlfwWindow, codepoint: u32) {
+    with_window_state(window, |state| {
+        if !state.accepting_input.get() {
+            return Ok(());
+        }
+        let text_input_active = state
+            .runtime
+            .try_borrow()
+            .map_err(|_| io::Error::other("the Lynx runtime is already borrowed"))?
+            .text_input_active();
+        if state.input_trace {
+            eprintln!("[host-rs] character codepoint={codepoint} active={text_input_active}");
+        }
+        if !text_input_active {
+            return Ok(());
+        }
+        let character = utf8_from_codepoint(codepoint);
+        if character.is_empty() || character.as_bytes().contains(&0) {
+            return Ok(());
+        }
+        let character = CString::new(character)
+            .map_err(|_| io::Error::other("character input unexpectedly contained NUL"))?;
+        let pressed = PressedKey {
+            physical: 0,
+            logical: u64::from(codepoint),
+        };
+        state.send_key(LYNX_KEY_EVENT_TYPE_DOWN, pressed, character.as_ptr(), true)?;
+        state.send_key(LYNX_KEY_EVENT_TYPE_UP, pressed, std::ptr::null(), true)
+    });
+}
+
+unsafe extern "C" fn framebuffer_size_callback(
+    window: *mut ffi::GlfwWindow,
+    _width: i32,
+    _height: i32,
+) {
+    with_window_state(window, WindowState::update_metrics);
+}
+
+unsafe extern "C" fn window_size_callback(window: *mut ffi::GlfwWindow, _width: i32, _height: i32) {
+    with_window_state(window, WindowState::update_metrics);
+}
+
+unsafe extern "C" fn content_scale_callback(
+    window: *mut ffi::GlfwWindow,
+    _x_scale: f32,
+    _y_scale: f32,
+) {
+    with_window_state(window, WindowState::update_metrics);
+}
+
+unsafe extern "C" fn window_focus_callback(window: *mut ffi::GlfwWindow, focused: i32) {
+    with_window_state(window, |state| {
+        state.focus_changed(focused == ffi::GLFW_TRUE)
+    });
 }

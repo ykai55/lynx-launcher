@@ -12,10 +12,11 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use lynx_sys::{
-    LynxGenericResourceFetcher, LynxLoadMeta, LynxResourceRequest, LynxResourceResponse, LynxTask,
-    LynxUiTaskRunnerConfig, LynxView, LynxViewClient, LynxWindowlessRenderer, NapiCallbackInfo,
-    NapiDeferred, NapiEnv, NapiValue, LYNX_LOG_INFO, LYNX_RENDERER_TYPE_GL_DIRECT,
-    LYNX_RESOURCE_TYPE_LYNX_CORE_JS, NAPI_AUTO_LENGTH, NAPI_OK,
+    LynxGenericResourceFetcher, LynxKeyEvent, LynxLoadMeta, LynxPointerEvent, LynxResourceRequest,
+    LynxResourceResponse, LynxTask, LynxUiTaskRunnerConfig, LynxView, LynxViewClient,
+    LynxWindowlessRenderer, NapiAsyncWork, NapiCallbackInfo, NapiDeferred, NapiEnv, NapiValue,
+    LYNX_LOG_INFO, LYNX_RENDERER_TYPE_GL_DIRECT, LYNX_RESOURCE_TYPE_LYNX_CORE_JS, NAPI_AUTO_LENGTH,
+    NAPI_OK,
 };
 
 use crate::support::{file_uri, read_file};
@@ -24,7 +25,10 @@ use lynx_launcher_platform::Launcher;
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 const CLOCK_MONOTONIC: c_int = 1;
 const FETCHER_FINALIZER_TIMEOUT: Duration = Duration::from_secs(5);
+const LAUNCH_WORK_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAXIMUM_E2E_LAUNCH_WORK_DELAY_MS: u64 = 5_000;
 const INJECTED_APPLICATION_ERROR: &str = "injected native application snapshot failure";
+const E2E_UNKNOWN_APPLICATION_ID: &str = "lynx-launcher-e2e-unknown.desktop";
 
 #[repr(C)]
 struct Timespec {
@@ -113,6 +117,95 @@ struct FetcherFinalization {
     changed: Condvar,
 }
 
+struct LaunchWorkState {
+    accepting: bool,
+    pending: usize,
+}
+
+struct LaunchWorkLifecycle {
+    state: Mutex<LaunchWorkState>,
+    idle: Condvar,
+}
+
+impl Default for LaunchWorkLifecycle {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(LaunchWorkState {
+                accepting: true,
+                pending: 0,
+            }),
+            idle: Condvar::new(),
+        }
+    }
+}
+
+impl LaunchWorkLifecycle {
+    fn register(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.accepting {
+            return false;
+        }
+        let Some(pending) = state.pending.checked_add(1) else {
+            state.accepting = false;
+            return false;
+        };
+        state.pending = pending;
+        true
+    }
+
+    fn complete(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        debug_assert!(state.pending > 0);
+        if state.pending == 0 {
+            return;
+        }
+        state.pending -= 1;
+        if state.pending == 0 {
+            self.idle.notify_all();
+        }
+    }
+
+    fn stop_accepting(&self) -> usize {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.accepting = false;
+        state.pending
+    }
+
+    fn wait_for_idle(&self, timeout: Duration) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Ok((state, _)) = self
+            .idle
+            .wait_timeout_while(state, timeout, |state| state.pending != 0)
+        else {
+            return false;
+        };
+        state.pending == 0
+    }
+}
+
+fn parse_e2e_launch_work_delay(value: Option<&OsStr>) -> io::Result<Duration> {
+    let Some(value) = value else {
+        return Ok(Duration::ZERO);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| io::Error::other("LYNX_LAUNCHER_E2E_LAUNCH_WORK_DELAY_MS must be UTF-8"))?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(io::Error::other(
+            "LYNX_LAUNCHER_E2E_LAUNCH_WORK_DELAY_MS must be an integer from 0 to 5000",
+        ));
+    }
+    let milliseconds = value.parse::<u64>().map_err(|_| {
+        io::Error::other("LYNX_LAUNCHER_E2E_LAUNCH_WORK_DELAY_MS must be an integer from 0 to 5000")
+    })?;
+    if milliseconds > MAXIMUM_E2E_LAUNCH_WORK_DELAY_MS {
+        return Err(io::Error::other(
+            "LYNX_LAUNCHER_E2E_LAUNCH_WORK_DELAY_MS must be an integer from 0 to 5000",
+        ));
+    }
+    Ok(Duration::from_millis(milliseconds))
+}
+
 impl FetcherFinalization {
     fn signal(&self) {
         let mut finalized = self
@@ -145,12 +238,15 @@ struct ViewState {
     bundle_source: Vec<u8>,
     bundle_url: CString,
     icu_path: CString,
+    launcher: Result<Launcher, String>,
     applications: Result<Vec<ApplicationSnapshot>, String>,
     wake: EventWake,
     first_screen: AtomicBool,
     received_error: AtomicBool,
     callback_failed: AtomicBool,
     fetcher_finalization: FetcherFinalization,
+    launch_work: LaunchWorkLifecycle,
+    launch_work_delay: Duration,
     native_callbacks_not_quiesced: AtomicBool,
     snapshot_trace: bool,
     injected_application_error: bool,
@@ -190,12 +286,18 @@ impl ViewState {
                 == Some(OsStr::new("1"));
         let snapshot_trace = std::env::var_os("LYNX_LAUNCHER_E2E_SNAPSHOT_TRACE").as_deref()
             == Some(OsStr::new("1"));
-        let applications = if injected_application_error {
+        let launch_work_delay = parse_e2e_launch_work_delay(
+            std::env::var_os("LYNX_LAUNCHER_E2E_LAUNCH_WORK_DELAY_MS").as_deref(),
+        )?;
+        let launcher = if injected_application_error {
             Err(INJECTED_APPLICATION_ERROR.to_owned())
         } else {
-            (|| -> Result<Vec<ApplicationSnapshot>, String> {
-                let launcher = Launcher::discover()
-                    .map_err(|error| format!("could not discover applications: {error}"))?;
+            Launcher::discover()
+                .map_err(|error| format!("could not discover applications: {error}"))
+        };
+        let mut applications = match &launcher {
+            Err(message) => Err(message.clone()),
+            Ok(launcher) => (|| -> Result<Vec<ApplicationSnapshot>, String> {
                 let mut applications = Vec::with_capacity(launcher.applications().len());
                 for application in launcher.applications() {
                     let icon_uri = launcher
@@ -212,20 +314,47 @@ impl ViewState {
                     });
                 }
                 Ok(applications)
-            })()
+            })(),
         };
+        if let Some(source_id) = std::env::var_os("LYNX_LAUNCHER_E2E_UNKNOWN_APPLICATION_ID") {
+            let source_id = source_id.to_string_lossy();
+            let snapshots = applications.as_mut().map_err(|message| {
+                io::Error::other(format!(
+                    "cannot inject an unknown application ID: {message}"
+                ))
+            })?;
+            let matching = snapshots
+                .iter()
+                .enumerate()
+                .filter_map(|(index, application)| (application.id == source_id).then_some(index))
+                .collect::<Vec<_>>();
+            let [target_index] = matching.as_slice() else {
+                let detail = if matching.is_empty() {
+                    "did not match an application"
+                } else {
+                    "matched more than one application"
+                };
+                return Err(io::Error::other(format!(
+                    "LYNX_LAUNCHER_E2E_UNKNOWN_APPLICATION_ID {detail}: {source_id}"
+                )));
+            };
+            snapshots[*target_index].id = E2E_UNKNOWN_APPLICATION_ID.to_owned();
+        }
 
         Ok(Self {
             core_source,
             bundle_source,
             bundle_url,
             icu_path,
+            launcher,
             applications,
             wake,
             first_screen: AtomicBool::new(false),
             received_error: AtomicBool::new(false),
             callback_failed: AtomicBool::new(false),
             fetcher_finalization: FetcherFinalization::default(),
+            launch_work: LaunchWorkLifecycle::default(),
+            launch_work_delay,
             native_callbacks_not_quiesced: AtomicBool::new(false),
             snapshot_trace,
             injected_application_error,
@@ -244,6 +373,21 @@ impl ViewState {
                 .store(true, Ordering::Release);
         }
         finalized
+    }
+
+    fn stop_launch_work_and_wait(&self, timeout: Duration) -> bool {
+        let pending = self.launch_work.stop_accepting();
+        if pending != 0 {
+            eprintln!("[host-rs] shutdown waiting for {pending} Launcher async work");
+        }
+        let quiesced = self.launch_work.wait_for_idle(timeout);
+        if !quiesced {
+            self.native_callbacks_not_quiesced
+                .store(true, Ordering::Release);
+        } else if pending != 0 {
+            eprintln!("[host-rs] Launcher async work quiesced during shutdown");
+        }
+        quiesced
     }
 }
 
@@ -389,6 +533,7 @@ struct GlobalUiRunnerState {
     posts_idle: Condvar,
     tasks: ScheduledQueue<AcceptedUiTask>,
     callback_failed: AtomicBool,
+    snapshot_trace: AtomicBool,
 }
 
 impl GlobalUiRunnerState {
@@ -398,10 +543,11 @@ impl GlobalUiRunnerState {
             posts_idle: Condvar::new(),
             tasks: ScheduledQueue::new(),
             callback_failed: AtomicBool::new(false),
+            snapshot_trace: AtomicBool::new(false),
         }
     }
 
-    fn activate(&self, wake: EventWake) -> io::Result<UiActivation> {
+    fn activate(&self, wake: EventWake, snapshot_trace: bool) -> io::Result<UiActivation> {
         let mut lifecycle = self
             .lifecycle
             .lock()
@@ -427,6 +573,7 @@ impl GlobalUiRunnerState {
         LYNX_LOG_CALLBACK_FAILED.store(false, Ordering::Release);
         RENDERER_CALLBACK_ENTRY_FAILED.store(false, Ordering::Release);
         self.callback_failed.store(false, Ordering::Release);
+        self.snapshot_trace.store(snapshot_trace, Ordering::Release);
         lifecycle.active_token = Some(activation.token);
         Ok(activation)
     }
@@ -471,7 +618,22 @@ impl GlobalUiRunnerState {
             generation: guard.generation,
             token: task,
         };
-        if self.tasks.push_absolute(task, target_nanos, now_nanos) && !guard.wake.wake() {
+        let runner = task.token.0.runner;
+        let task_id = task.token.0.task;
+        let deadline_nanos = target_nanos.max(now_nanos);
+        let accepted = self.tasks.push_absolute(task, target_nanos, now_nanos);
+        if self.snapshot_trace.load(Ordering::Acquire) {
+            eprintln!(
+                "[host-rs] queue ui post runner={:p} task={} target={} now={} deadline={} accepted={}",
+                runner,
+                task_id,
+                target_nanos,
+                now_nanos,
+                deadline_nanos,
+                accepted
+            );
+        }
+        if accepted && !guard.wake.wake() {
             self.callback_failed.store(true, Ordering::Release);
         }
     }
@@ -483,10 +645,20 @@ impl GlobalUiRunnerState {
             ));
         }
         let generation = self.active_generation_on_current_thread()?;
-        while let Some(task) = self.tasks.pop_due(monotonic_nanos()?) {
+        loop {
+            let now_nanos = monotonic_nanos()?;
+            let Some(task) = self.tasks.pop_due(now_nanos) else {
+                break;
+            };
             if task.generation != generation {
                 self.callback_failed.store(true, Ordering::Release);
                 return Err(io::Error::other("a UI task crossed Lynx host generations"));
+            }
+            if self.snapshot_trace.load(Ordering::Acquire) {
+                eprintln!(
+                    "[host-rs] queue ui run runner={:p} task={} now={}",
+                    task.token.0.runner, task.token.0.task, now_nanos
+                );
             }
             // SAFETY: Each accepted token is removed from the queue before it
             // is returned once to its Lynx runner.
@@ -560,6 +732,7 @@ impl GlobalUiRunnerState {
         lifecycle.draining_token = None;
         lifecycle.platform_thread = None;
         lifecycle.wake = None;
+        self.snapshot_trace.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -625,7 +798,6 @@ static GLOBAL_UI_RUNNER_CONFIGURED: OnceLock<bool> = OnceLock::new();
 static LYNX_LOG_INITIALIZED: OnceLock<()> = OnceLock::new();
 static LYNX_LOG_CALLBACK_FAILED: AtomicBool = AtomicBool::new(false);
 static RENDERER_CALLBACK_ENTRY_FAILED: AtomicBool = AtomicBool::new(false);
-
 #[cfg(test)]
 static LYNX_LOG_INITIALIZATION_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -667,6 +839,8 @@ struct RendererState {
     gl_context_stranded: AtomicBool,
     finalized: AtomicBool,
     first_present: AtomicBool,
+    text_input_active: AtomicBool,
+    snapshot_trace: bool,
 }
 
 struct RendererCallbackLifecycle {
@@ -696,7 +870,7 @@ unsafe impl Send for WindowHandle {}
 unsafe impl Sync for WindowHandle {}
 
 impl RendererState {
-    fn new(window: *mut c_void, gl: GlApi, wake: EventWake) -> Self {
+    fn new(window: *mut c_void, gl: GlApi, wake: EventWake, snapshot_trace: bool) -> Self {
         let tasks = ScheduledQueue::new();
         assert!(tasks.start_accepting());
         Self {
@@ -711,6 +885,8 @@ impl RendererState {
             gl_context_stranded: AtomicBool::new(false),
             finalized: AtomicBool::new(false),
             first_present: AtomicBool::new(false),
+            text_input_active: AtomicBool::new(false),
+            snapshot_trace,
         }
     }
 
@@ -730,6 +906,9 @@ impl RendererState {
             if owner.is_none() {
                 *owner = Some(current_thread);
             }
+            if self.snapshot_trace {
+                eprintln!("[host-rs] queue GL make-current reused");
+            }
             return true;
         }
         let mut rollback = GlContextRollback::new(self, previous);
@@ -743,6 +922,9 @@ impl RendererState {
             *owner = Some(current_thread);
         }
         rollback.disarm();
+        if self.snapshot_trace {
+            eprintln!("[host-rs] queue GL make-current acquired");
+        }
         true
     }
 
@@ -762,6 +944,9 @@ impl RendererState {
         unsafe { (self.gl.make_context_current)(std::ptr::null_mut()) };
         if unsafe { (self.gl.get_current_context)().is_null() } {
             detach.confirm();
+            if self.snapshot_trace {
+                eprintln!("[host-rs] queue GL clear-current");
+            }
             true
         } else {
             false
@@ -781,6 +966,9 @@ impl RendererState {
             return false;
         }
         unsafe { (self.gl.swap_buffers)(window) };
+        if self.snapshot_trace {
+            eprintln!("[host-rs] queue GL present");
+        }
         if !self.first_present.swap(true, Ordering::AcqRel) {
             eprintln!("[host-rs] first GL frame presented");
             let _ = self.wake.wake();
@@ -826,7 +1014,22 @@ impl RendererState {
                 return;
             }
         };
-        if self.tasks.push_after(task, interval_nanos, now_nanos) && !self.wake.wake() {
+        let deadline_nanos = now_nanos.saturating_add(interval_nanos);
+        let runner = task.0.runner;
+        let task_id = task.0.task;
+        let accepted = self.tasks.push_after(task, interval_nanos, now_nanos);
+        if self.snapshot_trace {
+            eprintln!(
+                "[host-rs] queue renderer post runner={:p} task={} interval={} now={} deadline={} accepted={}",
+                runner,
+                task_id,
+                interval_nanos,
+                now_nanos,
+                deadline_nanos,
+                accepted
+            );
+        }
+        if accepted && !self.wake.wake() {
             self.callback_failed.store(true, Ordering::Release);
         }
     }
@@ -1045,9 +1248,10 @@ fn unregister_renderer_state(
 fn activate_runtime_generation(
     ui_runner: &GlobalUiRunnerState,
     wake: EventWake,
+    snapshot_trace: bool,
 ) -> io::Result<UiActivation> {
     initialize_lynx_log_once();
-    ui_runner.activate(wake)
+    ui_runner.activate(wake, snapshot_trace)
 }
 
 fn finish_failed_initialization(
@@ -1088,9 +1292,15 @@ impl RuntimeCore {
         }
         let view_state = Arc::new(ViewState::load(view_options, wake)?);
         let ui_runner = configure_global_ui_runner()?;
-        let ui_activation = activate_runtime_generation(ui_runner, wake)?;
+        let ui_activation =
+            activate_runtime_generation(ui_runner, wake, view_state.snapshot_trace)?;
 
-        let renderer_state = Arc::new(RendererState::new(window, gl, wake));
+        let renderer_state = Arc::new(RendererState::new(
+            window,
+            gl,
+            wake,
+            view_state.snapshot_trace,
+        ));
         let user_data = Arc::as_ptr(&renderer_state).cast_mut().cast();
         // SAFETY: `renderer_state` is heap allocated before registration and
         // remains at the same address until after renderer release/finalization.
@@ -1140,6 +1350,10 @@ impl RuntimeCore {
             lynx_sys::lynx_windowless_renderer_bind_on_post_task(
                 renderer.as_ptr(),
                 Some(renderer_post_task_callback),
+            );
+            lynx_sys::lynx_windowless_renderer_bind_show_text_input(
+                renderer.as_ptr(),
+                Some(show_text_input_callback),
             );
         }
 
@@ -1254,8 +1468,8 @@ impl RuntimeCore {
                 Some(received_error_callback),
             );
             lynx_sys::lynx_view_add_client(view.as_ptr(), client.as_ptr());
-            lynx_sys::lynx_view_enter_foreground(view.as_ptr());
         }
+        self.enter_foreground()?;
 
         // SAFETY: The metadata setters synchronously retain or copy their input;
         // the bundle bytes themselves remain owned by ViewState for the view's
@@ -1289,7 +1503,17 @@ impl RuntimeCore {
     pub fn run_due_tasks(&self) -> io::Result<()> {
         self.ensure_healthy()?;
         self.ui_runner.run_due()?;
-        while let Some(task) = self.renderer_state.tasks.pop_due(monotonic_nanos()?) {
+        loop {
+            let now_nanos = monotonic_nanos()?;
+            let Some(task) = self.renderer_state.tasks.pop_due(now_nanos) else {
+                break;
+            };
+            if self.view_state.snapshot_trace {
+                eprintln!(
+                    "[host-rs] queue renderer run runner={:p} task={} now={}",
+                    task.0.runner, task.0.task, now_nanos
+                );
+            }
             if let Some(renderer) = self.renderer {
                 // SAFETY: The live renderer consumes each task after it has been
                 // removed from the queue, so the token cannot run twice.
@@ -1303,8 +1527,19 @@ impl RuntimeCore {
 
     pub fn wait_duration(&self, maximum: Duration) -> io::Result<Duration> {
         let ui_wait = self.ui_runner.wait_duration(maximum)?;
-        let renderer_wait = wait_duration(&self.renderer_state.tasks, monotonic_nanos()?, maximum);
-        Ok(ui_wait.min(renderer_wait))
+        let now_nanos = monotonic_nanos()?;
+        let renderer_wait = wait_duration(&self.renderer_state.tasks, now_nanos, maximum);
+        let wait = ui_wait.min(renderer_wait);
+        if self.view_state.snapshot_trace {
+            eprintln!(
+                "[host-rs] queue wait now={} ui-deadline={:?} renderer-deadline={:?} timeout={}",
+                now_nanos,
+                self.ui_runner.tasks.next_deadline(),
+                self.renderer_state.tasks.next_deadline(),
+                wait.as_nanos()
+            );
+        }
+        Ok(wait)
     }
 
     pub fn ensure_healthy(&self) -> io::Result<()> {
@@ -1337,6 +1572,102 @@ impl RuntimeCore {
             && self.renderer_state.first_present.load(Ordering::Acquire)
     }
 
+    pub fn send_pointer_event(&self, event: &mut LynxPointerEvent) -> io::Result<()> {
+        let renderer = self
+            .renderer
+            .ok_or_else(|| io::Error::other("Lynx renderer is not available for pointer input"))?;
+        event.timestamp = usize::try_from(monotonic_nanos()? / 1_000).unwrap_or(usize::MAX);
+        // SAFETY: The event remains live for this synchronous renderer call.
+        unsafe { lynx_sys::lynx_windowless_renderer_send_pointer_event(renderer.as_ptr(), event) };
+        Ok(())
+    }
+
+    pub fn send_key_event(&self, event: &mut LynxKeyEvent) -> io::Result<()> {
+        let renderer = self
+            .renderer
+            .ok_or_else(|| io::Error::other("Lynx renderer is not available for key input"))?;
+        event.timestamp = (monotonic_nanos()? / 1_000) as f64;
+        // SAFETY: The event and optional character remain live for this
+        // synchronous renderer call.
+        unsafe { lynx_sys::lynx_windowless_renderer_send_key_event(renderer.as_ptr(), event) };
+        Ok(())
+    }
+
+    pub fn text_input_active(&self) -> bool {
+        self.renderer_state
+            .text_input_active
+            .load(Ordering::Acquire)
+    }
+
+    pub fn cancel_text_input(&self) {
+        self.renderer_state
+            .text_input_active
+            .store(false, Ordering::Release);
+    }
+
+    pub fn enter_foreground(&self) -> io::Result<()> {
+        let view = self
+            .view
+            .ok_or_else(|| io::Error::other("Lynx view is not available for foregrounding"))?;
+        // SAFETY: RuntimeCore owns the live view.
+        unsafe { lynx_sys::lynx_view_enter_foreground(view.as_ptr()) };
+        if self.view_state.snapshot_trace {
+            eprintln!("[host-rs] view entered foreground");
+        }
+        Ok(())
+    }
+
+    pub fn enter_background(&self) -> io::Result<()> {
+        let view = self
+            .view
+            .ok_or_else(|| io::Error::other("Lynx view is not available for backgrounding"))?;
+        // SAFETY: RuntimeCore owns the live view.
+        unsafe { lynx_sys::lynx_view_enter_background(view.as_ptr()) };
+        if self.view_state.snapshot_trace {
+            eprintln!("[host-rs] view entered background");
+        }
+        Ok(())
+    }
+
+    pub fn update_view_metrics(
+        &self,
+        logical_width: f32,
+        logical_height: f32,
+        pixel_ratio: f32,
+    ) -> io::Result<()> {
+        for (label, value) in [
+            ("logical width", logical_width),
+            ("logical height", logical_height),
+            ("pixel ratio", pixel_ratio),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(io::Error::other(format!(
+                    "Lynx view {label} must be positive and finite"
+                )));
+            }
+        }
+        let view = self
+            .view
+            .ok_or_else(|| io::Error::other("Lynx view is not available for metric updates"))?;
+        // SAFETY: Both by-value shim calls synchronously update the live view.
+        unsafe {
+            lynx_sys::lynx_sys_view_update_screen_metrics(
+                view.as_ptr(),
+                logical_width,
+                logical_height,
+                pixel_ratio,
+            );
+            lynx_sys::lynx_sys_view_set_frame(
+                view.as_ptr(),
+                0.0,
+                0.0,
+                logical_width,
+                logical_height,
+            );
+        }
+        Ok(())
+    }
+
     pub fn requires_process_exit_without_glfw_cleanup(&self) -> bool {
         self.renderer_state
             .gl_context_stranded
@@ -1363,11 +1694,25 @@ impl RuntimeCore {
             return Ok(());
         }
 
+        self.cancel_text_input();
+
+        if !self
+            .view_state
+            .stop_launch_work_and_wait(LAUNCH_WORK_QUIESCENCE_TIMEOUT)
+        {
+            return Err(io::Error::other(
+                "Launcher async work did not quiesce before timeout",
+            ));
+        }
+
         if let Some(view) = self.view.take() {
             // SAFETY: The view is live and task queues still accept release work.
             unsafe {
                 lynx_sys::lynx_view_enter_background(view.as_ptr());
                 lynx_sys::lynx_view_release(view.as_ptr());
+            }
+            if self.view_state.snapshot_trace {
+                eprintln!("[host-rs] view entered background for shutdown");
             }
         }
         if let Some(client) = self.view_client.take() {
@@ -1843,43 +2188,59 @@ impl NapiPromiseSettlement {
     }
 
     unsafe fn reject(&mut self, env: NapiEnv, message: &str) -> bool {
-        if !self.deferred.is_pending() {
-            return false;
-        }
-        let mut text = std::ptr::null_mut();
-        let mut error = std::ptr::null_mut();
-        // SAFETY: The UTF-8 bytes remain live through these synchronous calls.
-        let created_error = unsafe {
-            lynx_sys::napi_create_string_utf8_weak(
-                env,
-                message.as_ptr().cast(),
-                message.len(),
-                &mut text,
-            ) == NAPI_OK
-                && lynx_sys::napi_create_error_weak(env, std::ptr::null_mut(), text, &mut error)
-                    == NAPI_OK
-        };
-        if !created_error {
-            // SAFETY: `error` is writable and receives the environment singleton.
-            let _ = unsafe { lynx_sys::napi_get_undefined_weak(env, &mut error) };
-        }
-        self.deferred.reject(
-            |deferred| {
-                // SAFETY: This owner exposes a pending deferred to exactly one
-                // reject call. A failed call permanently poisons ownership.
-                (unsafe { lynx_sys::napi_reject_deferred_weak(env, deferred, error) }) == NAPI_OK
-            },
-            || unsafe { throw_promise_settlement_failure(env) },
-        )
+        unsafe { reject_napi_deferred(env, &mut self.deferred, message) }
     }
 
     unsafe fn resolve(&mut self, env: NapiEnv, resolution: NapiValue) -> bool {
-        self.deferred.resolve(|deferred| {
-            // SAFETY: This owner removes the deferred immediately after a
-            // successful resolve, before any later operation can panic.
-            (unsafe { lynx_sys::napi_resolve_deferred_weak(env, deferred, resolution) }) == NAPI_OK
-        })
+        unsafe { resolve_napi_deferred(env, &mut self.deferred, resolution) }
     }
+}
+
+unsafe fn reject_napi_deferred(
+    env: NapiEnv,
+    settlement: &mut DeferredSettlement<NapiDeferred>,
+    message: &str,
+) -> bool {
+    if !settlement.is_pending() {
+        return false;
+    }
+    let mut text = std::ptr::null_mut();
+    let mut error = std::ptr::null_mut();
+    // SAFETY: The UTF-8 bytes remain live through these synchronous calls.
+    let created_error = unsafe {
+        lynx_sys::napi_create_string_utf8_weak(
+            env,
+            message.as_ptr().cast(),
+            message.len(),
+            &mut text,
+        ) == NAPI_OK
+            && lynx_sys::napi_create_error_weak(env, std::ptr::null_mut(), text, &mut error)
+                == NAPI_OK
+    };
+    if !created_error {
+        // SAFETY: `error` is writable and receives the environment singleton.
+        let _ = unsafe { lynx_sys::napi_get_undefined_weak(env, &mut error) };
+    }
+    settlement.reject(
+        |deferred| {
+            // SAFETY: This owner exposes a pending deferred to exactly one
+            // reject call. A failed call permanently poisons ownership.
+            (unsafe { lynx_sys::napi_reject_deferred_weak(env, deferred, error) }) == NAPI_OK
+        },
+        || unsafe { throw_promise_settlement_failure(env) },
+    )
+}
+
+unsafe fn resolve_napi_deferred(
+    env: NapiEnv,
+    settlement: &mut DeferredSettlement<NapiDeferred>,
+    resolution: NapiValue,
+) -> bool {
+    settlement.resolve(|deferred| {
+        // SAFETY: This owner removes the deferred immediately after a
+        // successful resolve, before any later operation can panic.
+        (unsafe { lynx_sys::napi_resolve_deferred_weak(env, deferred, resolution) }) == NAPI_OK
+    })
 }
 
 unsafe fn throw_promise_settlement_failure(env: NapiEnv) {
@@ -2047,9 +2408,317 @@ unsafe extern "C" fn get_applications_callback(env: NapiEnv, info: NapiCallbackI
     unsafe { settlement.callback_value(env) }
 }
 
+struct LaunchAsyncWork {
+    state: Arc<ViewState>,
+    id: String,
+    result: Option<Result<(), String>>,
+    settlement: DeferredSettlement<NapiDeferred>,
+    work: NapiAsyncWork,
+    delay: Duration,
+}
+
+impl LaunchAsyncWork {
+    fn complete_registration(&self) {
+        self.state.launch_work.complete();
+    }
+
+    fn record_delete_failure(&self) {
+        self.state
+            .native_callbacks_not_quiesced
+            .store(true, Ordering::Release);
+        let _ = self.state.wake.wake();
+    }
+}
+
+// N-API transfers exclusive access to this allocation from the JS callback to
+// execute and then completion. Execute touches only Rust-owned fields; N-API
+// handles are used only after ownership returns to the JS thread.
+unsafe impl Send for LaunchAsyncWork {}
+
+unsafe fn launch_application_inputs(
+    env: NapiEnv,
+    info: NapiCallbackInfo,
+) -> Result<(Arc<ViewState>, String), String> {
+    let mut argument_count = 2;
+    let mut arguments = [std::ptr::null_mut(); 2];
+    let mut opaque = std::ptr::null_mut();
+    // SAFETY: The argument array and callback-data output are writable for this
+    // synchronous callback-info query.
+    if unsafe {
+        lynx_sys::napi_get_cb_info_weak(
+            env,
+            info,
+            &mut argument_count,
+            arguments.as_mut_ptr(),
+            std::ptr::null_mut(),
+            &mut opaque,
+        )
+    } != NAPI_OK
+    {
+        return Err("could not read launchApplication arguments".to_owned());
+    }
+    if argument_count != 1 {
+        return Err("launchApplication requires one application id".to_owned());
+    }
+
+    let mut length = 0;
+    // SAFETY: A NULL buffer requests the UTF-8 byte length only.
+    if unsafe {
+        lynx_sys::napi_get_value_string_utf8_weak(
+            env,
+            arguments[0],
+            std::ptr::null_mut(),
+            0,
+            &mut length,
+        )
+    } != NAPI_OK
+    {
+        return Err("application id must be a string".to_owned());
+    }
+    let buffer_size = length
+        .checked_add(1)
+        .ok_or_else(|| "application id is too large".to_owned())?;
+    let mut bytes = vec![0_u8; buffer_size];
+    let mut copied = 0;
+    // SAFETY: `bytes` has `buffer_size` initialized bytes and remains live for
+    // the synchronous UTF-8 copy.
+    if unsafe {
+        lynx_sys::napi_get_value_string_utf8_weak(
+            env,
+            arguments[0],
+            bytes.as_mut_ptr().cast(),
+            buffer_size,
+            &mut copied,
+        )
+    } != NAPI_OK
+        || copied > length
+    {
+        return Err("could not read application id".to_owned());
+    }
+    bytes.truncate(copied);
+    let id = String::from_utf8(bytes)
+        .map_err(|_| "application id must contain valid UTF-8".to_owned())?;
+
+    let state = NonNull::new(opaque.cast::<ViewState>())
+        .ok_or_else(|| "launcher platform is not available".to_owned())?;
+    // SAFETY: Native module callbacks run while RuntimeCore owns the Arc that
+    // supplied this pointer. The retained reference is released with the work.
+    unsafe { Arc::increment_strong_count(state.as_ptr()) };
+    let state = unsafe { Arc::from_raw(state.as_ptr()) };
+    Ok((state, id))
+}
+
+unsafe extern "C" fn execute_launch_application(_env: NapiEnv, data: *mut c_void) {
+    let Some(mut work) = NonNull::new(data.cast::<LaunchAsyncWork>()) else {
+        return;
+    };
+    // SAFETY: N-API invokes execute once with the Box exclusively owned by the
+    // queued work; completion cannot run until execute returns.
+    let work = unsafe { work.as_mut() };
+    if !work.delay.is_zero() {
+        eprintln!(
+            "[host-rs] Launcher.launchApplication worker entered pending delay_ms={}",
+            work.delay.as_millis()
+        );
+        thread::sleep(work.delay);
+    }
+    work.result = Some(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            work.state
+                .launcher
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|launcher| launcher.launch(&work.id).map_err(|error| error.to_string()))
+        }))
+        .unwrap_or_else(|_| Err("Launcher.launchApplication worker panicked".to_owned())),
+    );
+}
+
+unsafe fn settle_launch_application(
+    env: NapiEnv,
+    status: c_int,
+    work: &mut LaunchAsyncWork,
+) -> (bool, Option<String>) {
+    let result = if status == NAPI_OK {
+        work.result
+            .take()
+            .unwrap_or_else(|| Err("launch worker completed without a result".to_owned()))
+    } else {
+        Err(format!("launch worker failed with N-API status {status}"))
+    };
+
+    match result {
+        Ok(()) => {
+            let mut undefined = std::ptr::null_mut();
+            // SAFETY: `undefined` receives the environment singleton before it
+            // is passed to this work's sole deferred owner.
+            if unsafe { lynx_sys::napi_get_undefined_weak(env, &mut undefined) } != NAPI_OK
+                || !unsafe { resolve_napi_deferred(env, &mut work.settlement, undefined) }
+            {
+                let _ = unsafe {
+                    reject_napi_deferred(
+                        env,
+                        &mut work.settlement,
+                        "could not resolve Launcher.launchApplication Promise",
+                    )
+                };
+                return (
+                    false,
+                    Some("could not resolve Launcher.launchApplication Promise".to_owned()),
+                );
+            }
+            (true, None)
+        }
+        Err(message) => {
+            let _ = unsafe { reject_napi_deferred(env, &mut work.settlement, &message) };
+            (false, Some(message))
+        }
+    }
+}
+
+unsafe extern "C" fn complete_launch_application(env: NapiEnv, status: c_int, data: *mut c_void) {
+    let Some(data) = NonNull::new(data.cast::<LaunchAsyncWork>()) else {
+        std::process::abort();
+    };
+    // SAFETY: Successful queueing transferred this Box to the exactly-once
+    // completion callback.
+    let mut work = unsafe { Box::from_raw(data.as_ptr()) };
+    let settled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        settle_launch_application(env, status, &mut work)
+    }));
+    if settled.is_err() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            reject_napi_deferred(
+                env,
+                &mut work.settlement,
+                "Launcher.launchApplication completion panicked",
+            )
+        }));
+    }
+    if work.settlement.is_pending() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            reject_napi_deferred(
+                env,
+                &mut work.settlement,
+                "Launcher.launchApplication completion did not settle",
+            )
+        }));
+    }
+
+    let (resolved, rejection) = settled.unwrap_or((false, None));
+    let handle = work.work;
+    // SAFETY: Completion owns the valid handle and deletes it exactly once
+    // before dropping its data Box.
+    if unsafe { lynx_sys::napi_delete_async_work_weak(env, handle) } != NAPI_OK {
+        work.record_delete_failure();
+        std::mem::forget(work);
+        return;
+    }
+    let _ = std::panic::catch_unwind(|| {
+        if resolved {
+            eprintln!("[host-rs] Launcher.launchApplication Promise resolved");
+        } else if let Some(message) = rejection {
+            eprintln!("[host-rs] Launcher.launchApplication Promise rejected: {message}");
+        } else {
+            eprintln!("[host-rs] Launcher.launchApplication Promise rejected");
+        }
+    });
+    work.complete_registration();
+    drop(work);
+}
+
+unsafe fn queue_launch_application(
+    env: NapiEnv,
+    state: Arc<ViewState>,
+    id: String,
+    settlement: NapiPromiseSettlement,
+) -> Result<NapiValue, (NapiPromiseSettlement, &'static str)> {
+    if !state.launch_work.register() {
+        return Err((settlement, "Launcher is shutting down"));
+    }
+    let mut resource_name = std::ptr::null_mut();
+    // SAFETY: The static resource name remains live through this synchronous
+    // conversion; N-API retains the resulting value for work creation.
+    if unsafe {
+        lynx_sys::napi_create_string_utf8_weak(
+            env,
+            c"Launcher.launchApplication".as_ptr(),
+            NAPI_AUTO_LENGTH,
+            &mut resource_name,
+        )
+    } != NAPI_OK
+    {
+        state.launch_work.complete();
+        return Err((settlement, "could not create launch async resource name"));
+    }
+
+    let NapiPromiseSettlement { deferred, promise } = settlement;
+    let delay = state.launch_work_delay;
+    let data = Box::into_raw(Box::new(LaunchAsyncWork {
+        state,
+        id,
+        result: None,
+        settlement: deferred,
+        work: std::ptr::null_mut(),
+        delay,
+    }));
+    let mut handle = std::ptr::null_mut();
+    // SAFETY: `data` stays owned by this function until queue success transfers
+    // it to completion. Both callbacks contain Rust panics.
+    if unsafe {
+        lynx_sys::napi_create_async_work_weak(
+            env,
+            std::ptr::null_mut(),
+            resource_name,
+            Some(execute_launch_application),
+            Some(complete_launch_application),
+            data.cast(),
+            &mut handle,
+        )
+    } != NAPI_OK
+    {
+        // SAFETY: Work creation failed, so N-API did not take the data pointer.
+        let data = unsafe { Box::from_raw(data) };
+        data.complete_registration();
+        return Err((
+            NapiPromiseSettlement {
+                deferred: data.settlement,
+                promise,
+            },
+            "could not create launch async work",
+        ));
+    }
+    // SAFETY: Work has not been queued, so this function still has exclusive
+    // access to the data allocation.
+    unsafe { (*data).work = handle };
+    if unsafe { lynx_sys::napi_queue_async_work_weak(env, handle) } != NAPI_OK {
+        // SAFETY: Queue failure guarantees neither callback owns `data`. The
+        // valid work handle must be deleted before reclaiming its allocation.
+        if unsafe { lynx_sys::napi_delete_async_work_weak(env, handle) } != NAPI_OK {
+            // SAFETY: The unqueued work and its data must stay allocated because
+            // the SDK did not accept deletion. Shutdown observes the retained
+            // pending registration and takes the process-fatal forget path.
+            let data = unsafe { Box::from_raw(data) };
+            data.record_delete_failure();
+            std::mem::forget(data);
+            return Ok(promise);
+        }
+        let data = unsafe { Box::from_raw(data) };
+        data.complete_registration();
+        return Err((
+            NapiPromiseSettlement {
+                deferred: data.settlement,
+                promise,
+            },
+            "could not queue launch async work",
+        ));
+    }
+    Ok(promise)
+}
+
 unsafe extern "C" fn launch_application_callback(
     env: NapiEnv,
-    _info: NapiCallbackInfo,
+    info: NapiCallbackInfo,
 ) -> NapiValue {
     let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         create_promise(env)
@@ -2057,20 +2726,29 @@ unsafe extern "C" fn launch_application_callback(
     let Ok(Some(mut settlement)) = created else {
         return std::ptr::null_mut();
     };
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        settlement.reject(
-            env,
-            "launchApplication is not implemented by the Rust host tracer",
-        )
-    }))
-    .is_err()
-    {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            settlement.reject(env, "Launcher.launchApplication callback panicked")
-        }));
+    let inputs = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        launch_application_inputs(env, info)
+    }));
+    let (state, id) = match inputs {
+        Ok(Ok(inputs)) => inputs,
+        Ok(Err(message)) => {
+            let _ = unsafe { settlement.reject(env, &message) };
+            return unsafe { settlement.callback_value(env) };
+        }
+        Err(_) => {
+            let _ =
+                unsafe { settlement.reject(env, "Launcher.launchApplication callback panicked") };
+            return unsafe { settlement.callback_value(env) };
+        }
+    };
+
+    match unsafe { queue_launch_application(env, state, id, settlement) } {
+        Ok(promise) => promise,
+        Err((mut settlement, message)) => {
+            let _ = unsafe { settlement.reject(env, message) };
+            unsafe { settlement.callback_value(env) }
+        }
     }
-    // SAFETY: The launch stub follows the same exactly-once settlement owner.
-    unsafe { settlement.callback_value(env) }
 }
 
 unsafe extern "C" fn launcher_module_creator(
@@ -2227,6 +2905,12 @@ unsafe extern "C" fn renderer_post_task_callback(
     });
 }
 
+unsafe extern "C" fn show_text_input_callback(renderer: *mut LynxWindowlessRenderer, show: bool) {
+    with_renderer_state(renderer, (), false, |state| {
+        state.text_input_active.store(show, Ordering::Release);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2361,12 +3045,15 @@ mod tests {
             bundle_source: Vec::new(),
             bundle_url: CString::new("file:///bundle").unwrap(),
             icu_path: CString::new("/icu").unwrap(),
+            launcher: Err("launcher unavailable in unit tests".to_owned()),
             applications: Ok(Vec::new()),
             wake: test_wake(),
             first_screen: AtomicBool::new(false),
             received_error: AtomicBool::new(false),
             callback_failed: AtomicBool::new(false),
             fetcher_finalization: FetcherFinalization::default(),
+            launch_work: LaunchWorkLifecycle::default(),
+            launch_work_delay: Duration::ZERO,
             native_callbacks_not_quiesced: AtomicBool::new(false),
             snapshot_trace: false,
             injected_application_error: false,
@@ -2558,6 +3245,112 @@ mod tests {
     }
 
     #[test]
+    fn async_launch_work_owns_view_state_until_completion() {
+        fn assert_send<T: Send>() {}
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send::<LaunchAsyncWork>();
+        assert_send_sync::<Launcher>();
+
+        let state = test_view_state();
+        let weak_state = Arc::downgrade(&state);
+        let work = LaunchAsyncWork {
+            state: Arc::clone(&state),
+            id: "fixture.desktop".to_owned(),
+            result: None,
+            settlement: DeferredSettlement::new(std::ptr::null_mut()),
+            work: std::ptr::null_mut(),
+            delay: Duration::ZERO,
+        };
+
+        drop(state);
+        assert!(weak_state.upgrade().is_some());
+        drop(work);
+        assert!(weak_state.upgrade().is_none());
+    }
+
+    #[test]
+    fn launch_work_shutdown_closes_registration_and_waits_for_completion() {
+        let lifecycle = Arc::new(LaunchWorkLifecycle::default());
+        assert!(lifecycle.register());
+
+        let completing = Arc::clone(&lifecycle);
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            completing.complete();
+        });
+
+        assert_eq!(lifecycle.stop_accepting(), 1);
+        assert!(lifecycle.wait_for_idle(Duration::from_secs(1)));
+        assert!(!lifecycle.register());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn launch_work_shutdown_timeout_keeps_registration_pending() {
+        let lifecycle = LaunchWorkLifecycle::default();
+        assert!(lifecycle.register());
+        assert_eq!(lifecycle.stop_accepting(), 1);
+        assert!(!lifecycle.wait_for_idle(Duration::from_millis(1)));
+        assert!(!lifecycle.register());
+        lifecycle.complete();
+        assert_eq!(lifecycle.stop_accepting(), 0);
+        assert!(lifecycle.wait_for_idle(Duration::ZERO));
+    }
+
+    #[test]
+    fn e2e_launch_work_delay_is_strict_bounded_and_disabled_by_default() {
+        assert_eq!(parse_e2e_launch_work_delay(None).unwrap(), Duration::ZERO);
+        assert_eq!(
+            parse_e2e_launch_work_delay(Some(OsStr::new("750"))).unwrap(),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            parse_e2e_launch_work_delay(Some(OsStr::new("5000"))).unwrap(),
+            Duration::from_secs(5)
+        );
+        for invalid in ["", "-1", "+1", " 1", "1 ", "1.0", "5001"] {
+            assert!(parse_e2e_launch_work_delay(Some(OsStr::new(invalid))).is_err());
+        }
+    }
+
+    #[test]
+    fn launch_worker_applies_the_pending_delay_before_platform_launch() {
+        let state = test_view_state();
+        let delay = Duration::from_millis(10);
+        let mut work = LaunchAsyncWork {
+            state,
+            id: "fixture.desktop".to_owned(),
+            result: None,
+            settlement: DeferredSettlement::new(std::ptr::null_mut()),
+            work: std::ptr::null_mut(),
+            delay,
+        };
+        let started = std::time::Instant::now();
+
+        unsafe {
+            execute_launch_application(
+                std::ptr::null_mut(),
+                (&mut work as *mut LaunchAsyncWork).cast(),
+            )
+        };
+
+        assert!(started.elapsed() >= delay);
+        assert!(matches!(work.result, Some(Err(_))));
+    }
+
+    #[test]
+    fn launch_work_timeout_latches_process_fatal_callback_ownership() {
+        let state = test_view_state();
+        assert!(state.launch_work.register());
+
+        assert!(!state.stop_launch_work_and_wait(Duration::ZERO));
+        assert!(state.native_callbacks_not_quiesced.load(Ordering::Acquire));
+        assert!(!state.launch_work.register());
+
+        state.launch_work.complete();
+    }
+
+    #[test]
     fn equal_deadlines_are_fifo_and_tokens_are_consumed_once() {
         let queue = ScheduledQueue::new();
         assert!(queue.start_accepting());
@@ -2598,11 +3391,11 @@ mod tests {
             count_wake,
         );
         let state = Arc::new(GlobalUiRunnerState::new());
-        let activation = state.activate(wake).unwrap();
+        let activation = state.activate(wake, false).unwrap();
         assert!(state.runs_on_current_thread());
 
         let other = Arc::clone(&state);
-        assert!(thread::spawn(move || other.activate(test_wake()))
+        assert!(thread::spawn(move || other.activate(test_wake(), false))
             .join()
             .unwrap()
             .unwrap_err()
@@ -2628,7 +3421,7 @@ mod tests {
     #[test]
     fn ui_draining_lease_outlives_delayed_fetcher_finalizer() {
         let state = Arc::new(GlobalUiRunnerState::new());
-        let activation = state.activate(test_wake()).unwrap();
+        let activation = state.activate(test_wake(), false).unwrap();
         let draining = state.stop_and_drain(activation).unwrap();
         let view_state = test_view_state();
         let (attempted_tx, attempted_rx) = mpsc::sync_channel(0);
@@ -2638,7 +3431,7 @@ mod tests {
         let other_view_state = Arc::clone(&view_state);
         let finalizer = thread::spawn(move || {
             attempted_tx
-                .send(other_state.activate(test_wake()).is_err())
+                .send(other_state.activate(test_wake(), false).is_err())
                 .unwrap();
             finalize_rx.recv().unwrap();
             other_view_state.fetcher_finalization.signal();
@@ -2650,11 +3443,11 @@ mod tests {
         assert!(!view_state
             .native_callbacks_not_quiesced
             .load(Ordering::Acquire));
-        assert!(state.activate(test_wake()).is_err());
+        assert!(state.activate(test_wake(), false).is_err());
 
         state.finish_deactivation(draining).unwrap();
         finalizer.join().unwrap();
-        let next = state.activate(test_wake()).unwrap();
+        let next = state.activate(test_wake(), false).unwrap();
         let next_draining = state.stop_and_drain(next).unwrap();
         state.finish_deactivation(next_draining).unwrap();
     }
@@ -2676,6 +3469,7 @@ mod tests {
                 std::ptr::dangling_mut::<c_void>(),
                 test_gl_api(),
                 test_wake(),
+                false,
             )),
             view_state,
             ui_runner: global_ui_runner(),
@@ -2696,7 +3490,7 @@ mod tests {
         LYNX_LOG_CALLBACK_FAILED.store(true, Ordering::Release);
         RENDERER_CALLBACK_ENTRY_FAILED.store(true, Ordering::Release);
 
-        let activation = activate_runtime_generation(&state, test_wake()).unwrap();
+        let activation = activate_runtime_generation(&state, test_wake(), false).unwrap();
         assert!(!state.callback_failed.load(Ordering::Acquire));
         assert!(!LYNX_LOG_CALLBACK_FAILED.load(Ordering::Acquire));
         assert!(!RENDERER_CALLBACK_ENTRY_FAILED.load(Ordering::Acquire));
@@ -2705,7 +3499,7 @@ mod tests {
         state.callback_failed.store(true, Ordering::Release);
         LYNX_LOG_CALLBACK_FAILED.store(true, Ordering::Release);
         RENDERER_CALLBACK_ENTRY_FAILED.store(true, Ordering::Release);
-        assert!(activate_runtime_generation(&state, test_wake()).is_err());
+        assert!(activate_runtime_generation(&state, test_wake(), false).is_err());
         assert!(state.callback_failed.load(Ordering::Acquire));
         assert!(LYNX_LOG_CALLBACK_FAILED.load(Ordering::Acquire));
         assert!(RENDERER_CALLBACK_ENTRY_FAILED.load(Ordering::Acquire));
@@ -2734,7 +3528,7 @@ mod tests {
 
         let owner_state = Arc::clone(&state);
         let owner = thread::spawn(move || {
-            let activation = owner_state.activate(wake).unwrap();
+            let activation = owner_state.activate(wake, false).unwrap();
             active_tx.send(activation).unwrap();
             shutdown_rx.recv().unwrap();
             let generation = owner_state.stop_and_wait_for_posts(activation).unwrap();
@@ -2783,7 +3577,7 @@ mod tests {
         state.callback_failed.store(true, Ordering::Release);
         LYNX_LOG_CALLBACK_FAILED.store(true, Ordering::Release);
         RENDERER_CALLBACK_ENTRY_FAILED.store(true, Ordering::Release);
-        assert!(activate_runtime_generation(&state, test_wake()).is_err());
+        assert!(activate_runtime_generation(&state, test_wake(), false).is_err());
         assert!(state.callback_failed.load(Ordering::Acquire));
         assert!(LYNX_LOG_CALLBACK_FAILED.load(Ordering::Acquire));
         assert!(RENDERER_CALLBACK_ENTRY_FAILED.load(Ordering::Acquire));
@@ -2791,7 +3585,7 @@ mod tests {
         done_rx.recv().unwrap();
         owner.join().unwrap();
 
-        let next = activate_runtime_generation(&state, test_wake()).unwrap();
+        let next = activate_runtime_generation(&state, test_wake(), false).unwrap();
         assert_ne!(next.token, activation.token);
         assert!(state.tasks.pop_any().is_none());
         let draining = state.stop_and_drain(next).unwrap();
@@ -2807,6 +3601,7 @@ mod tests {
             std::ptr::dangling_mut::<c_void>(),
             test_gl_api(),
             test_wake(),
+            false,
         ));
 
         assert!(state.make_current());
@@ -2845,6 +3640,7 @@ mod tests {
             std::ptr::dangling_mut::<c_void>(),
             gl,
             test_wake(),
+            false,
         ));
         let renderer = create_registered_test_renderer(&state);
 
@@ -2874,7 +3670,7 @@ mod tests {
             swap_buffers,
             get_proc_address,
         );
-        let state = Arc::new(RendererState::new(window, gl, test_wake()));
+        let state = Arc::new(RendererState::new(window, gl, test_wake(), false));
         let renderer = create_registered_test_renderer(&state);
 
         assert!(!unsafe { gl_make_current_callback(renderer.as_ptr()) });
@@ -2901,7 +3697,7 @@ mod tests {
             swap_buffers,
             get_proc_address,
         );
-        let state = Arc::new(RendererState::new(window, gl, test_wake()));
+        let state = Arc::new(RendererState::new(window, gl, test_wake(), false));
         let renderer = create_registered_test_renderer(&state);
 
         assert!(!unsafe { gl_make_current_callback(renderer.as_ptr()) });
@@ -2938,7 +3734,7 @@ mod tests {
             swap_buffers,
             get_proc_address,
         );
-        let state = Arc::new(RendererState::new(window, gl, test_wake()));
+        let state = Arc::new(RendererState::new(window, gl, test_wake(), false));
         assert!(state.make_current());
         let renderer = create_registered_test_renderer(&state);
 
@@ -2961,6 +3757,7 @@ mod tests {
             std::ptr::dangling_mut::<c_void>(),
             test_gl_api(),
             wake,
+            false,
         ));
         let renderer = create_registered_test_renderer(&state);
         let renderer_address = renderer.as_ptr() as usize;
