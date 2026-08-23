@@ -1,6 +1,6 @@
 # Complete the Remaining Native Host Migration to Rust
 
-Status: in-progress
+Status: completed
 
 > **Historical problem statement.** This statement describes the starting point
 > of the migration. As of ticket 09 the retired C++ host, the host-only support
