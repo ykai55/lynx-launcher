@@ -2,6 +2,13 @@
 
 Status: in-progress
 
+> **Historical problem statement.** This statement describes the starting point
+> of the migration. As of ticket 09 the retired C++ host, the host-only support
+> adapter, and the platform C ABI have been removed: `host-rs` is the only host,
+> and the `platform` crate is a pure rlib consumed directly through its Rust
+> interface. Statements below that reference the C++ fallback or the C ABI
+> describe the migration window and are retained for historical context only.
+
 ## Problem Statement
 
 Lynx Launcher now has a side-by-side Rust host that owns CLI handling, executable-relative runtime validation, the pinned GLFW/X11 popup window, an OpenGL shell frame, focus exit, and bounded event pumping. However, the default C++ host still owns the behavior that turns that shell into the real launcher: the process-global Lynx UI runner, deadline queues, renderer callbacks, Lynx view and resource lifecycle, input translation, clipboard and cursor integration, the `Launcher` native module, and exact teardown ordering.
@@ -72,7 +79,8 @@ The migration will remain side-by-side until parity is demonstrated. A narrow pr
 ## Implementation Decisions
 
 - The migration is staged and side-by-side; it is not a big-bang rewrite.
-- The primary product module is the existing Rust host. The C++ host remains the default adapter until all parity gates pass.
+- The primary product module is the existing Rust host. The C++ host remained
+  the default adapter until all parity gates passed and was removed by ticket 09.
 - The raw Lynx module will expose only reviewed functions, opaque handles, callback tables, enums, and layouts used by the launcher.
 - A tiny project-owned C++ shim will expose by-value wrappers for the five float-reference functions currently used by the host. The shim contains no task scheduling, resource policy, input logic, N-API behavior, or lifecycle state.
 - The first implementation stage establishes the strict Lynx ABI surface and compile/link/layout checks needed by subsequent stages.
@@ -87,9 +95,9 @@ The migration will remain side-by-side until parity is demonstrated. A narrow pr
 - The resource fetcher serves only the packaged core resource and keeps byte-preserving local file behavior.
 - The input stage migrates physical and logical key mapping, pointer, scroll, character input, focus foreground/background, window metrics, clipboard, cursor, and input cancellation without browser assumptions.
 - The native module stage binds the pinned SDK's weak N-API symbol names directly and preserves real Promise resolve/reject behavior.
-- The Rust host calls the Rust platform module directly for application snapshots, icon resolution, and launch. The platform C ABI remains compiled and tested until the C++ host is retired.
+- The Rust host calls the Rust platform module directly for application snapshots, icon resolution, and launch. The platform C ABI was compiled and tested until the C++ host was retired; as of ticket 09 the ABI, its header, and the `staticlib` crate-type are removed, and the platform crate is a pure rlib.
 - Shutdown preserves the proven order: cancel input; background and release view/client; stop accepting renderer work; drain renderer and UI work while runners are alive; release renderer, fetcher, platform state, cursors, and window resources last.
-- The default executable changes only after the Rust host passes all baseline and parity gates side-by-side. Cleanup of the old host, support adapter, and platform C ABI occurs afterward as separate work.
+- The default executable changed only after the Rust host passed all baseline and parity gates side-by-side. Cleanup of the old host, support adapter, and platform C ABI was completed as ticket 09.
 - CMake continues to own the verified Lynx SDK, pinned static GLFW, X11/OpenGL system linkage, `$ORIGIN` runtime layout, resource refresh, CTest, and the native X11 test driver.
 - Changes to the pinned SDK, patch set, gitlink, CMake removal, or window backend are separate architectural efforts.
 
@@ -123,8 +131,8 @@ The migration will remain side-by-side until parity is demonstrated. A narrow pr
 - Moving OS policy into the ReactLynx UI.
 - Expanding the resource fetcher to arbitrary filesystem or network resources.
 - Adding full IME composition, new input features, installer support, packaging formats, or desktop integration beyond existing behavior.
-- Removing the platform C ABI before the C++ baseline is retired and remaining consumers are reviewed.
-- Deleting the C++ host before side-by-side parity and default cutover are complete.
+- Removing the platform C ABI before the C++ baseline is retired and remaining consumers are reviewed. *(Historical guard; the C ABI was removed by ticket 09 after the C++ host was retired.)*
+- Deleting the C++ host before side-by-side parity and default cutover are complete. *(Historical guard; the C++ host was removed by ticket 09 after cutover.)*
 
 ## Further Notes
 

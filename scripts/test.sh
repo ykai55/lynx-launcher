@@ -40,13 +40,11 @@ ctest --test-dir "${host_build_dir}" --build-config RelWithDebInfo --output-on-f
 
 resource_host="${LYNX_LAUNCHER_RESOURCE_HOST:-rust}"
 case "${resource_host}" in
-  cpp) "${cpp_host_binary}" --check-resources ;;
   rust) "${rust_host_binary}" --check-resources ;;
-  both)
-    "${cpp_host_binary}" --check-resources
-    "${rust_host_binary}" --check-resources
+  cpp|both)
+    die "the C++ host has been retired; LYNX_LAUNCHER_RESOURCE_HOST only supports rust"
     ;;
-  *) die "LYNX_LAUNCHER_RESOURCE_HOST must be cpp, rust, or both" ;;
+  *) die "LYNX_LAUNCHER_RESOURCE_HOST must be rust" ;;
 esac
 
 case "${LYNX_LAUNCHER_SMOKE:-0}" in
@@ -63,17 +61,13 @@ case "${LYNX_LAUNCHER_SMOKE:-0}" in
     printf 'Running %s graphical first-frame smoke with timeout %s\n' \
       "${smoke_host}" "${smoke_timeout}"
     case "${smoke_host}" in
-      cpp)
-        timeout --foreground -- "${smoke_timeout}" "${cpp_host_binary}" --exit-after-first-frame
-        ;;
       rust)
         "${scripts_dir}/rust-shell-smoke.sh"
         ;;
-      both)
-        timeout --foreground -- "${smoke_timeout}" "${cpp_host_binary}" --exit-after-first-frame
-        "${scripts_dir}/rust-shell-smoke.sh"
+      cpp|both)
+        die "the C++ host has been retired; LYNX_LAUNCHER_SMOKE_HOST only supports rust"
         ;;
-      *) die "LYNX_LAUNCHER_SMOKE_HOST must be cpp, rust, or both" ;;
+      *) die "LYNX_LAUNCHER_SMOKE_HOST must be rust" ;;
     esac
     ;;
   *)

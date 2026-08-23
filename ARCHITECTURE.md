@@ -2,26 +2,26 @@
 
 ## System shape
 
-Lynx Launcher is split into three application layers around a pinned Lynx SDK:
+Lynx Launcher is split into two application layers around a pinned Lynx SDK:
 
 ```text
 ReactLynx UI (TypeScript)
         |
         | NativeModules.Launcher promises
         v
-C++ host (N-API + Lynx C API + GLFW/OpenGL)
+Rust host (N-API + Lynx C API + GLFW/OpenGL)
         |
-        | lynx_launcher.h C ABI
+        | platform Rust direct interface
         v
 Rust platform layer (XDG discovery, icons, process launch)
 ```
 
-The boundaries are deliberate. The UI has no browser DOM dependency, the C++
-host contains embedder and graphics concerns, and Rust owns operating-system
-policy and parsing. `third_party/lynx` is an implementation dependency rather
-than an application layer.
+The boundaries are deliberate. The UI has no browser DOM dependency, the Rust
+host contains embedder and graphics concerns, and the platform crate owns
+operating-system policy and parsing. `third_party/lynx` is an implementation
+dependency rather than an application layer.
 
-`host-rs/` owns the default native host. It implements the executable CLI and
+`host-rs/` owns the native host. It implements the executable CLI and
 pure host support behavior, directly
 uses the Rust platform interface for discovery, and verifies that its linked
 `lynx_log_init` symbol resolves to the staged `$ORIGIN/liblynx.so`. Its windowed
@@ -31,9 +31,8 @@ GLDirect renderer, restricted core-resource fetcher, builder, view, client, and
 load metadata with deterministic teardown. It loads the staged ReactLynx bundle
 and exposes a Promise-based application snapshot through the SDK's verified weak
 N-API symbols. Pointer, wheel, keyboard, character, focus, metric, and async
-application-launch, clipboard, cursor, and lifecycle parity are implemented.
-The C++ binary remains available as an explicit fallback until post-cutover
-cleanup completes.
+application-launch, clipboard, cursor, and lifecycle behavior are implemented
+in Rust.
 
 ## Layers
 
@@ -45,28 +44,26 @@ icons, and starts child processes. Platform-specific behavior is selected with
 Rust `cfg` gates; unsupported systems return `UnsupportedPlatform` rather than
 silently emulating Linux.
 
-`platform/src/ffi.rs` exports the stable interface in
-`platform/include/lynx_launcher.h`. The ABI uses opaque handles, explicit status
-codes, byte slices instead of NUL-terminated strings, matching destroy functions,
-and panic containment. This keeps Rust layout and allocator details out of C++.
+The platform crate is a pure rlib. It exposes the direct `Launcher` API
+(discovery, application snapshot, icon resolution, and launch) consumed by
+`host-rs`; there is no separate C ABI or static library crate-type.
 
 ### Native host
 
-`host/src/main.cc` is the temporary C++ fallback. It owns its GLFW window,
-OpenGL context, Lynx view, renderer callbacks, task queues, input translation,
-resource loading, and `Launcher` N-API module while the cutover remains
-reversible. It links the Rust platform static library and pinned Lynx shared
-library.
+`host/src/main.cc` and `host/src/support.cc` were the temporary C++ host and
+its support adapter; they were removed after the Rust host proved stable. The
+retired platform C ABI (`platform/src/ffi.rs`,
+`platform/include/lynx_launcher.h`) and its `staticlib` crate-type were removed
+with them. CMake now owns the pinned SDK, pinned GLFW, runtime staging, and
+native tests without building any C++ launcher executable.
 
-`host/src/support.cc` contains independently testable path, file, URI, and UTF-8
-operations. CMake copies `liblynx.so`, ICU data, `lynx_core.js`, and the UI bundle
-into `host/build`, allowing runtime paths to be resolved relative to the
-executable rather than the caller's current directory. Core JS is copied both to
-`resources/lynx_core.js` for the host's explicit path and to `$ORIGIN/lynx_core.js`
-for the engine preloader's default lookup.
-
-`host-rs/src/support.rs` preserves those pure path, file, URI, XSettings, scroll,
-UTF-8, key-mapping, input-bookkeeping, and window-metric semantics. `lynx-sys/`
+`host-rs/src/support.rs` holds the pure path, file, URI, XSettings, scroll,
+UTF-8, key-mapping, input-bookkeeping, and window-metric semantics. CMake copies
+`liblynx.so`, ICU data, `lynx_core.js`, and the UI bundle into `host/build`,
+allowing runtime paths to be resolved relative to the executable rather than the
+caller's current directory. Core JS is copied both to `resources/lynx_core.js`
+for the host's explicit path and to `$ORIGIN/lynx_core.js` for the engine
+preloader's default lookup. `lynx-sys/`
 contains the reviewed runtime, renderer, view/resource, and weak N-API ABI,
 strict by-value view wrappers, and dynamic-loader path probe. The Rust runtime
 tracer configures the process-global UI runner once, executes absolute UI
@@ -81,7 +78,7 @@ The binary-private Rust window module keeps `RuntimeCore`, metrics, and input in
 a stable boxed userdata object. GLFW callbacks recover only a shared reference;
 short `RefCell` borrows serialize platform-thread mutation rather than creating a
 long-lived arbitrary `&mut`. Every callback contains panics, atomically latches
-failure, wakes the loop, and requests close. Input follows the C++ USB HID and
+failure, wakes the loop, and requests close. Input follows the USB HID and
 logical-key mappings, tracks down/repeat/up, synthesizes missing key-up and
 pointer cancel/remove events, and gates UTF-8 character events on Lynx text-input
 activation. Focus loss and normal shutdown first close a one-way input-acceptance
@@ -133,32 +130,25 @@ and error state. Rspeedy produces `ui/dist/main.lynx.bundle` for the host.
 
 ### Discover and render
 
-1. The C++ host creates a Rust `LynxLauncher` while initializing the Lynx view.
+1. The Rust host discovers applications through the platform direct interface
+   while initializing the Lynx view, resolves their optional icons, and stores
+   an owned snapshot.
 2. ReactLynx calls `Launcher.getApplications()` through N-API.
-3. C++ requests an owned Rust `LynxAppList` snapshot through the C ABI.
-4. C++ reads each borrowed `LynxApplicationView`, resolves its optional icon,
-   and constructs JavaScript objects.
-5. C++ resolves a real N-API promise with the array and destroys all temporary
-   Rust handles.
-6. TypeScript validates IDs, names, icon URIs, and uniqueness before updating
+3. The host resolves a real N-API promise with the snapshot array.
+4. TypeScript validates IDs, names, icon URIs, and uniqueness before updating
    ReactLynx state.
-
-The side-by-side Rust tracer performs the same platform discovery and icon
-resolution directly before creating its view, stores an owned snapshot, and
-resolves it from `Launcher.getApplications()` without crossing the platform C
-ABI. This alternate path is not yet the default host.
 
 ### Launch
 
 1. The UI calls `Launcher.launchApplication(id)` and awaits the returned promise.
-2. The active host validates one JavaScript string as a length-delimited UTF-8 ID.
-3. The C++ host crosses the platform C ABI; the Rust host queues N-API async work
-   whose execute callback calls the retained Rust `Launcher` directly.
-4. Rust finds the previously discovered application, builds a process command
+2. The host validates one JavaScript string as a length-delimited UTF-8 ID and
+   queues N-API async work whose execute callback calls the retained Rust
+   `Launcher` directly.
+3. Rust finds the previously discovered application, builds a process command
    without a shell, and starts a named reaper thread. Launch returns after the
    reaper reports the `spawn` result; only the reaper waits for child exit.
-5. The C++ callback or Rust async completion resolves with `undefined` or rejects
-   with native detail; the UI clears pending state or displays the error.
+4. The Rust async completion resolves with `undefined` or rejects with native
+   detail; the UI clears pending state or displays the error.
 
 The test-only `LYNX_LAUNCHER_E2E_LAUNCH_WORK_DELAY_MS` gate is disabled by
 default, strictly accepts 0 through 5000 milliseconds, and delays only the Rust
@@ -185,13 +175,6 @@ shutdown ownership deterministic in E2E tests.
   the Rust view, and closes the popup. The terminal gate ignores later synthetic
   GLFW releases and focus gains. Normal shutdown also closes the gate before
   cancellation and view background/release.
-- Rust `LynxLauncher`, list, icon, and error values are opaque heap handles.
-  Every successful allocation has one matching destroy call. Slices borrowed
-  from a handle are valid only until that handle is destroyed.
-- The application list returned over the ABI is a byte-owning snapshot, so it
-  remains valid independently of the launcher's internal vector.
-- Rust panics are caught at the ABI boundary. Status-returning functions expose
-  a panic status instead of unwinding through C++.
 - The Rust shutdown gate cancels input and launch work before closing desktop
   callbacks. It then backgrounds/releases the view and client while renderer
   and UI queues can service release work, stops and drains those queues, and
@@ -244,14 +227,14 @@ process is running.
 ## Cross-platform extension points
 
 - Add operating-system discovery and launch implementations behind the Rust
-  platform `cfg` boundary while preserving the C ABI.
+  platform `cfg` boundary.
 - Add native host backends that implement the same windowless renderer, task,
   input, and runtime-resource responsibilities. The ReactLynx bundle and N-API
   module contract can remain unchanged.
 - Replace the GLFW/OpenGL adapter with another window and graphics backend
-  without moving application discovery into C++ or UI code.
-- Add native module methods by extending the C ABI first, implementing explicit
-  ownership/status semantics, then adapting them to promises at the N-API edge.
+  without moving application discovery into host or UI code.
+- Add native module methods directly in the Rust host, keeping explicit promise
+  resolve/reject semantics at the N-API edge.
 - Package target-specific SDK/runtime resources through CMake without teaching
   the UI about filesystem layout.
 
@@ -282,8 +265,9 @@ The build treats every dependency boundary as an explicit lock:
   reuse; unverified loose files under `out/Default` are never linked or copied.
 - `rust-toolchain.toml` pins Rust `1.93.0`; the root `Cargo.lock` covers
   `platform`, `lynx-sys`, and `host-rs` and is used with locked workspace
-  commands. Serial CMake Cargo rules build the platform static library before the
-  Rust tracer, avoiding concurrent writers to the shared Cargo target directory.
+  commands. Serial CMake Cargo rules build the Rust host tracer, which links the
+  `platform` rlib as a normal workspace dependency; the platform crate builds no
+  static library.
 - `.nvmrc` pins Node.js `22.14.0`. `ui/package.json` pins pnpm `10.34.5` and every
   direct package version; `ui/pnpm-lock.yaml` locks the full graph. Scripts ask
   Corepack for that exact `packageManager` value and use frozen installs.
@@ -300,8 +284,8 @@ The build treats every dependency boundary as an explicit lock:
 - Runtime resources are refreshed by an always-run target whose operations are
   content-aware `copy_if_different` calls. Correctness does not depend on source
   mtimes, while equal files avoid writes and preserve incremental efficiency.
-- Both executables use an exact `$ORIGIN` runtime search path, depend on one
-  staged `liblynx.so`, and never dynamically link GLFW. Rust check and windowed
+- The executable uses an exact `$ORIGIN` runtime search path, depends on one
+  staged `liblynx.so`, and never dynamically links GLFW. Rust check and windowed
   startup resolve bundle, core JavaScript, ICU, and Lynx relative to the
   executable, verify the actually loaded Lynx path, and reject an injected
   `LD_LIBRARY_PATH` copy even when launched from an unrelated working directory.

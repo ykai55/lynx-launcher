@@ -7,10 +7,6 @@ use std::ffi::OsString;
 #[cfg(target_os = "linux")]
 use std::process::Command;
 
-mod ffi;
-
-pub use ffi::*;
-
 #[derive(Debug)]
 pub enum Error {
     ApplicationNotFound(String),

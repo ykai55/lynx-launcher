@@ -16,12 +16,14 @@ printf 'Installing locked UI dependencies with %s\n' "${UI_PNPM[*]}"
   "${UI_PNPM[@]}" run build
 )
 
-printf 'Building the default Rust host and C++ fallback\n'
+printf 'Building the default Rust host\n'
 cmake -S "${host_dir}" -B "${host_build_dir}" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DBUILD_TESTING=ON \
   -DLYNX_SDK_DIR="${verified_sdk_dir}"
 cmake --build "${host_build_dir}" --parallel
 
-printf 'Build complete: %s (default Rust host), %s (C++ fallback)\n' \
-  "${host_binary}" "${cpp_host_binary}"
+# Remove any stale retired C++ fallback binary staged by older builds.
+rm -f -- "${host_build_dir}/lynx-launcher-cpp"
+
+printf 'Build complete: %s (default Rust host)\n' "${host_binary}"

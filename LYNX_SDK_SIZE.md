@@ -97,8 +97,8 @@ Linux shared target因此使用：
 ```
 
 Lynx 内部仍使用配套 unwinder，但 `_Unwind_*` 不再成为进程级动态 ABI。现有
-`launcher_rejects_empty_icu` CTest 覆盖该回归：host 抛出的 `std::runtime_error` 必须
-被顶层捕获并报告 `resource is empty`。
+`rust_launcher_rejects_empty_icu` CTest 覆盖该回归：host 必须拒绝空的 ICU 资源并报告
+`resource is empty`。
 
 ### Feature trimming
 
@@ -186,9 +186,9 @@ LYNX_LAUNCHER_E2E_ITERATIONS=3 ./scripts/e2e-launch.sh
 
 结果：
 
-- Rust discovery `7/7`、FFI `1/1`。
+- Rust discovery `7/7`。
 - UI `15/15`，typecheck 和 production bundle build 通过。
-- CTest `4/4`，包括 empty ICU exception regression。
+- CTest `10/10`，包括 empty ICU exception regression。
 - 首帧 GL smoke 通过。
 - popup、中文 glyph、SVG icon、搜索和启动 E2E `3/3`。
 - teardown bounded `10/10`、first-frame `10/10`。

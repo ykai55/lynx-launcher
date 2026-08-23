@@ -16,55 +16,28 @@ click_driver="${host_build_dir}/x11_click_test_driver"
 host_kind="${LYNX_LAUNCHER_E2E_HOST:-rust}"
 requested_scenario="${LYNX_LAUNCHER_E2E_SCENARIO:-}"
 
-if [[ "${host_kind}" == both ]]; then
-  case "${requested_scenario:-all}" in
-    all)
-      LYNX_LAUNCHER_E2E_HOST=cpp LYNX_LAUNCHER_E2E_SCENARIO=success "$0"
-      LYNX_LAUNCHER_E2E_HOST=cpp LYNX_LAUNCHER_E2E_SCENARIO=spawn-failure "$0"
-      LYNX_LAUNCHER_E2E_HOST=rust LYNX_LAUNCHER_E2E_SCENARIO=all "$0"
-      ;;
-    success | spawn-failure)
-      LYNX_LAUNCHER_E2E_HOST=cpp LYNX_LAUNCHER_E2E_SCENARIO="${requested_scenario}" "$0"
-      LYNX_LAUNCHER_E2E_HOST=rust LYNX_LAUNCHER_E2E_SCENARIO="${requested_scenario}" "$0"
-      ;;
-    unknown | immediate-defocus)
-      die "E2E scenario ${requested_scenario} is Rust-specific; select LYNX_LAUNCHER_E2E_HOST=rust"
-      ;;
-    *)
-      die "LYNX_LAUNCHER_E2E_SCENARIO must be success, spawn-failure, unknown, immediate-defocus, or all"
-      ;;
-  esac
-  exit 0
-fi
-
 case "${host_kind}" in
-  cpp)
-    selected_host_binary="${cpp_host_binary}"
-    host_log_prefix='[host]'
+  rust) ;;
+  cpp|both)
+    die "the C++ host has been retired; LYNX_LAUNCHER_E2E_HOST only supports rust"
     ;;
-  rust)
-    selected_host_binary="${rust_host_binary}"
-    host_log_prefix='[host-rs]'
-    ;;
-  *)
-    die "LYNX_LAUNCHER_E2E_HOST must be cpp, rust, or both"
-    ;;
+  *) die "LYNX_LAUNCHER_E2E_HOST must be rust" ;;
 esac
+
+selected_host_binary="${rust_host_binary}"
+host_log_prefix='[host-rs]'
 [[ -x "${selected_host_binary}" ]] ||
-  die "${host_kind} host is not built; run scripts/build.sh first"
+  die "Rust host is not built; run scripts/build.sh first"
 [[ -x "${click_driver}" ]] || die "X11 test driver is not built; run scripts/build.sh first"
 
 iterations="${LYNX_LAUNCHER_E2E_ITERATIONS:-1}"
 [[ "${iterations}" =~ ^[1-9][0-9]*$ ]] ||
   die "LYNX_LAUNCHER_E2E_ITERATIONS must be a positive integer"
-scenario="${LYNX_LAUNCHER_E2E_SCENARIO:-$([[ "${host_kind}" == rust ]] && printf all || printf success)}"
+scenario="${LYNX_LAUNCHER_E2E_SCENARIO:-all}"
 case "${scenario}" in
   success | spawn-failure | unknown | immediate-defocus | all) ;;
   *) die "LYNX_LAUNCHER_E2E_SCENARIO must be success, spawn-failure, unknown, immediate-defocus, or all" ;;
 esac
-if [[ "${host_kind}" != rust && ("${scenario}" == unknown || "${scenario}" == immediate-defocus || "${scenario}" == all) ]]; then
-  die "${scenario} launch E2E is only supported by the Rust host"
-fi
 
 host_pid=""
 host_identity=""
@@ -359,8 +332,7 @@ run_case() {
       dump_log
       die "launch E2E ${case_name} iteration ${iteration}: target did not start"
     }
-    if [[ "${host_kind}" == rust ]] &&
-      ! wait_for_log "${host_log_prefix} Launcher.launchApplication Promise resolved"; then
+    if ! wait_for_log "${host_log_prefix} Launcher.launchApplication Promise resolved"; then
       dump_log
       die "launch E2E ${case_name} iteration ${iteration}: Promise did not resolve"
     fi
@@ -381,8 +353,7 @@ run_case() {
     else
       expected_rejection='application not found: lynx-launcher-e2e-unknown.desktop'
     fi
-    if [[ "${host_kind}" == rust ]] &&
-      ! wait_for_log "${host_log_prefix} Launcher.launchApplication Promise rejected: ${expected_rejection}"; then
+    if ! wait_for_log "${host_log_prefix} Launcher.launchApplication Promise rejected: ${expected_rejection}"; then
       dump_log
       die "launch E2E ${case_name} iteration ${iteration}: native rejection detail was missing"
     fi
@@ -399,8 +370,8 @@ run_case() {
   assert_clean_host_log "launch E2E ${case_name} iteration ${iteration}"
   rm -rf -- "${temporary}"
   temporary=""
-  printf 'launch E2E %s %s iteration %s/%s passed\n' \
-    "${host_kind}" "${case_name}" "${iteration}" "${case_iterations}"
+  printf 'launch E2E rust %s iteration %s/%s passed\n' \
+    "${case_name}" "${iteration}" "${case_iterations}"
 }
 
 cases=("${scenario}")

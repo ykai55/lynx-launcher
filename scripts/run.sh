@@ -15,8 +15,10 @@ elif [[ "${1:-}" == --host=* ]]; then
 fi
 case "${host_kind}" in
   rust) selected_host_binary="${rust_host_binary}" ;;
-  cpp) selected_host_binary="${cpp_host_binary}" ;;
-  *) die "LYNX_LAUNCHER_HOST/--host must be rust or cpp" ;;
+  cpp|both)
+    die "the C++ host has been retired; run.sh only supports the Rust host"
+    ;;
+  *) die "LYNX_LAUNCHER_HOST/--host must be rust" ;;
 esac
 
 required_runtime=(

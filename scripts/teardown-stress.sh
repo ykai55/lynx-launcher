@@ -10,26 +10,19 @@ require_command mktemp
 require_command timeout
 
 host_kind="${LYNX_LAUNCHER_TEARDOWN_HOST:-rust}"
-if [[ "${host_kind}" == both ]]; then
-  LYNX_LAUNCHER_TEARDOWN_HOST=cpp "$0"
-  LYNX_LAUNCHER_TEARDOWN_HOST=rust "$0"
-  exit 0
-fi
-
 case "${host_kind}" in
-  cpp)
-    selected_host_binary="${cpp_host_binary}"
-    first_frame_marker='[host] first GL frame presented'
+  rust) ;;
+  cpp|both)
+    die "the C++ host has been retired; LYNX_LAUNCHER_TEARDOWN_HOST only supports rust"
     ;;
-  rust)
-    selected_host_binary="${rust_host_binary}"
-    first_frame_marker='[host-rs] first GL frame presented'
-    ;;
-  *) die "LYNX_LAUNCHER_TEARDOWN_HOST must be cpp, rust, or both" ;;
+  *) die "LYNX_LAUNCHER_TEARDOWN_HOST must be rust" ;;
 esac
 
+selected_host_binary="${rust_host_binary}"
+first_frame_marker='[host-rs] first GL frame presented'
+
 [[ -x "${selected_host_binary}" ]] ||
-  die "${host_kind} host is not built; run scripts/build.sh first"
+  die "Rust host is not built; run scripts/build.sh first"
 
 iterations="${LYNX_LAUNCHER_TEARDOWN_ITERATIONS:-10}"
 timeout_value="${LYNX_LAUNCHER_TEARDOWN_TIMEOUT:-30s}"
@@ -91,17 +84,15 @@ for ((iteration = 1; iteration <= iterations; iteration += 1)); do
     --exit-after-first-frame
 done
 
-if [[ "${host_kind}" == rust ]]; then
-  printf 'Running Rust pending-launch immediate-defocus teardown (%s iterations)\n' "${iterations}"
-  LYNX_LAUNCHER_E2E_HOST=rust \
-    LYNX_LAUNCHER_E2E_SCENARIO=immediate-defocus \
-    LYNX_LAUNCHER_E2E_IMMEDIATE_DEFOCUS_ITERATIONS="${iterations}" \
-    "${scripts_dir}/e2e-launch.sh"
+printf 'Running Rust pending-launch immediate-defocus teardown (%s iterations)\n' "${iterations}"
+LYNX_LAUNCHER_E2E_HOST=rust \
+  LYNX_LAUNCHER_E2E_SCENARIO=immediate-defocus \
+  LYNX_LAUNCHER_E2E_IMMEDIATE_DEFOCUS_ITERATIONS="${iterations}" \
+  "${scripts_dir}/e2e-launch.sh"
 
-  printf 'Running Rust cursor/clipboard desktop teardown (%s iterations)\n' "${iterations}"
-  LYNX_LAUNCHER_RUST_SHELL_ITERATIONS="${iterations}" \
-    "${scripts_dir}/rust-shell-smoke.sh"
-fi
+printf 'Running Rust cursor/clipboard desktop teardown (%s iterations)\n' "${iterations}"
+LYNX_LAUNCHER_RUST_SHELL_ITERATIONS="${iterations}" \
+  "${scripts_dir}/rust-shell-smoke.sh"
 
 printf '%s teardown stress passed: bounded=%s first-frame=%s layout_parent=%s target_missing=%s\n' \
   "${host_kind}" "${iterations}" "${iterations}" "${layout_parent_count}" "${target_missing_count}"

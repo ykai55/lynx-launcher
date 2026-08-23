@@ -5,6 +5,6 @@ edition = "2021"
 license = "Apache-2.0"
 
 [lib]
-crate-type = ["rlib", "staticlib"]
+crate-type = ["rlib"]
 
 [dependencies]

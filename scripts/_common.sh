@@ -18,7 +18,6 @@ host_dir="${repo_root}/host"
 host_build_dir="${host_dir}/build"
 host_binary="${host_build_dir}/lynx-launcher"
 rust_host_binary="${host_binary}"
-cpp_host_binary="${host_build_dir}/lynx-launcher-cpp"
 lynx_patch_relpaths=(
   "patches/lynx/0001-linux-windowless-teardown.patch"
   "patches/lynx/0002-linux-fontconfig-fallback.patch"

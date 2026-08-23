@@ -23,13 +23,13 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
-
-#include "support.h"
 
 namespace {
 
@@ -466,6 +466,99 @@ void ExpectPopup(Display* display, Window window) {
   std::cout << "window has popup-like X11 properties\n";
 }
 
+std::optional<float> XSettingsWindowScale(std::span<const uint8_t> data) {
+  if (data.size() < 12 || data[0] > 1) {
+    return std::nullopt;
+  }
+  const bool little_endian = data[0] == 0;
+  const auto read_u16 = [&](size_t offset) -> std::optional<uint16_t> {
+    if (offset > data.size() || data.size() - offset < 2) {
+      return std::nullopt;
+    }
+    if (little_endian) {
+      return static_cast<uint16_t>(data[offset]) |
+             static_cast<uint16_t>(data[offset + 1]) << 8;
+    }
+    return static_cast<uint16_t>(data[offset]) << 8 |
+           static_cast<uint16_t>(data[offset + 1]);
+  };
+  const auto read_u32 = [&](size_t offset) -> std::optional<uint32_t> {
+    if (offset > data.size() || data.size() - offset < 4) {
+      return std::nullopt;
+    }
+    uint32_t value = 0;
+    for (size_t index = 0; index < 4; ++index) {
+      const size_t shift = little_endian ? index * 8 : (3 - index) * 8;
+      value |= static_cast<uint32_t>(data[offset + index]) << shift;
+    }
+    return value;
+  };
+  const auto align_four = [&](size_t offset) -> std::optional<size_t> {
+    const size_t padding = (4 - offset % 4) % 4;
+    if (offset > data.size() || data.size() - offset < padding) {
+      return std::nullopt;
+    }
+    return offset + padding;
+  };
+
+  const auto setting_count = read_u32(8);
+  if (!setting_count) {
+    return std::nullopt;
+  }
+  size_t offset = 12;
+  for (uint32_t index = 0; index < *setting_count; ++index) {
+    const auto name_length = read_u16(offset + 2);
+    if (!name_length || offset > data.size() || data.size() - offset < 4) {
+      return std::nullopt;
+    }
+    const uint8_t type = data[offset];
+    offset += 4;
+    if (data.size() - offset < *name_length) {
+      return std::nullopt;
+    }
+    const std::string_view name(
+        reinterpret_cast<const char*>(data.data() + offset), *name_length);
+    const auto value_offset = align_four(offset + *name_length);
+    if (!value_offset || !read_u32(*value_offset)) {
+      return std::nullopt;
+    }
+    offset = *value_offset + 4;
+
+    if (type == 0) {
+      const auto value = read_u32(offset);
+      if (!value) {
+        return std::nullopt;
+      }
+      offset += 4;
+      if (name == "Gdk/WindowScalingFactor") {
+        if (*value >= 1 && *value <= 8) {
+          return static_cast<float>(*value);
+        }
+        return std::nullopt;
+      }
+    } else if (type == 1) {
+      const auto length = read_u32(offset);
+      if (!length || data.size() - offset < 4 ||
+          data.size() - (offset + 4) < *length) {
+        return std::nullopt;
+      }
+      const auto next = align_four(offset + 4 + *length);
+      if (!next) {
+        return std::nullopt;
+      }
+      offset = *next;
+    } else if (type == 2) {
+      if (offset > data.size() || data.size() - offset < 8) {
+        return std::nullopt;
+      }
+      offset += 8;
+    } else {
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
 std::optional<float> XSettingsScale(Display* display) {
   const std::string selection_name =
       "_XSETTINGS_S" + std::to_string(DefaultScreen(display));
@@ -490,7 +583,7 @@ std::optional<float> XSettingsScale(Display* display) {
   std::optional<float> scale;
   if (status == Success && actual_type == property && actual_format == 8 &&
       remaining == 0 && data) {
-    scale = launcher_host::XSettingsWindowScale(
+    scale = XSettingsWindowScale(
         std::span<const uint8_t>(data, item_count));
   }
   if (data) {
