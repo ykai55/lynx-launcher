@@ -23,7 +23,10 @@ cmake -S "${host_dir}" -B "${host_build_dir}" \
   -DLYNX_SDK_DIR="${verified_sdk_dir}"
 cmake --build "${host_build_dir}" --parallel
 
-# Remove any stale retired C++ fallback binary staged by older builds.
-rm -f -- "${host_build_dir}/lynx-launcher-cpp"
+# Remove stale artifacts from the retired C++ host and older Rust staging names.
+rm -f -- \
+  "${host_build_dir}/lynx-launcher-cpp" \
+  "${host_build_dir}/lynx-launcher-rs" \
+  "${host_build_dir}/libhost_support.a"
 
 printf 'Build complete: %s (default Rust host)\n' "${host_binary}"
