@@ -8,6 +8,10 @@ source "${launcher_root}/scripts/_common.sh"
 
 build_dir="${LYNX_LAUNCHER_HOST_BUILD_DIR:-${host_dir}/build}"
 
+if [[ "${build_dir}" == "${host_build_dir}" ]]; then
+  rm -f -- "${wayland_host_binary}"
+fi
+
 require_command cmake
 require_command cargo
 require_command ctest

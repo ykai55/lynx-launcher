@@ -17,7 +17,9 @@ use std::time::Instant;
 use lynx_launcher_host::runtime::{DesktopApi, EventWake, GlApi};
 #[cfg(not(test))]
 use lynx_launcher_host::runtime::{RuntimeCore, RuntimeViewOptions};
-use lynx_launcher_host::support::{InputState, PointerDispatch, PressedKey, WindowMetrics};
+use lynx_launcher_host::support::{
+    InputState, PointerDispatch, PressedKey, WindowMetrics, PHYSICAL_KEY_ESCAPE,
+};
 #[cfg(not(test))]
 use lynx_launcher_host::{verify_linked_lynx, WindowBackendChoice, WindowRunOptions};
 use lynx_sys::{
@@ -227,6 +229,14 @@ impl<R: RuntimeDispatch> WindowCoordinator<R> {
                 logical,
                 action,
             } => {
+                if physical == PHYSICAL_KEY_ESCAPE && action == KeyAction::Press {
+                    self.accepting_input = false;
+                    let cancel_result = self.cancel_input();
+                    let background_result = self.runtime.enter_background();
+                    eprintln!("[host-rs] Escape pressed; exiting");
+                    cancel_result.and(background_result)?;
+                    return Ok(true);
+                }
                 if self.input_trace {
                     eprintln!(
                         "[host-rs] key key={id} action={} physical={physical} logical={logical}",
@@ -695,6 +705,82 @@ mod tests {
         assert!(coordinator.dispatch(WindowEvent::Focused(false)).unwrap());
         assert_eq!(coordinator.runtime.backgrounds.get(), 1);
         assert!(!coordinator.accepting_input);
+    }
+
+    #[test]
+    fn escape_press_cancels_input_and_ignores_late_events() {
+        let mut coordinator = WindowCoordinator::new(FakeRuntime::default(), metrics(), false);
+        coordinator
+            .dispatch(WindowEvent::Key {
+                id: 30,
+                physical: 0x0007_0004,
+                logical: u64::from('a'),
+                action: KeyAction::Press,
+            })
+            .unwrap();
+        coordinator
+            .dispatch(WindowEvent::CursorEntered(true))
+            .unwrap();
+        coordinator
+            .dispatch(WindowEvent::PointerButton(PointerButton::Primary, true))
+            .unwrap();
+
+        assert!(coordinator
+            .dispatch(WindowEvent::Key {
+                id: 256,
+                physical: 0x0007_0029,
+                logical: 0x0001_0000_001b,
+                action: KeyAction::Press,
+            })
+            .unwrap());
+
+        assert_eq!(
+            *coordinator.runtime.keys.borrow(),
+            vec![LYNX_KEY_EVENT_TYPE_DOWN, LYNX_KEY_EVENT_TYPE_UP]
+        );
+        assert!(coordinator.runtime.pointers.borrow().contains(&(
+            lynx_sys::LYNX_POINTER_PHASE_CANCEL,
+            LYNX_POINTER_BUTTON_PRIMARY
+        )));
+        assert_eq!(coordinator.runtime.text_cancellations.get(), 1);
+        assert_eq!(coordinator.runtime.backgrounds.get(), 1);
+        assert!(!coordinator.accepting_input);
+
+        let dispatched_keys = coordinator.runtime.keys.borrow().len();
+        let dispatched_pointers = coordinator.runtime.pointers.borrow().len();
+        assert!(!coordinator
+            .dispatch(WindowEvent::Key {
+                id: 256,
+                physical: 0x0007_0029,
+                logical: 0x0001_0000_001b,
+                action: KeyAction::Repeat,
+            })
+            .unwrap());
+        assert!(!coordinator
+            .dispatch(WindowEvent::Key {
+                id: 256,
+                physical: 0x0007_0029,
+                logical: 0x0001_0000_001b,
+                action: KeyAction::Release,
+            })
+            .unwrap());
+        assert!(!coordinator
+            .dispatch(WindowEvent::PointerButton(PointerButton::Primary, true))
+            .unwrap());
+        assert!(!coordinator
+            .dispatch(WindowEvent::Text {
+                codepoint: u32::from('x'),
+                text: "x".into(),
+            })
+            .unwrap());
+
+        assert_eq!(coordinator.runtime.keys.borrow().len(), dispatched_keys);
+        assert_eq!(
+            coordinator.runtime.pointers.borrow().len(),
+            dispatched_pointers
+        );
+        assert_eq!(coordinator.runtime.text_cancellations.get(), 1);
+        assert_eq!(coordinator.runtime.backgrounds.get(), 1);
     }
 
     #[test]

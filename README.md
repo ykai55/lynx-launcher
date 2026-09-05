@@ -2,9 +2,9 @@
 
 Lynx Launcher 是一个 Linux 桌面应用启动器：Rust 平台层读取 XDG
 `Desktop Entry`，Rust 原生 host 通过直接 Rust 平台接口和 N-API 将数据交给
-ReactLynx，UI 负责搜索并异步发起启动。默认窗口由 GLFW/X11/OpenGL 创建；显式
-opt-in backend 可使用 native Wayland layer-shell + EGL/OpenGL。Lynx 以 windowless
-embedder 方式渲染。
+ReactLynx，UI 负责搜索并异步发起启动。运行脚本在 Wayland session 且 native Wayland
+产物可用时选择 layer-shell + EGL/OpenGL，否则选择 GLFW/X11/OpenGL。Lynx 以
+windowless embedder 方式渲染。
 
 ## 3 分钟上手
 
@@ -160,6 +160,12 @@ LYNX_LAUNCHER_BUILD_WAYLAND=1 ./scripts/build.sh
 ./host/build.sh
 ```
 
+该入口使用 canonical `host/build` 做默认 X11 增量构建时，会在构建开始前删除已有的
+`host/build-wayland/lynx-launcher-wayland`，避免 `run.sh` 的 `auto` 选择已被该流程明确
+陈旧化的 Wayland executable。通过 `LYNX_LAUNCHER_HOST_BUILD_DIR` 指定自定义或 Wayland build
+directory 时不会删除当前目标；需要恢复独立 Wayland 产物时使用
+`LYNX_LAUNCHER_BUILD_WAYLAND=1 ./scripts/build.sh`。
+
 runtime resource target 每次构建都执行 content-aware `copy_if_different`。即使切回
 mtime 更早的 verified SDK，内容也会正确刷新；相同内容不会改写。CTest 覆盖该
 older-source/newer-target 回归场景。
@@ -176,11 +182,13 @@ LYNX_LAUNCHER_WINDOW_BACKEND=wayland ./scripts/run.sh
 `run.sh` 从 executable 相对位置寻找完整 runtime，缺失时会提示先运行
 `scripts/build.sh`。`--check-resources` 不创建窗口；host 还支持 `--bundle PATH`、
 `--lynx-core PATH`、`--icu PATH`、`--run-for SECONDS`、
-`--exit-after-first-frame` 和 `--window-backend x11|wayland`。backend 默认固定为 `x11`；
-`LYNX_LAUNCHER_WINDOW_BACKEND` 只接受 `x11|wayland`，默认 `x11`。选择 `wayland` 会使用独立
-binary 并自动传入 `--window-backend wayland`；缺少对应 runtime 时会提示运行
-`LYNX_LAUNCHER_BUILD_WAYLAND=1 ./scripts/build.sh`，不会回落 X11。默认 binary 未编入 native
-Wayland，直接向其显式选择 Wayland 仍会给出明确错误。`./scripts/wayland-smoke.sh`
+`--exit-after-first-frame` 和 `--window-backend x11|wayland`。`run.sh` 的
+`LYNX_LAUNCHER_WINDOW_BACKEND` 接受 `auto|x11|wayland`，默认 `auto`：当
+`WAYLAND_DISPLAY` 非空且 `host/build-wayland/lynx-launcher-wayland` 可执行时选择 native
+Wayland，否则选择 X11。显式 `x11` 或 `wayland` 不探测、不回落；显式 Wayland 缺少对应
+runtime 时会提示运行 `LYNX_LAUNCHER_BUILD_WAYLAND=1 ./scripts/build.sh`。`run.sh` 始终替 host
+传入最终的 `--window-backend`，并拒绝用户通过 CLI 重复或覆盖选择。默认 X11 binary 未编入
+native Wayland，直接向其显式选择 Wayland 仍会给出明确错误。`./scripts/wayland-smoke.sh`
 使用独立 CMake build directory 和 Cargo feature 构建 backend，要求 `WAYLAND_DISPLAY` 与
 Niri，但会为被测进程清除 `DISPLAY`。
 
@@ -382,8 +390,8 @@ LYNX_LAUNCHER_WINDOW_BACKEND=wayland ./scripts/teardown-stress.sh
 ## 已知限制
 
 - 只有 Linux x64 已 bootstrap 并验证。
-- 默认 host 固定 `GLFW_USE_WAYLAND=OFF`，要求 X11/XWayland、`DISPLAY` 和 OpenGL 3.3；
-  native Wayland layer-shell + EGL 是显式 opt-in backend，默认 ELF 不直接依赖 `libEGL`、
+- 默认构建的 host 固定 `GLFW_USE_WAYLAND=OFF`，要求 X11/XWayland、`DISPLAY` 和 OpenGL 3.3；
+  native Wayland layer-shell + EGL 由独立构建产物提供，默认 ELF 不直接依赖 `libEGL`、
   `libwayland-client`、`libwayland-egl` 或 `libxkbcommon`。
 - XSettings 窗口缩放在启动时读取；运行中修改系统缩放需要重启 launcher，且当前 X11
   baseline 不提供逐显示器 fractional scaling。

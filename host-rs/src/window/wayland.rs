@@ -1791,6 +1791,7 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lynx_launcher_host::support::PHYSICAL_KEY_ESCAPE;
     use std::collections::VecDeque;
 
     #[test]
@@ -1877,6 +1878,7 @@ mod tests {
 
     #[test]
     fn evdev_and_keysym_translation_matches_backend_neutral_key_contract() {
+        assert_eq!(physical_key(evdev_to_glfw(1).unwrap()), PHYSICAL_KEY_ESCAPE);
         assert_eq!(evdev_to_glfw(30), Some(65));
         assert_eq!(physical_key(evdev_to_glfw(30).unwrap()), 0x0007_0004);
         assert_eq!(keysym_to_glfw(u32::from('a')), Some(65));

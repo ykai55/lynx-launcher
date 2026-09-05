@@ -19,6 +19,8 @@ pub struct PressedKey {
     pub logical: u64,
 }
 
+pub const PHYSICAL_KEY_ESCAPE: u64 = 0x0007_0029;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointerDispatch {
     pub phase: i32,
@@ -281,7 +283,7 @@ pub fn physical_key(key: i32) -> u64 {
     match key {
         KEY_0 => 0x0007_0027,
         257 => 0x0007_0028,
-        256 => 0x0007_0029,
+        256 => PHYSICAL_KEY_ESCAPE,
         259 => 0x0007_002a,
         258 => 0x0007_002b,
         32 => 0x0007_002c,
@@ -627,6 +629,7 @@ mod tests {
 
     #[test]
     fn maps_glfw_keys_to_usb_hid_and_lynx_logical_ids() {
+        assert_eq!(physical_key(256), PHYSICAL_KEY_ESCAPE);
         assert_eq!(physical_key(65), 0x0007_0004);
         assert_eq!(physical_key(90), 0x0007_001d);
         assert_eq!(physical_key(49), 0x0007_001e);

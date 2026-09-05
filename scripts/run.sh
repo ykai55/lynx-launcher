@@ -21,7 +21,19 @@ case "${host_kind}" in
   *) die "LYNX_LAUNCHER_HOST/--host must be rust" ;;
 esac
 
-window_backend="${LYNX_LAUNCHER_WINDOW_BACKEND-x11}"
+window_backend="${LYNX_LAUNCHER_WINDOW_BACKEND-auto}"
+case "${window_backend}" in
+  auto)
+    if [[ -n "${WAYLAND_DISPLAY:-}" && -x "${wayland_host_binary}" ]]; then
+      window_backend=wayland
+    else
+      window_backend=x11
+    fi
+    ;;
+  x11|wayland) ;;
+  *) die "LYNX_LAUNCHER_WINDOW_BACKEND must be auto, x11, or wayland" ;;
+esac
+
 case "${window_backend}" in
   x11)
     selected_build_dir="${host_build_dir}"
@@ -35,7 +47,6 @@ case "${window_backend}" in
     backend_arguments=(--window-backend wayland)
     build_hint="LYNX_LAUNCHER_BUILD_WAYLAND=1 ./scripts/build.sh"
     ;;
-  *) die "LYNX_LAUNCHER_WINDOW_BACKEND must be x11 or wayland" ;;
 esac
 
 for argument in "$@"; do

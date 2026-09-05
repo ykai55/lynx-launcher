@@ -73,14 +73,16 @@ Rust platform / XDG discovery / icon lookup / process launch
 | 搜索、图标、启动 E2E | `./scripts/e2e-launch.sh` |
 | 默认 X11 生命周期 stress | `./scripts/teardown-stress.sh` |
 | native Wayland 生命周期 stress | `LYNX_LAUNCHER_WINDOW_BACKEND=wayland ./scripts/teardown-stress.sh` |
-| 运行默认 X11 backend | `./scripts/run.sh` |
+| 自动选择可用 backend 运行 | `./scripts/run.sh` |
 | 运行 native Wayland backend | `LYNX_LAUNCHER_WINDOW_BACKEND=wayland ./scripts/run.sh` |
 | 无窗口 ABI/resource check | `./scripts/run.sh --check-resources` |
 | Rust popup GL shell smoke | `./scripts/rust-shell-smoke.sh` |
 | native Wayland placement/readiness smoke | `./scripts/wayland-smoke.sh` |
 
 `./host/build.sh` 仅用于已有 `ui/dist/main.lynx.bundle` 后的 host/Rust/CMake 增量构建与
-CTest；它不能代替 UI 验证。
+CTest；它不能代替 UI 验证。该脚本使用 canonical `host/build` 时会在构建开始前删除独立
+Wayland executable，防止 `run.sh auto` 选择已陈旧化的产物；自定义或 Wayland build directory
+不能删除当前目标。
 
 ## 最小验证矩阵
 
@@ -140,8 +142,8 @@ CTest；它不能代替 UI 验证。
 
 ## Rust Host 约束
 
-- `host-rs` 是唯一 host；默认 executable 是 `host/build/lynx-launcher`，由 `scripts/run.sh`、
-  X11 smoke、E2E 和 teardown 使用。
+- `host-rs` 是唯一 host；X11 executable 是 `host/build/lynx-launcher`，由 X11 smoke、E2E 和
+  teardown 使用；`scripts/run.sh` 可按环境选择它或独立 Wayland executable。
 - host 必须从 executable 相对位置读取 staged runtime，并核验 `lynx_log_init` 实际来自同目录
   的 `liblynx.so`；不能用只读资源文件冒充 native linkage 验证。
 - 默认 X11 backend 只能直链 CMake `$<TARGET_FILE:glfw>` 提供的 pinned static archive；不能使用
@@ -201,12 +203,13 @@ CTest；它不能代替 UI 验证。
 ## X11、XWayland 与 Wayland backend
 
 - 当前 CMake 明确设置 `GLFW_USE_WAYLAND=OFF`；GLDirect baseline 是 X11 OpenGL 3.3。
-- 默认 backend 仍通过 X11/XWayland 运行并要求 `DISPLAY`；默认构建不探测或链接 Wayland/EGL，
-  不能隐式切换 backend。
+- 默认构建仍只生成通过 X11/XWayland 运行并要求 `DISPLAY` 的 host，不探测或链接 Wayland/EGL。
 - `LYNX_LAUNCHER_BUILD_WAYLAND` 只接受 `0|1`；值为 `1` 时在默认产物之外构建
-  `host/build-wayland/lynx-launcher-wayland`。`LYNX_LAUNCHER_WINDOW_BACKEND` 只接受
-  `x11|wayland`，选择 Wayland 必须使用该独立产物并传 `--window-backend wayland`；缺产物、
-  无效值都失败，禁止自动探测或回落。
+  `host/build-wayland/lynx-launcher-wayland`。`scripts/run.sh` 的
+  `LYNX_LAUNCHER_WINDOW_BACKEND` 只接受 `auto|x11|wayland`，默认 `auto`；仅当
+  `WAYLAND_DISPLAY` 非空且独立 Wayland host 可执行时自动选择 Wayland，否则选择 X11。显式
+  `x11|wayland` 禁止回落，Wayland 缺产物时必须给出对应 build hint；用户不能通过 CLI
+  `--window-backend` 覆盖脚本选择。
 - `LYNX_LAUNCHER_NATIVE_WAYLAND=ON` 构建的独立 binary 才支持
   `--window-backend wayland`；该 native layer-shell/EGL backend 支持 pointer、wheel、
   xkbcommon keyboard/repeat、基础 UTF-8 text、cursor shape、真实 Lynx first frame 与 EGL

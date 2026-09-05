@@ -136,10 +136,12 @@ dimensions. This applies even when the old and new outputs report the same scale
 
 The root build keeps this boundary explicit. `scripts/build.sh` always builds the
 default X11 runtime and only adds `host/build-wayland/lynx-launcher-wayland` when
-`LYNX_LAUNCHER_BUILD_WAYLAND=1`. `scripts/run.sh` accepts only
-`LYNX_LAUNCHER_WINDOW_BACKEND=x11|wayland`, selects the corresponding staged runtime,
-and passes `--window-backend wayland` only to the Wayland binary. Missing artifacts or
-invalid selectors fail without backend detection or fallback.
+`LYNX_LAUNCHER_BUILD_WAYLAND=1`. `scripts/run.sh` accepts
+`LYNX_LAUNCHER_WINDOW_BACKEND=auto|x11|wayland` and defaults to `auto`. Auto selects the
+native Wayland runtime only when `WAYLAND_DISPLAY` is non-empty and its separate host is
+executable, otherwise it selects X11. Explicit X11 and Wayland selections remain strict;
+missing artifacts fail with the corresponding build hint. The script passes the resolved
+`--window-backend` itself and rejects CLI attempts to override it.
 
 The Rust fetcher returns only the staged core bytes for the Lynx-core resource
 type and rejects every other request. Bundle file URIs percent-encode raw Linux
