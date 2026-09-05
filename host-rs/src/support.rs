@@ -118,6 +118,10 @@ impl InputState {
 
     pub fn cancel(&mut self) -> (Vec<PressedKey>, Vec<PointerDispatch>) {
         let keys = self.pressed_keys.drain().map(|(_, key)| key).collect();
+        (keys, self.cancel_pointer())
+    }
+
+    pub fn cancel_pointer(&mut self) -> Vec<PointerDispatch> {
         let mut pointer_events = Vec::new();
         if self.pointer_buttons != 0 {
             pointer_events.extend(self.pointer_event(lynx_sys::LYNX_POINTER_PHASE_CANCEL));
@@ -127,7 +131,7 @@ impl InputState {
             pointer_events.extend(self.pointer_event(lynx_sys::LYNX_POINTER_PHASE_REMOVE));
         }
         self.pointer_inside = false;
-        (keys, pointer_events)
+        pointer_events
     }
 
     fn pointer_event(&mut self, phase: i32) -> Vec<PointerDispatch> {

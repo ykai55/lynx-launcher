@@ -27,5 +27,21 @@ fn main() {
         println!("cargo:rerun-if-changed={archive}");
     }
     println!("cargo:rerun-if-env-changed=LYNX_LAUNCHER_GLFW_ARCHIVE");
+    if env::var_os("CARGO_FEATURE_NATIVE_WAYLAND").is_some() {
+        pkg_config::Config::new()
+            .atleast_version("1.20")
+            .probe("wayland-client")
+            .expect("native Wayland requires wayland-client >= 1.20");
+        pkg_config::Config::new()
+            .probe("wayland-egl")
+            .expect("native Wayland requires wayland-egl");
+        pkg_config::Config::new()
+            .probe("egl")
+            .expect("native Wayland requires EGL");
+        pkg_config::Config::new()
+            .atleast_version("1.0")
+            .probe("xkbcommon")
+            .expect("native Wayland requires xkbcommon >= 1.0");
+    }
     println!("cargo:rerun-if-changed=build.rs");
 }

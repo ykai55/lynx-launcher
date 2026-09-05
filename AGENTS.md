@@ -15,15 +15,15 @@
 ReactLynx UI
     | NativeModules.Launcher Promise
     v
-C++ host / N-API / Lynx windowless / GLFW + OpenGL
-    | platform/include/lynx_launcher.h C ABI
+Rust host / N-API / Lynx windowless / selected OpenGL backend
+    | platform Rust direct interface
     v
 Rust platform / XDG discovery / icon lookup / process launch
 ```
 
 - Rust 拥有 Linux 应用策略、`.desktop` 解析、图标定位和进程启动。
-- C++ host 拥有 Rust ABI adapter、N-API、Lynx embedder、runtime resources、窗口、输入、
-  OpenGL 和任务队列。
+- Rust host 拥有 N-API、Lynx embedder、runtime resources、backend-neutral lifecycle、窗口、
+  输入、OpenGL 和任务队列。
 - ReactLynx UI 拥有数据验证、搜索、显示和交互状态，不拥有 OS policy。
 - `third_party/lynx/` 是 pinned implementation dependency，不是第四个应用层。
 - 详细数据流、线程和依赖锁定见 `ARCHITECTURE.md`。
@@ -33,13 +33,9 @@ Rust platform / XDG discovery / icon lookup / process launch
 | 路径 | 允许的职责 |
 | --- | --- |
 | `platform/src/lib.rs` | XDG discovery、Desktop Entry policy、Exec parser、icon lookup、launch。 |
-| `platform/src/ffi.rs` | Rust C ABI implementation、panic containment、opaque handle ownership。 |
-| `platform/include/lynx_launcher.h` | C ABI public contract；必须与 `ffi.rs` 同步。 |
-| `platform/tests/` | discovery、Exec 安全、icon 和 ABI ownership 回归。 |
-| `lynx-sys/` | 最小 Lynx raw binding、native linkage 和后续严格 C shim。 |
-| `host-rs/` | side-by-side Rust host；当前拥有 CLI、support logic、resource/link check 和 popup GL shell。 |
-| `host/src/main.cc` | Lynx/GLFW host、N-API Promise、线程、输入和 lifecycle。 |
-| `host/src/support.*` | 可独立测试的 path、file、URI、UTF-8 支持逻辑。 |
+| `platform/tests/` | discovery、Exec 安全和 icon 回归。 |
+| `lynx-sys/` | 最小 Lynx raw binding、native linkage 与严格 C++ by-value shim。 |
+| `host-rs/` | 唯一 native host；拥有 CLI、N-API、Lynx runtime、support logic、窗口 backend 与 lifecycle。 |
 | `host/tests/`、`host/cmake/` | native tests、X11 E2E driver、resource refresh checks。 |
 | `ui/src/platform.ts` | 唯一的 UI native-module boundary。 |
 | `ui/src/applications.ts` | native data validation 和纯应用列表逻辑。 |
@@ -58,8 +54,8 @@ Rust platform / XDG discovery / icon lookup / process launch
 - `third_party/lynx` 当前 gitlink 是
   `a573c3b8280180b59ca3da3e33d7a50192334cce`；该 checkout 提供 Habitat `0.3.149` 和
   pinned DEPS graph。
-- host 使用 C++20、CMake 3.16+、verified Lynx SDK、系统 fontconfig development files 和
-  pinned Lynx DEPS 中的 GLFW。
+- native build 使用 C++20 shim/tests、CMake 3.16+、verified Lynx SDK、系统 fontconfig
+  development files 和 pinned Lynx DEPS 中的 GLFW。
 - 不要让脚本运行 `sudo` 或安装系统软件包；缺依赖时报告具体 command。
 
 ## 首选根脚本
@@ -70,14 +66,18 @@ Rust platform / XDG discovery / icon lookup / process launch
 | 目的 | 命令 |
 | --- | --- |
 | 构建 pinned/patch SDK | `./scripts/bootstrap.sh` |
-| 全项目构建 | `./scripts/build.sh` |
+| 全项目默认构建 | `./scripts/build.sh` |
+| 默认构建并额外构建 native Wayland | `LYNX_LAUNCHER_BUILD_WAYLAND=1 ./scripts/build.sh` |
 | 无图形完整测试 | `./scripts/test.sh` |
 | 首帧图形测试 | `LYNX_LAUNCHER_SMOKE=1 ./scripts/test.sh` |
 | 搜索、图标、启动 E2E | `./scripts/e2e-launch.sh` |
-| 生命周期 stress | `./scripts/teardown-stress.sh` |
-| 运行 | `./scripts/run.sh` |
+| 默认 X11 生命周期 stress | `./scripts/teardown-stress.sh` |
+| native Wayland 生命周期 stress | `LYNX_LAUNCHER_WINDOW_BACKEND=wayland ./scripts/teardown-stress.sh` |
+| 运行默认 X11 backend | `./scripts/run.sh` |
+| 运行 native Wayland backend | `LYNX_LAUNCHER_WINDOW_BACKEND=wayland ./scripts/run.sh` |
 | 无窗口 ABI/resource check | `./scripts/run.sh --check-resources` |
 | Rust popup GL shell smoke | `./scripts/rust-shell-smoke.sh` |
+| native Wayland placement/readiness smoke | `./scripts/wayland-smoke.sh` |
 
 `./host/build.sh` 仅用于已有 `ui/dist/main.lynx.bundle` 后的 host/Rust/CMake 增量构建与
 CTest；它不能代替 UI 验证。
@@ -88,12 +88,13 @@ CTest；它不能代替 UI 验证。
 | --- | --- |
 | 仅 Markdown 文档 | 检查本地 links、文中 scripts/path；`git diff --check` |
 | Rust discovery、Exec、icon、launch | `./scripts/test.sh` |
-| C ABI 或 header | `./scripts/test.sh`；确认 ABI/resource check 实际执行 |
+| `lynx-sys` ABI 或 shim | `./scripts/test.sh`；确认 ABI/resource check 实际执行 |
 | UI data validation、search 纯逻辑 | `./scripts/test.sh` |
 | UI layout、input、icon rendering、launch interaction | `./scripts/test.sh`；首帧 smoke；`./scripts/e2e-launch.sh` |
-| C++ support、CMake、runtime resource copy | `./scripts/test.sh` |
+| C++ shim/native tests、CMake、runtime resource copy | `./scripts/test.sh` |
 | GLFW/input/render/task queue/lifecycle | `./scripts/test.sh`；首帧 smoke；相关 E2E；`./scripts/teardown-stress.sh` |
-| Rust GLFW/X11/OpenGL shell | `./scripts/test.sh`；`./scripts/rust-shell-smoke.sh`；C++ 首帧 smoke、E2E 和 teardown 回归。 |
+| Rust GLFW/X11/OpenGL shell | `./scripts/test.sh`；`./scripts/rust-shell-smoke.sh`；E2E 和 teardown 回归。 |
+| native Wayland layer-shell/EGL backend | `./scripts/test.sh`；`./scripts/wayland-smoke.sh`；`LYNX_LAUNCHER_WINDOW_BACKEND=wayland ./scripts/teardown-stress.sh`；核验 layer intent、Niri geometry、focus loss 与 clean shutdown。 |
 | `scripts/bootstrap.sh`、SDK provenance、gitlink、Lynx patch | `./scripts/bootstrap.sh`；`./scripts/test.sh`；首帧 smoke；`./scripts/teardown-stress.sh` |
 | E2E driver 或 process cleanup | `./scripts/e2e-launch.sh`，用 `LYNX_LAUNCHER_E2E_ITERATIONS` 重复 |
 
@@ -106,8 +107,10 @@ CTest；它不能代替 UI 验证。
   `./scripts/teardown-stress.sh`。
 - 影响 Lynx pin/patch/provenance 的改动还必须确认
   `git -C third_party/lynx status --short` 为空，HEAD 等于 parent index gitlink。
-- 没有 `DISPLAY` 时不得声称图形门禁通过；明确报告未执行项，不用 native Wayland、
-  mock 或 `--check-resources` 替代。
+- X11/XWayland 门禁要求 `DISPLAY`；native Wayland 门禁要求 `WAYLAND_DISPLAY` 和 Niri。
+  任一环境缺失时明确报告对应未执行项，不能用另一 backend、mock 或 `--check-resources` 替代。
+- Wayland teardown stress 只覆盖 bounded/first-frame 重复、禁词和 clean shutdown；它不运行也不
+  替代 X11 application E2E、cursor/clipboard shell 或真实 compositor focus-loss 门禁。
 
 ## Rust 约束
 
@@ -135,41 +138,22 @@ CTest；它不能代替 UI 验证。
 - 修改 parser 或 launch 前先阅读 `platform/tests/discovery.rs` 中的 shell-injection marker
   regression；不得通过放宽测试绕过安全约束。
 
-## Rust C ABI 约束
+## Rust Host 约束
 
-- `platform/src/ffi.rs` 与 `platform/include/lynx_launcher.h` 是一个 contract；签名、status、
-  struct layout 或 ownership 改动必须同步，并判断是否递增 `LYNX_LAUNCHER_ABI_VERSION`。
-- ABI 只暴露 `#[repr(C)]` value、opaque handles、显式 status 和 length-delimited UTF-8
-  `LynxSlice`；slice 不保证 NUL termination。
-- 每个成功分配的 launcher/list/icon/error 必须由 matching destroy function 恰好释放一次；
-  destroy 接受 NULL。borrowed slice 只活到 owner 被 destroy。
-- status-returning call 在工作前清空 output/error slot；不要覆盖仍 live 的 handle。
-- panic 必须在 ABI boundary 由 `catch_unwind` containment，绝不 unwind 进 C++。
-- C++ 消费 handle 时优先保持现有 RAII deleter；输入 string 必须按明确 length 转换。
-
-## C++ Host 约束
-
-- 不把 `.desktop` policy、XDG discovery 或 launch command construction 移入 C++。
-- `NativeModules.Launcher.getApplications()` 和 `launchApplication(id)` 返回真实 N-API
-  Promise。错误必须 reject，不要改成同步 throw/return 或吞掉 Rust status。
-- runtime paths 默认相对 executable，不能依赖 caller current directory。继续使用
-  `launcher_host` 的 file/path/URI/UTF-8 支持逻辑及其 tests。
-- resource fetcher 当前只服务 packaged local `lynx_core.js`；不要未经 provenance 验证
-  直接开放任意 filesystem/network fetch。
-- 保持 C++20 和 CMake target dependency；不要从 `third_party/lynx/out/Default` 链接 loose
-  SDK files。
-
-## Rust Host Tracer 约束
-
-- `host-rs` 当前是 side-by-side popup GL shell，不是默认 host。`scripts/run.sh`、C++ smoke、E2E
-  和 teardown 继续使用 `host/build/lynx-launcher`，直到独立 parity gate 完成。
-- tracer 必须从 executable 相对位置读取 staged runtime，并核验 `lynx_log_init` 实际来自同目录
+- `host-rs` 是唯一 host；默认 executable 是 `host/build/lynx-launcher`，由 `scripts/run.sh`、
+  X11 smoke、E2E 和 teardown 使用。
+- host 必须从 executable 相对位置读取 staged runtime，并核验 `lynx_log_init` 实际来自同目录
   的 `liblynx.so`；不能用只读资源文件冒充 native linkage 验证。
-- Rust shell 只能直链 CMake `$<TARGET_FILE:glfw>` 提供的 pinned static archive；不能使用系统
-  GLFW、crate-bundled GLFW 或 native Wayland。shell frame marker 不能冒充 Lynx first frame。
-- `lynx-sys` 只暴露已核对的窄 binding。五个 C++ float-reference wrapper 属于后续 renderer
-  阶段，必须作为严格 `extern "C"` by-value shim 落在该模块，不能硬编码 C++ reference ABI。
-- Rust host 直接使用 `platform` Rust interface；现有 C ABI 在 C++ host 移除前继续保留并测试。
+- 默认 X11 backend 只能直链 CMake `$<TARGET_FILE:glfw>` 提供的 pinned static archive；不能使用
+  系统或 crate-bundled GLFW。native Wayland backend 通过独立 feature/target 直链 Wayland/EGL/xkbcommon。
+- shell/probe frame marker 不能冒充 Lynx first frame；readiness 必须同时具备 screen layout 与
+  成功 GL present。
+- `lynx-sys` 只暴露已核对的窄 binding；C++ float-reference API 必须通过严格
+  `extern "C"` by-value shim 暴露，不能硬编码 C++ reference ABI。
+- Rust host 直接使用 `platform` Rust interface，不重新引入 platform C ABI。
+- `NativeModules.Launcher.getApplications()` 和 `launchApplication(id)` 返回真实 N-API Promise；
+  错误必须 reject，不能改成同步返回或吞掉 platform error。
+- resource fetcher 只服务 packaged local `lynx_core.js`，不得开放任意 filesystem/network fetch。
 
 ## ReactLynx 约束
 
@@ -177,7 +161,7 @@ CTest；它不能代替 UI 验证。
   component assumptions。
 - 所有 native access 保持集中在 `ui/src/platform.ts`；UI 消费前由
   `validateApplications` 验证 array、item、nonblank/unique ID、name 和 `iconUri`。
-- Native API shape 改动必须同步 `ui/src/native-modules.d.ts`、C++ N-API implementation、
+- Native API shape 改动必须同步 `ui/src/native-modules.d.ts`、Rust N-API implementation、
   validation/tests 和架构文档。
 - 搜索按 trimmed、case-insensitive application name 工作；missing/blank/failed icon 保持
   deterministic initial fallback。
@@ -214,26 +198,43 @@ CTest；它不能代替 UI 验证。
 - UI bundle 必须由 pinned pnpm/frozen lockfile 生成，再由同一 CMake resource target
   复制到 runtime。
 
-## X11 与 XWayland
+## X11、XWayland 与 Wayland backend
 
 - 当前 CMake 明确设置 `GLFW_USE_WAYLAND=OFF`；GLDirect baseline 是 X11 OpenGL 3.3。
-- Wayland desktop 只能通过 XWayland 运行，并要求 `DISPLAY`。不要声称 native Wayland
-  support，也不要只翻转 CMake switch。
-- native Wayland 需要重新验证 clipboard、IME/text input、cursor、scale、context ownership、
-  first-frame、E2E 和 teardown，属于独立架构改动。
+- 默认 backend 仍通过 X11/XWayland 运行并要求 `DISPLAY`；默认构建不探测或链接 Wayland/EGL，
+  不能隐式切换 backend。
+- `LYNX_LAUNCHER_BUILD_WAYLAND` 只接受 `0|1`；值为 `1` 时在默认产物之外构建
+  `host/build-wayland/lynx-launcher-wayland`。`LYNX_LAUNCHER_WINDOW_BACKEND` 只接受
+  `x11|wayland`，选择 Wayland 必须使用该独立产物并传 `--window-backend wayland`；缺产物、
+  无效值都失败，禁止自动探测或回落。
+- `LYNX_LAUNCHER_NATIVE_WAYLAND=ON` 构建的独立 binary 才支持
+  `--window-backend wayland`；该 native layer-shell/EGL backend 支持 pointer、wheel、
+  xkbcommon keyboard/repeat、基础 UTF-8 text、cursor shape、真实 Lynx first frame 与 EGL
+  lifecycle。不得声称 Wayland clipboard、完整 IME composition 或完整 X11 E2E parity。
+- 无 anchor overlay 必须使用 `exclusive_zone=-1`，相对完整 output 定位，不避让其他 surface
+  的正 exclusive zone。
+- layer keyboard interactivity 必须使用 `OnDemand`，让 compositor 初始聚焦 launcher，同时
+  允许普通窗口抢焦并通过 `wl_keyboard.leave` 触发 input cancellation 与 clean shutdown。
+- tracer 不支持运行期 resize/reconfigure、output migration 或 scale 变化。初始
+  `wl_surface.enter/leave` 建立多 output overlap identity 集合；event delivery 激活后进入新
+  output identity、任何 leave 或 mapped output global removal 都必须 health-fail 并 clean
+  shutdown，即使整数和 fractional scale 都未变化。
+- event delivery 激活后的任何 layer configure 同样必须 health-fail 并 clean shutdown；seat
+  capability/global removal必须按 proxy version 安全 release、产生 focus loss 并允许新 seat 绑定。
 
 ## 并发与生命周期
 
-- platform thread 创建 GLFW/Host、pump events，并运行 process-global Lynx UI runner；每个
-  process 只能有一个 active host。
-- UI tasks 和 renderer tasks 使用 mutex-protected deadline queues；跨线程 post 用
-  `glfwPostEmptyEvent` 唤醒 event loop。
+- platform thread 创建所选 window backend/Host、pump native events，并运行 process-global
+  Lynx UI runner；每个 process 只能有一个 active host。
+- UI tasks 和 renderer tasks 使用 mutex-protected deadline queues；跨线程 post 通过 backend
+  wake adapter 唤醒 event loop，X11 使用 `glfwPostEmptyEvent`，Wayland 使用 `eventfd`。
 - 第一个取得 OpenGL context 的 render thread 成为 stable owner；禁止其他 thread
   make-current、present 或 clear-current。
 - shutdown 顺序不可随意调整：cancel input；background/release view 和 client；停止接收
   renderer tasks；在 runner 仍 live 时 drain renderer/UI queues；再释放 renderer、fetcher、
-  Rust handles、cursor、window/GLFW resources。
-- 停止接收任务后不能保留或 reenter 新 work。涉及该顺序的改动必须执行 teardown stress。
+  platform/runtime owners、cursor 与所选 backend 的 window/GL resources。
+- 停止接收任务后不能保留或 reenter 新 work。涉及该顺序的改动必须对受影响 backend 执行
+  teardown stress。
 - E2E cleanup signal 前必须继续核验 executable、process group 和 process start identity，
   最后 `wait` child，避免 PID reuse 误杀。
 
@@ -262,12 +263,12 @@ post an unknown task
 LoadJSSource load js error
 ```
 
-此外，timeout、未出现 `[host] first GL frame presented`、host non-zero exit、
+此外，timeout、未出现 `[host-rs] first GL frame presented`、host non-zero exit、
 `[lynx-error ...]` 或 test command non-zero 都是失败，不能归类为已知 warning。
 
 ## 生成物与 Git
 
-- 不提交 `.build-home/`、`.logs/`、`host/build/`、`platform/target/`、`ui/node_modules/`、
+- 不提交 `.build-home/`、`.logs/`、`host/build/`、`host/build-wayland/`、`platform/target/`、`ui/node_modules/`、
   `ui/dist/`、`*.tsbuildinfo`、`quickjs_cache/` 或 submodule `out/Default` 产物。
 - `Cargo.lock`、`ui/pnpm-lock.yaml`、gitlink 和 `patches/lynx/*.patch` 是 source，不是
   cache；有意变更时保留并验证。

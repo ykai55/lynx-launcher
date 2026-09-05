@@ -44,7 +44,7 @@ unsafe extern "C" {
 #[derive(Clone, Copy)]
 pub struct EventWake {
     user_data: CallbackUserData,
-    callback: unsafe fn(*mut c_void),
+    callback: unsafe fn(*mut c_void) -> bool,
 }
 
 #[derive(Clone, Copy)]
@@ -56,7 +56,7 @@ unsafe impl Send for CallbackUserData {}
 unsafe impl Sync for CallbackUserData {}
 
 impl EventWake {
-    pub fn new(user_data: *mut c_void, callback: unsafe fn(*mut c_void)) -> Self {
+    pub fn new(user_data: *mut c_void, callback: unsafe fn(*mut c_void) -> bool) -> Self {
         Self {
             user_data: CallbackUserData(user_data),
             callback,
@@ -67,30 +67,85 @@ impl EventWake {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: The caller keeps the callback and its optional userdata
             // valid for the complete runtime registration period.
-            unsafe { (self.callback)(self.user_data.0) };
+            unsafe { (self.callback)(self.user_data.0) }
         }))
-        .is_ok()
+        .unwrap_or(false)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlContextBinding {
+    display: *mut c_void,
+    context: *mut c_void,
+    draw_surface: *mut c_void,
+    read_surface: *mut c_void,
+}
+
+impl GlContextBinding {
+    pub const fn new(
+        display: *mut c_void,
+        context: *mut c_void,
+        draw_surface: *mut c_void,
+        read_surface: *mut c_void,
+    ) -> Self {
+        Self {
+            display,
+            context,
+            draw_surface,
+            read_surface,
+        }
+    }
+
+    pub const fn empty() -> Self {
+        Self::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    }
+
+    pub const fn display(self) -> *mut c_void {
+        self.display
+    }
+
+    pub const fn context(self) -> *mut c_void {
+        self.context
+    }
+
+    pub const fn draw_surface(self) -> *mut c_void {
+        self.draw_surface
+    }
+
+    pub const fn read_surface(self) -> *mut c_void {
+        self.read_surface
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct GlApi {
-    make_context_current: unsafe fn(*mut c_void),
-    get_current_context: unsafe fn() -> *mut c_void,
-    swap_buffers: unsafe fn(*mut c_void),
+    make_render_target_current: unsafe fn(*mut c_void),
+    capture_current_binding: unsafe fn() -> GlContextBinding,
+    is_render_target_current: unsafe fn(*mut c_void) -> bool,
+    restore_binding: unsafe fn(GlContextBinding) -> bool,
+    swap_buffers: unsafe fn(*mut c_void) -> bool,
     get_proc_address: unsafe fn(*const c_char) -> *mut c_void,
 }
 
 impl GlApi {
     pub const fn new(
-        make_context_current: unsafe fn(*mut c_void),
-        get_current_context: unsafe fn() -> *mut c_void,
-        swap_buffers: unsafe fn(*mut c_void),
+        make_render_target_current: unsafe fn(*mut c_void),
+        capture_current_binding: unsafe fn() -> GlContextBinding,
+        is_render_target_current: unsafe fn(*mut c_void) -> bool,
+        restore_binding: unsafe fn(GlContextBinding) -> bool,
+        swap_buffers: unsafe fn(*mut c_void) -> bool,
         get_proc_address: unsafe fn(*const c_char) -> *mut c_void,
     ) -> Self {
         Self {
-            make_context_current,
-            get_current_context,
+            make_render_target_current,
+            capture_current_binding,
+            is_render_target_current,
+            restore_binding,
             swap_buffers,
             get_proc_address,
         }
@@ -105,6 +160,8 @@ pub struct DesktopApi {
     destroy_cursor: unsafe fn(*mut c_void),
     set_cursor: unsafe fn(*mut c_void, *mut c_void),
     set_cursor_mode: unsafe fn(*mut c_void, c_int),
+    clipboard_supported: bool,
+    cursor_supported: bool,
 }
 
 impl DesktopApi {
@@ -123,9 +180,53 @@ impl DesktopApi {
             destroy_cursor,
             set_cursor,
             set_cursor_mode,
+            clipboard_supported: true,
+            cursor_supported: true,
+        }
+    }
+
+    pub const fn unsupported() -> Self {
+        Self {
+            get_clipboard: unsupported_get_clipboard,
+            set_clipboard: unsupported_set_clipboard,
+            create_cursor: unsupported_create_cursor,
+            destroy_cursor: unsupported_destroy_cursor,
+            set_cursor: unsupported_set_cursor,
+            set_cursor_mode: unsupported_set_cursor_mode,
+            clipboard_supported: false,
+            cursor_supported: false,
+        }
+    }
+
+    pub const fn cursor_only(
+        create_cursor: unsafe fn(c_int) -> *mut c_void,
+        destroy_cursor: unsafe fn(*mut c_void),
+        set_cursor: unsafe fn(*mut c_void, *mut c_void),
+        set_cursor_mode: unsafe fn(*mut c_void, c_int),
+    ) -> Self {
+        Self {
+            get_clipboard: unsupported_get_clipboard,
+            set_clipboard: unsupported_set_clipboard,
+            create_cursor,
+            destroy_cursor,
+            set_cursor,
+            set_cursor_mode,
+            clipboard_supported: false,
+            cursor_supported: true,
         }
     }
 }
+
+unsafe fn unsupported_get_clipboard(_: *mut c_void) -> *const c_char {
+    std::ptr::null()
+}
+unsafe fn unsupported_set_clipboard(_: *mut c_void, _: *const c_char) {}
+unsafe fn unsupported_create_cursor(_: c_int) -> *mut c_void {
+    std::ptr::null_mut()
+}
+unsafe fn unsupported_destroy_cursor(_: *mut c_void) {}
+unsafe fn unsupported_set_cursor(_: *mut c_void, _: *mut c_void) {}
+unsafe fn unsupported_set_cursor_mode(_: *mut c_void, _: c_int) {}
 
 pub struct RuntimeViewOptions {
     pub bundle: PathBuf,
@@ -1008,6 +1109,9 @@ impl RendererState {
     }
 
     fn read_clipboard_on_platform(&self) -> Result<CString, ()> {
+        if !self.desktop.clipboard_supported {
+            return Err(());
+        }
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let value = unsafe { (self.desktop.get_clipboard)(self.window.0) };
             if value.is_null() {
@@ -1062,6 +1166,10 @@ impl RendererState {
     }
 
     fn set_clipboard_data(&self, value: CString) {
+        if !self.desktop.clipboard_supported {
+            self.record_callback_failure();
+            return;
+        }
         if thread::current().id() == self.platform_thread {
             unsafe { (self.desktop.set_clipboard)(self.window.0, value.as_ptr()) };
             if self.snapshot_trace {
@@ -1073,6 +1181,10 @@ impl RendererState {
     }
 
     fn activate_cursor(&self, cursor_type: c_int) {
+        if !self.desktop.cursor_supported {
+            self.record_callback_failure();
+            return;
+        }
         if thread::current().id() == self.platform_thread {
             self.activate_cursor_on_platform(cursor_type);
         } else {
@@ -1218,9 +1330,9 @@ impl RendererState {
             eprintln!("[host-rs] GL make-current rejected on a second render thread");
             return false;
         }
-        let window = self.window.0;
-        let previous = unsafe { (self.gl.get_current_context)() };
-        if previous == window {
+        let render_target = self.window.0;
+        let previous = unsafe { (self.gl.capture_current_binding)() };
+        if unsafe { (self.gl.is_render_target_current)(render_target) } {
             if owner.is_none() {
                 *owner = Some(current_thread);
             }
@@ -1230,10 +1342,10 @@ impl RendererState {
             return true;
         }
         let mut rollback = GlContextRollback::new(self, previous);
-        // SAFETY: The window and GL function table remain valid until after the
-        // renderer is released.
-        unsafe { (self.gl.make_context_current)(window) };
-        if unsafe { (self.gl.get_current_context)() } != window {
+        // SAFETY: The render target and GL function table remain valid until
+        // after the renderer is released.
+        unsafe { (self.gl.make_render_target_current)(render_target) };
+        if !unsafe { (self.gl.is_render_target_current)(render_target) } {
             return false;
         }
         if owner.is_none() {
@@ -1251,16 +1363,15 @@ impl RendererState {
             .gl_owner
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let window = self.window.0;
+        let render_target = self.window.0;
         if *owner != Some(thread::current().id())
-            || unsafe { (self.gl.get_current_context)() } != window
+            || !unsafe { (self.gl.is_render_target_current)(render_target) }
         {
             eprintln!("[host-rs] GL clear-current rejected on a non-owner thread");
             return false;
         }
         let mut detach = GlContextDetachVerification::new(self);
-        unsafe { (self.gl.make_context_current)(std::ptr::null_mut()) };
-        if unsafe { (self.gl.get_current_context)().is_null() } {
+        if unsafe { (self.gl.restore_binding)(GlContextBinding::empty()) } {
             detach.confirm();
             if self.snapshot_trace {
                 eprintln!("[host-rs] queue GL clear-current");
@@ -1276,14 +1387,17 @@ impl RendererState {
             .gl_owner
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let window = self.window.0;
+        let render_target = self.window.0;
         if *owner != Some(thread::current().id())
-            || unsafe { (self.gl.get_current_context)() } != window
+            || !unsafe { (self.gl.is_render_target_current)(render_target) }
         {
             eprintln!("[host-rs] GL present rejected without the owned context");
             return false;
         }
-        unsafe { (self.gl.swap_buffers)(window) };
+        if !unsafe { (self.gl.swap_buffers)(render_target) } {
+            self.record_callback_failure();
+            return false;
+        }
         if self.snapshot_trace {
             eprintln!("[host-rs] queue GL present");
         }
@@ -1300,7 +1414,7 @@ impl RendererState {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if *owner != Some(thread::current().id())
-            || unsafe { (self.gl.get_current_context)() } != self.window.0
+            || !unsafe { (self.gl.is_render_target_current)(self.window.0) }
             || width <= 0
             || height <= 0
         {
@@ -1445,12 +1559,12 @@ impl Drop for DesktopCallbackGuard<'_> {
 
 struct GlContextRollback<'a> {
     state: &'a RendererState,
-    previous: *mut c_void,
+    previous: GlContextBinding,
     armed: bool,
 }
 
 impl<'a> GlContextRollback<'a> {
-    fn new(state: &'a RendererState, previous: *mut c_void) -> Self {
+    fn new(state: &'a RendererState, previous: GlContextBinding) -> Self {
         Self {
             state,
             previous,
@@ -1469,10 +1583,9 @@ impl Drop for GlContextRollback<'_> {
             return;
         }
         let restored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // SAFETY: The callback's GLFW dependencies remain registered, and
-            // rollback runs synchronously on the same callback thread.
-            unsafe { (self.state.gl.make_context_current)(self.previous) };
-            (unsafe { (self.state.gl.get_current_context)() }) == self.previous
+            // SAFETY: The graphics adapter remains registered, and rollback
+            // runs synchronously on the same callback thread.
+            unsafe { (self.state.gl.restore_binding)(self.previous) }
         }))
         .unwrap_or(false);
         if !restored {
@@ -2045,7 +2158,7 @@ impl RuntimeCore {
         Ok(())
     }
 
-    pub fn requires_process_exit_without_glfw_cleanup(&self) -> bool {
+    pub fn requires_process_exit_without_native_cleanup(&self) -> bool {
         self.renderer_state
             .gl_context_stranded
             .load(Ordering::Acquire)
@@ -3346,7 +3459,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
 
-    static MAKE_CURRENT_COUNT: AtomicUsize = AtomicUsize::new(0);
     static SWAP_COUNT: AtomicUsize = AtomicUsize::new(0);
     static CURSOR_CREATE_COUNT: AtomicUsize = AtomicUsize::new(0);
     static CLIPBOARD_GET_PANIC: AtomicBool = AtomicBool::new(false);
@@ -3359,9 +3471,12 @@ mod tests {
 
     thread_local! {
         static CURRENT_CONTEXT: Cell<usize> = const { Cell::new(0) };
-        static BIND_THEN_PANIC_GET_COUNT: Cell<usize> = const { Cell::new(0) };
+        static CURRENT_DISPLAY: Cell<usize> = const { Cell::new(0) };
+        static CURRENT_DRAW_SURFACE: Cell<usize> = const { Cell::new(0) };
+        static CURRENT_READ_SURFACE: Cell<usize> = const { Cell::new(0) };
+        static RENDER_TARGET_CHECK_COUNT: Cell<usize> = const { Cell::new(0) };
         static TRANSACTION_MAKE_COUNT: Cell<usize> = const { Cell::new(0) };
-        static VERIFICATION_GET_COUNT: Cell<usize> = const { Cell::new(0) };
+        static MAKE_CURRENT_COUNT: Cell<usize> = const { Cell::new(0) };
     }
 
     struct BlockingWake {
@@ -3380,14 +3495,21 @@ mod tests {
         }
     }
 
-    unsafe fn count_wake(counter: *mut c_void) {
+    unsafe fn count_wake(counter: *mut c_void) -> bool {
         // SAFETY: The test retains this AtomicUsize through the activation.
         unsafe { &*counter.cast::<AtomicUsize>() }.fetch_add(1, Ordering::AcqRel);
+        true
     }
 
-    unsafe fn ignore_wake(_: *mut c_void) {}
+    unsafe fn ignore_wake(_: *mut c_void) -> bool {
+        true
+    }
 
-    unsafe fn blocking_wake(state: *mut c_void) {
+    unsafe fn fail_wake(_: *mut c_void) -> bool {
+        false
+    }
+
+    unsafe fn blocking_wake(state: *mut c_void) -> bool {
         // SAFETY: Each test retains this boxed state until its callback exits.
         let state = unsafe { &*state.cast::<BlockingWake>() };
         state.entered.send(()).unwrap();
@@ -3401,19 +3523,56 @@ mod tests {
                 .wait_while(released, |released| !*released)
                 .unwrap_or_else(|error| error.into_inner()),
         );
+        true
     }
 
     unsafe fn make_context_current(window: *mut c_void) {
-        MAKE_CURRENT_COUNT.fetch_add(1, Ordering::AcqRel);
-        CURRENT_CONTEXT.set(window as usize);
+        MAKE_CURRENT_COUNT.set(MAKE_CURRENT_COUNT.get() + 1);
+        set_current_binding(GlContextBinding::new(
+            std::ptr::null_mut(),
+            window,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ));
     }
 
-    unsafe fn get_current_context() -> *mut c_void {
-        CURRENT_CONTEXT.get() as *mut c_void
+    fn current_binding() -> GlContextBinding {
+        GlContextBinding::new(
+            CURRENT_DISPLAY.get() as *mut c_void,
+            CURRENT_CONTEXT.get() as *mut c_void,
+            CURRENT_DRAW_SURFACE.get() as *mut c_void,
+            CURRENT_READ_SURFACE.get() as *mut c_void,
+        )
     }
 
-    unsafe fn swap_buffers(_: *mut c_void) {
+    fn set_current_binding(binding: GlContextBinding) {
+        CURRENT_DISPLAY.set(binding.display() as usize);
+        CURRENT_CONTEXT.set(binding.context() as usize);
+        CURRENT_DRAW_SURFACE.set(binding.draw_surface() as usize);
+        CURRENT_READ_SURFACE.set(binding.read_surface() as usize);
+    }
+
+    unsafe fn capture_current_binding() -> GlContextBinding {
+        current_binding()
+    }
+
+    unsafe fn restore_binding(binding: GlContextBinding) -> bool {
+        MAKE_CURRENT_COUNT.set(MAKE_CURRENT_COUNT.get() + 1);
+        set_current_binding(binding);
+        current_binding() == binding
+    }
+
+    unsafe fn is_render_target_current(render_target: *mut c_void) -> bool {
+        CURRENT_CONTEXT.get() == render_target as usize
+    }
+
+    unsafe fn swap_buffers(_: *mut c_void) -> bool {
         SWAP_COUNT.fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
+    unsafe fn fail_swap_buffers(_: *mut c_void) -> bool {
+        false
     }
 
     unsafe fn get_proc_address(_: *const c_char) -> *mut c_void {
@@ -3463,50 +3622,77 @@ mod tests {
     }
 
     unsafe fn bind_context(window: *mut c_void) {
-        CURRENT_CONTEXT.set(window as usize);
+        set_current_binding(GlContextBinding::new(
+            std::ptr::null_mut(),
+            window,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ));
     }
 
-    unsafe fn get_context_after_bind_then_panic() -> *mut c_void {
-        let call = BIND_THEN_PANIC_GET_COUNT.get() + 1;
-        BIND_THEN_PANIC_GET_COUNT.set(call);
+    unsafe fn is_render_target_current_then_panic(_: *mut c_void) -> bool {
+        let call = RENDER_TARGET_CHECK_COUNT.get() + 1;
+        RENDER_TARGET_CHECK_COUNT.set(call);
         if call == 2 {
             panic!("controlled panic after binding the GL context");
         }
-        CURRENT_CONTEXT.get() as *mut c_void
+        false
     }
 
-    unsafe fn panic_before_bind() -> *mut c_void {
+    unsafe fn panic_during_binding_capture() -> GlContextBinding {
         panic!("controlled panic before binding the GL context");
     }
 
     unsafe fn counted_bind_context(window: *mut c_void) {
         TRANSACTION_MAKE_COUNT.set(TRANSACTION_MAKE_COUNT.get() + 1);
-        CURRENT_CONTEXT.set(window as usize);
+        bind_context(window);
     }
 
-    unsafe fn bind_context_but_fail_restore(window: *mut c_void) {
-        let call = TRANSACTION_MAKE_COUNT.get() + 1;
-        TRANSACTION_MAKE_COUNT.set(call);
-        if call == 1 {
-            CURRENT_CONTEXT.set(window as usize);
-        }
+    unsafe fn bind_counted_context(window: *mut c_void) {
+        TRANSACTION_MAKE_COUNT.set(TRANSACTION_MAKE_COUNT.get() + 1);
+        bind_context(window);
     }
 
-    unsafe fn leave_context_attached(_: *mut c_void) {}
+    unsafe fn fail_restore_binding(_: GlContextBinding) -> bool {
+        TRANSACTION_MAKE_COUNT.set(TRANSACTION_MAKE_COUNT.get() + 1);
+        false
+    }
 
-    unsafe fn fail_bind_verification_then_report_current() -> *mut c_void {
-        let call = VERIFICATION_GET_COUNT.get() + 1;
-        VERIFICATION_GET_COUNT.set(call);
-        if call == 2 {
-            return std::ptr::null_mut();
-        }
-        CURRENT_CONTEXT.get() as *mut c_void
+    unsafe fn render_target_not_current(_: *mut c_void) -> bool {
+        false
+    }
+
+    unsafe fn make_distinct_context_current(render_target: *mut c_void) {
+        MAKE_CURRENT_COUNT.set(MAKE_CURRENT_COUNT.get() + 1);
+        set_current_binding(if render_target.is_null() {
+            GlContextBinding::empty()
+        } else {
+            GlContextBinding::new(
+                (render_target as usize + 4) as *mut c_void,
+                (render_target as usize + 1) as *mut c_void,
+                (render_target as usize + 2) as *mut c_void,
+                (render_target as usize + 3) as *mut c_void,
+            )
+        });
+    }
+
+    unsafe fn is_distinct_render_target_current(render_target: *mut c_void) -> bool {
+        !render_target.is_null()
+            && current_binding()
+                == GlContextBinding::new(
+                    (render_target as usize + 4) as *mut c_void,
+                    (render_target as usize + 1) as *mut c_void,
+                    (render_target as usize + 2) as *mut c_void,
+                    (render_target as usize + 3) as *mut c_void,
+                )
     }
 
     fn test_gl_api() -> GlApi {
         GlApi::new(
             make_context_current,
-            get_current_context,
+            capture_current_binding,
+            is_render_target_current,
+            restore_binding,
             swap_buffers,
             get_proc_address,
         )
@@ -3965,7 +4151,7 @@ mod tests {
             ui_activation: None,
             _thread_bound: PhantomData,
         };
-        assert!(runtime.requires_process_exit_without_glfw_cleanup());
+        assert!(runtime.requires_process_exit_without_native_cleanup());
         assert!(runtime.native_callbacks_not_quiesced());
     }
 
@@ -4211,6 +4397,29 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_desktop_operations_latch_failure_instead_of_reporting_success() {
+        let state = RendererState::new(
+            std::ptr::dangling_mut::<c_void>(),
+            test_gl_api(),
+            DesktopApi::unsupported(),
+            test_wake(),
+            false,
+        );
+
+        let value = state.clipboard_data();
+        assert!(unsafe { CStr::from_ptr(value) }.to_bytes().is_empty());
+        assert!(state.callback_failed.load(Ordering::Acquire));
+
+        state.callback_failed.store(false, Ordering::Release);
+        state.set_clipboard_data(CString::new("value").unwrap());
+        assert!(state.callback_failed.load(Ordering::Acquire));
+
+        state.callback_failed.store(false, Ordering::Release);
+        state.activate_cursor(lynx_sys::LYNX_CURSOR_TYPE_CLICK);
+        assert!(state.callback_failed.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn clipboard_bytes_and_cursor_fallback_match_the_cpp_host() {
         let _guard = GLOBAL_HEALTH_TEST_LOCK
             .lock()
@@ -4295,9 +4504,9 @@ mod tests {
 
     #[test]
     fn first_successful_render_thread_remains_the_gl_owner() {
-        MAKE_CURRENT_COUNT.store(0, Ordering::Release);
+        MAKE_CURRENT_COUNT.set(0);
         SWAP_COUNT.store(0, Ordering::Release);
-        CURRENT_CONTEXT.set(0);
+        set_current_binding(GlContextBinding::empty());
         let state = Arc::new(RendererState::new(
             std::ptr::dangling_mut::<c_void>(),
             test_gl_api(),
@@ -4307,7 +4516,7 @@ mod tests {
         ));
 
         assert!(state.make_current());
-        assert_eq!(MAKE_CURRENT_COUNT.load(Ordering::Acquire), 1);
+        assert_eq!(MAKE_CURRENT_COUNT.get(), 1);
         assert!(state.present());
         assert_eq!(SWAP_COUNT.load(Ordering::Acquire), 1);
         assert!(state.clear_current());
@@ -4320,7 +4529,7 @@ mod tests {
         })
         .join()
         .unwrap());
-        assert_eq!(MAKE_CURRENT_COUNT.load(Ordering::Acquire), 2);
+        assert_eq!(MAKE_CURRENT_COUNT.get(), 2);
 
         assert!(state.make_current());
         assert!(state.present());
@@ -4329,12 +4538,89 @@ mod tests {
     }
 
     #[test]
-    fn make_current_callback_restores_null_after_bind_then_panic() {
-        CURRENT_CONTEXT.set(0);
-        BIND_THEN_PANIC_GET_COUNT.set(0);
+    fn failed_swap_does_not_report_a_first_present() {
+        let mut render_target = 0_u8;
+        let render_target = (&mut render_target as *mut u8).cast();
+        set_current_binding(GlContextBinding::new(
+            std::ptr::null_mut(),
+            render_target,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ));
+        let state = RendererState::new(
+            render_target,
+            GlApi::new(
+                make_context_current,
+                capture_current_binding,
+                is_render_target_current,
+                restore_binding,
+                fail_swap_buffers,
+                get_proc_address,
+            ),
+            test_desktop_api(),
+            test_wake(),
+            false,
+        );
+
+        assert!(state.make_current());
+        assert!(!state.present());
+        assert!(!state.first_present.load(Ordering::Acquire));
+        assert!(state.callback_failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn wake_callback_failure_is_not_reported_as_success() {
+        assert!(!EventWake::new(std::ptr::null_mut(), fail_wake).wake());
+    }
+
+    #[test]
+    fn render_target_and_context_can_have_distinct_identities() {
+        MAKE_CURRENT_COUNT.set(0);
+        SWAP_COUNT.store(0, Ordering::Release);
+        set_current_binding(GlContextBinding::empty());
+        let mut render_target_storage = 0_u8;
+        let render_target: *mut c_void = (&mut render_target_storage as *mut u8).cast();
+        let state = RendererState::new(
+            render_target,
+            GlApi::new(
+                make_distinct_context_current,
+                capture_current_binding,
+                is_distinct_render_target_current,
+                restore_binding,
+                swap_buffers,
+                get_proc_address,
+            ),
+            test_desktop_api(),
+            test_wake(),
+            false,
+        );
+
+        assert!(state.make_current());
+        assert_ne!(current_binding().context(), render_target);
+        assert!(state.present());
+        assert_eq!(state.create_fbo(10, 10), 0);
+        assert!(state.clear_current());
+        assert_eq!(current_binding(), GlContextBinding::empty());
+        assert_eq!(MAKE_CURRENT_COUNT.get(), 2);
+        assert_eq!(SWAP_COUNT.load(Ordering::Acquire), 1);
+        assert!(!state.gl_context_stranded.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn make_current_callback_restores_complete_binding_after_bind_then_panic() {
+        let previous = GlContextBinding::new(
+            10_usize as *mut c_void,
+            11_usize as *mut c_void,
+            12_usize as *mut c_void,
+            13_usize as *mut c_void,
+        );
+        set_current_binding(previous);
+        RENDER_TARGET_CHECK_COUNT.set(0);
         let gl = GlApi::new(
             bind_context,
-            get_context_after_bind_then_panic,
+            capture_current_binding,
+            is_render_target_current_then_panic,
+            restore_binding,
             swap_buffers,
             get_proc_address,
         );
@@ -4348,7 +4634,7 @@ mod tests {
         let renderer = create_registered_test_renderer(&state);
 
         assert!(!unsafe { gl_make_current_callback(renderer.as_ptr()) });
-        assert!(unsafe { get_current_context() }.is_null());
+        assert_eq!(current_binding(), previous);
         assert!(state
             .gl_owner
             .lock()
@@ -4360,16 +4646,23 @@ mod tests {
     }
 
     #[test]
-    fn make_current_callback_preserves_other_context_when_initial_read_panics() {
+    fn make_current_callback_preserves_other_binding_when_capture_panics() {
         let mut window_storage = 0_u8;
         let mut other_storage = 0_u8;
         let window: *mut c_void = (&mut window_storage as *mut u8).cast();
         let other: *mut c_void = (&mut other_storage as *mut u8).cast();
-        CURRENT_CONTEXT.set(other as usize);
+        set_current_binding(GlContextBinding::new(
+            std::ptr::null_mut(),
+            other,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ));
         TRANSACTION_MAKE_COUNT.set(0);
         let gl = GlApi::new(
             counted_bind_context,
-            panic_before_bind,
+            panic_during_binding_capture,
+            is_render_target_current,
+            restore_binding,
             swap_buffers,
             get_proc_address,
         );
@@ -4383,7 +4676,7 @@ mod tests {
         let renderer = create_registered_test_renderer(&state);
 
         assert!(!unsafe { gl_make_current_callback(renderer.as_ptr()) });
-        assert_eq!(CURRENT_CONTEXT.get(), other as usize);
+        assert_eq!(current_binding().context(), other);
         assert_eq!(TRANSACTION_MAKE_COUNT.get(), 0);
         assert!(state.callback_failed.load(Ordering::Acquire));
         assert!(!state.gl_context_stranded.load(Ordering::Acquire));
@@ -4397,12 +4690,18 @@ mod tests {
         let mut other_storage = 0_u8;
         let window: *mut c_void = (&mut window_storage as *mut u8).cast();
         let other: *mut c_void = (&mut other_storage as *mut u8).cast();
-        CURRENT_CONTEXT.set(other as usize);
+        set_current_binding(GlContextBinding::new(
+            std::ptr::null_mut(),
+            other,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ));
         TRANSACTION_MAKE_COUNT.set(0);
-        VERIFICATION_GET_COUNT.set(0);
         let gl = GlApi::new(
-            bind_context_but_fail_restore,
-            fail_bind_verification_then_report_current,
+            bind_counted_context,
+            capture_current_binding,
+            render_target_not_current,
+            fail_restore_binding,
             swap_buffers,
             get_proc_address,
         );
@@ -4417,7 +4716,7 @@ mod tests {
 
         assert!(!unsafe { gl_make_current_callback(renderer.as_ptr()) });
         assert_eq!(TRANSACTION_MAKE_COUNT.get(), 2);
-        assert_eq!(CURRENT_CONTEXT.get(), window as usize);
+        assert_eq!(current_binding().context(), window);
         assert!(state.callback_failed.load(Ordering::Acquire));
         assert!(state.gl_context_stranded.load(Ordering::Acquire));
 
@@ -4434,7 +4733,7 @@ mod tests {
             ui_activation: None,
             _thread_bound: PhantomData,
         };
-        assert!(runtime.requires_process_exit_without_glfw_cleanup());
+        assert!(runtime.requires_process_exit_without_native_cleanup());
         assert!(runtime.ensure_healthy().is_err());
     }
 
@@ -4442,10 +4741,17 @@ mod tests {
     fn clear_current_callback_marks_failed_detach_as_stranded() {
         let mut window_storage = 0_u8;
         let window: *mut c_void = (&mut window_storage as *mut u8).cast();
-        CURRENT_CONTEXT.set(window as usize);
+        set_current_binding(GlContextBinding::new(
+            std::ptr::null_mut(),
+            window,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ));
         let gl = GlApi::new(
-            leave_context_attached,
-            get_current_context,
+            make_context_current,
+            capture_current_binding,
+            is_render_target_current,
+            fail_restore_binding,
             swap_buffers,
             get_proc_address,
         );
@@ -4460,7 +4766,7 @@ mod tests {
         let renderer = create_registered_test_renderer(&state);
 
         assert!(!unsafe { gl_clear_current_callback(renderer.as_ptr()) });
-        assert_eq!(CURRENT_CONTEXT.get(), window as usize);
+        assert_eq!(current_binding().context(), window);
         assert!(state.callback_failed.load(Ordering::Acquire));
         assert!(state.gl_context_stranded.load(Ordering::Acquire));
 

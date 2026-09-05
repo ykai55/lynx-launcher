@@ -2,8 +2,9 @@
 
 Lynx Launcher 是一个 Linux 桌面应用启动器：Rust 平台层读取 XDG
 `Desktop Entry`，Rust 原生 host 通过直接 Rust 平台接口和 N-API 将数据交给
-ReactLynx，UI 负责搜索并异步发起启动。窗口由 GLFW/OpenGL 创建，Lynx 以
-windowless embedder 方式渲染。
+ReactLynx，UI 负责搜索并异步发起启动。默认窗口由 GLFW/X11/OpenGL 创建；显式
+opt-in backend 可使用 native Wayland layer-shell + EGL/OpenGL。Lynx 以 windowless
+embedder 方式渲染。
 
 ## 3 分钟上手
 
@@ -39,6 +40,8 @@ Linux SDK 的 launcher-specific 体积 profile、实测结果和能力取舍见
 - 通过 fontconfig 匹配系统与用户字体，为中文及其他缺失 glyph 提供字体回退。
 - 无窗口检查 Rust ABI 与打包运行资源；可选执行首帧图形 smoke。
 - 提供搜索、图标渲染、启动链路 E2E，以及重复退出生命周期 stress。
+- 提供显式 `--window-backend wayland` backend，通过 wlr-layer-shell/EGL 渲染真实 Lynx，
+  并转发 pointer、wheel、xkbcommon keyboard/repeat、UTF-8 text 和 cursor shape。
 
 ## 架构
 
@@ -47,7 +50,7 @@ ReactLynx UI（TypeScript，搜索与交互状态）
         |
         | NativeModules.Launcher Promise
         v
-Rust host（N-API + Lynx C API + GLFW/OpenGL）
+Rust host（N-API + Lynx C API + X11/Wayland OpenGL backend）
         |
         | platform Rust direct interface
         v
@@ -61,7 +64,7 @@ platform 拥有操作系统策略与 `.desktop` 解析。完整边界、数据�
 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 `host-rs` 是唯一 Lynx host：它实现 Rust CLI、support logic、
-platform direct interface、staged `liblynx.so` linkage、pinned GLFW/X11/OpenGL 窗口，
+platform direct interface、staged `liblynx.so` linkage、默认 pinned GLFW/X11/OpenGL 窗口，
 加载 packaged core 与 bundle 渲染真实 launcher，并已迁移 pointer、wheel、keyboard、character、
 focus、scale handling 和直接 Rust application launch。Rust host 直接调用 platform
 crate 的 discovery/icon/launch API，不再经过 C ABI。
@@ -108,6 +111,9 @@ Rspeedy/Corepack 行为随本机版本漂移。
 - C/C++20 compiler、CMake 3.16+，以及 Ninja 或 Make 等 native build tool。
 - OpenGL development files，以及 GLFW 所需的 X11 development headers；多数发行版对应
   `X11`、`Xrandr`、`Xinerama`、`Xcursor`、`Xi`。
+- 仅构建 native Wayland backend 时需要 Wayland client、wayland-egl、EGL 与 xkbcommon
+  development files；显式配置会按 `pkg-config` 名称 `wayland-client`、`wayland-egl`、
+  `egl`、`xkbcommon` 检查，默认构建不探测或链接这些依赖。
 - fontconfig development files；patched Lynx SDK 构建时需要 headers 与 linker metadata，
   运行时需要 `libfontconfig.so.1` 和至少一款覆盖所需字符的已安装字体。
 - Rustup；它读取 `rust-toolchain.toml` 并提供 rustfmt、Clippy 和 Cargo。
@@ -138,6 +144,16 @@ nvm use
 ./scripts/build.sh
 ```
 
+默认命令只生成 `host/build/lynx-launcher`，保持 X11 dependency boundary。需要额外生成可交互
+native Wayland backend 时使用严格布尔开关：
+
+```sh
+LYNX_LAUNCHER_BUILD_WAYLAND=1 ./scripts/build.sh
+```
+
+该命令保留默认构建，并额外生成 `host/build-wayland/lynx-launcher-wayland`；除 `0`、`1` 外的
+值都会失败。
+
 已有 `ui/dist/main.lynx.bundle` 时，可只走 host/Rust/CMake 构建并执行 CTest：
 
 ```sh
@@ -152,14 +168,21 @@ older-source/newer-target 回归场景。
 
 ```sh
 ./scripts/run.sh
+LYNX_LAUNCHER_WINDOW_BACKEND=wayland ./scripts/run.sh
 ./scripts/run.sh --help
 ./scripts/run.sh --check-resources
 ```
 
 `run.sh` 从 executable 相对位置寻找完整 runtime，缺失时会提示先运行
 `scripts/build.sh`。`--check-resources` 不创建窗口；host 还支持 `--bundle PATH`、
-`--lynx-core PATH`、`--icu PATH`、`--run-for SECONDS` 和
-`--exit-after-first-frame`。
+`--lynx-core PATH`、`--icu PATH`、`--run-for SECONDS`、
+`--exit-after-first-frame` 和 `--window-backend x11|wayland`。backend 默认固定为 `x11`；
+`LYNX_LAUNCHER_WINDOW_BACKEND` 只接受 `x11|wayland`，默认 `x11`。选择 `wayland` 会使用独立
+binary 并自动传入 `--window-backend wayland`；缺少对应 runtime 时会提示运行
+`LYNX_LAUNCHER_BUILD_WAYLAND=1 ./scripts/build.sh`，不会回落 X11。默认 binary 未编入 native
+Wayland，直接向其显式选择 Wayland 仍会给出明确错误。`./scripts/wayland-smoke.sh`
+使用独立 CMake build directory 和 Cargo feature 构建 backend，要求 `WAYLAND_DISPLAY` 与
+Niri，但会为被测进程清除 `DISPLAY`。
 
 Rust host 是唯一入口；已退役的 C++ fallback 不再构建或路由。它会额外确认实际加载的
 Lynx symbol 来自 executable 同目录的 staged `liblynx.so`。
@@ -172,6 +195,23 @@ direct snapshot；`launchApplication()` 立即返回真实 Promise，在 N-API w
 再由 JS-thread completion resolve/reject。`scripts/run.sh`、smoke、E2E 和 teardown 均固定
 选择 Rust。
 
+native Wayland backend 使用本项目选择的 wlr-layer-shell overlay 和 Fuzzel-style unanchored
+centering：compositor-selected output、无 anchor、
+固定 `1120x760` 逻辑尺寸、on-demand keyboard interactivity 和 `exclusive_zone=-1`，使无
+anchor overlay 相对完整 output 定位，不避让其他 surface 的正 exclusive zone。它严格先做
+无 buffer 的 initial commit，等待并 ack configure 后才创建 EGL window surface 和渲染；无
+anchor 使 compositor 在所选 output 内居中，但不保证选择鼠标所在 output。它通过 core seat
+协议处理 pointer motion/button/frame scroll，通过 xkbcommon 处理 keymap、modifiers、repeat
+和 UTF-8 text，并通过 cursor-shape-v1 响应 Lynx cursor 请求。Wayland clipboard 和完整 IME
+composition 尚未接入，相关 X11 desktop integration 门禁不能由该 backend 替代。
+On-demand keyboard interactivity 让 Niri 在映射时聚焦 launcher，同时允许普通窗口随后取得
+焦点；对应的 `wl_keyboard.leave` 进入统一 focus-loss、input cancellation 和 clean close 路径。
+startup 阶段曾获得后又丢失 keyboard focus 仍会触发关闭；seat 移除 keyboard capability
+时旧 proxy 会按协议版本安全释放，seat global removal 会清理 keyboard/seat 并允许后续新
+seat 绑定。初始 `wl_surface.enter/leave` 会记录多 output overlap identity；event delivery
+激活后进入新 output、任何 leave、mapped output global removal、configure、preferred scale
+变化或 resize 都作为不支持的状态变化触发 health failure 并关闭，即使 output scale 相同。
+
 ## 测试
 
 ### 普通测试
@@ -180,12 +220,31 @@ direct snapshot；`launchApplication()` 立即返回真实 Promise，在 N-API w
 ./scripts/test.sh
 ```
 
-该入口依次执行 Rust workspace format check、locked Clippy（warnings denied）和全部
-Rust tests；UI tests、typecheck 和 production build；host build、CTest；最后执行 Rust
+该入口依次执行 Rust workspace format check、default features 的 locked Clippy（warnings
+denied）和 Rust tests；UI tests、typecheck 和 production build；host build、CTest；最后执行 Rust
 资源检查。`LYNX_LAUNCHER_RESOURCE_HOST` 已退役，默认且只能验证 Rust host。CTest 始终保留
-Rust 的 provenance 回归。默认路径不需要 display。
+Rust 的 provenance 回归。默认路径不编译 native Wayland feature，不探测 Wayland/EGL
+development packages，也不需要 display。
 Rust host 要求精确 `$ORIGIN` RUNPATH 和唯一的 staged `liblynx.so`，禁止动态 GLFW；
 check/windowed startup 还会从非仓库 cwd 注入外部 `liblynx.so` 并断言拒绝。
+
+### Native Wayland smoke
+
+在设置 `WAYLAND_DISPLAY` 和 `NIRI_SOCKET` 的 Niri session 中运行：
+
+```sh
+./scripts/wayland-smoke.sh
+```
+
+该入口显式执行 `native-wayland` feature 的 Clippy/tests、Wayland option build 和 CTest，然后
+运行两个相互独立的真实进程。placement probe 通过严格的 E2E-only output 环境变量在一个能
+完整容纳目标尺寸的真实 output 上呈现固定时长纯色 EGL shell frame；正常 tracer 仍使用
+`output=NULL`。脚本用 `grim` 捕获 P6 PPM，读取 `niri msg -j outputs` 的 logical geometry、scale、transform 和
+current mode，对纯色像素做 connected-component bounding box，断言 `1120x760` logical size
+且两轴中心误差不超过 2 physical pixels。probe marker 不是 Lynx readiness。第二个进程使用
+`--exit-after-first-frame`，必须同时出现 first-screen layout、成功 GL present、auto-exit 和 clean
+runtime shutdown。两个进程退出后都检查 Niri layer 已移除；artifact 位于
+`.logs/native-wayland-smoke/run.XXXXXX/`。
 
 ### 首帧 smoke
 
@@ -254,14 +313,23 @@ compositor capture 比较两个不同中文 glyph 的渲染区域，拒绝重复
 ./scripts/teardown-stress.sh
 LYNX_LAUNCHER_TEARDOWN_ITERATIONS=20 ./scripts/teardown-stress.sh
 LYNX_LAUNCHER_TEARDOWN_TIMEOUT=45s ./scripts/teardown-stress.sh
+LYNX_LAUNCHER_WINDOW_BACKEND=wayland ./scripts/teardown-stress.sh
 ```
 
-`LYNX_LAUNCHER_TEARDOWN_HOST` 已退役，默认且只能运行 Rust host。每次执行 10 次
-bounded launch 和 10 次真实 first-frame close，随后还执行相同次数的 pending-launch
-immediate-defocus，以及 cursor/clipboard desktop teardown。每次都必须 present 一帧，
-且日志不得出现 `destroyed thread host`、`Maybe leaked`、`post an unknown task`、
-`LoadJSSource load js error`。每次并发 invocation 使用独立的
-`.logs/ticket-07/teardown-stress/rust/run.XXXXXX/`，保留逐次日志和 `summary.txt`；summary 也记录
+`LYNX_LAUNCHER_TEARDOWN_HOST` 已退役，默认且只能运行 Rust host。默认 X11 模式要求
+`DISPLAY`，每次执行 10 次 bounded launch 和 10 次真实 first-frame close，随后还执行相同
+次数的 pending-launch immediate-defocus，以及 cursor/clipboard desktop teardown。
+
+显式 Wayland 模式要求 `WAYLAND_DISPLAY` 和已构建的
+`host/build-wayland/lynx-launcher-wayland`，固定传递 `--window-backend wayland`。它在清除 backend
+与 resource override 后重复 bounded 和 first-frame 两类 lifecycle，并要求 first frame、无禁词和
+`runtime core shutdown complete`。该模式不运行 X11 `e2e-launch.sh` 或 X11 cursor/clipboard shell，
+也不替代真实 compositor focus-loss 验证。
+
+两种模式的每次 invocation 都必须 present 一帧，且日志不得出现 `destroyed thread host`、
+`Maybe leaked`、`post an unknown task`、`LoadJSSource load js error`。日志分别保存在
+`.logs/ticket-07/teardown-stress/rust/run.XXXXXX/` 和
+`.logs/ticket-07/teardown-stress/wayland/run.XXXXXX/`；`summary.txt` 记录
 `DestroyLayoutNodeBeforeRemoveFromParent` 与 `target view: ... not found` 的残余计数。
 
 ## Lynx Pin、补丁与 verified SDK
@@ -309,19 +377,22 @@ immediate-defocus，以及 cursor/clipboard desktop teardown。每次都必须 p
 | `host/build/resources/icudtl.dat` | verified packaged ICU data。 |
 | `.logs/bootstrap.log` | 最近一次串行 bootstrap 完整输出。 |
 | `.logs/ticket-07/teardown-stress/rust/run.XXXXXX/` | 每次 host stress 的独立日志与 summary。 |
+| `.logs/ticket-07/teardown-stress/wayland/run.XXXXXX/` | 每次 native Wayland host stress 的独立日志与 summary。 |
 
 ## 已知限制
 
 - 只有 Linux x64 已 bootstrap 并验证。
-- host 固定 `GLFW_USE_WAYLAND=OFF`，要求 X11/XWayland、`DISPLAY` 和 OpenGL 3.3；尚不支持
-  native Wayland。
+- 默认 host 固定 `GLFW_USE_WAYLAND=OFF`，要求 X11/XWayland、`DISPLAY` 和 OpenGL 3.3；
+  native Wayland layer-shell + EGL 是显式 opt-in backend，默认 ELF 不直接依赖 `libEGL`、
+  `libwayland-client`、`libwayland-egl` 或 `libxkbcommon`。
 - XSettings 窗口缩放在启动时读取；运行中修改系统缩放需要重启 launcher，且当前 X11
   baseline 不提供逐显示器 fractional scaling。
 - 只实现 Desktop Entry specification 的实用子集。Terminal 应用与 file/URI launch
   arguments 被有意忽略，D-Bus activation 当前 fallback 到 `Exec`。
 - icon lookup 不检测当前 theme、不读取 `index.theme` inheritance，也未实现完整 HiDPI
   algorithm；找不到或加载失败时 UI 显示应用名称首字母。
-- 文本输入只转发 character events，尚无完整 IME composition protocol。
+- X11 与 native Wayland 都支持基础 UTF-8 text；native Wayland 尚无完整 IME composition
+  和 clipboard protocol integration。
 - 字体回退依赖宿主机 fontconfig 配置和已安装字体；系统没有覆盖目标字符的字体时仍会显示
   缺字方框。
 - resource fetcher 只提供 packaged local Lynx core，不支持任意 network resources。

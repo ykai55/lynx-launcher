@@ -7,8 +7,26 @@ license = "Apache-2.0"
 [[bin]]
 name = "lynx-launcher-rs"
 path = "src/main.rs"
-test = false
 
 [dependencies]
+khronos-egl = { version = "=6.0.0", default-features = false, features = ["1_5", "static"], optional = true }
+libc = { version = "=0.2.189", optional = true }
 lynx-launcher-platform = { path = "../platform" }
 lynx-sys = { path = "../lynx-sys" }
+wayland-client = { version = "=0.31.14", optional = true }
+wayland-egl = { version = "=0.32.11", optional = true }
+wayland-protocols = { version = "=0.32.13", features = ["client", "staging", "unstable"], optional = true }
+wayland-protocols-wlr = { version = "=0.3.12", features = ["client"], optional = true }
+
+[features]
+native-wayland = [
+  "dep:khronos-egl",
+  "dep:libc",
+  "dep:wayland-client",
+  "dep:wayland-egl",
+  "dep:wayland-protocols",
+  "dep:wayland-protocols-wlr",
+]
+
+[build-dependencies]
+pkg-config = "=0.3.34"

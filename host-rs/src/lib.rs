@@ -27,6 +27,14 @@ struct Options {
     run_for_seconds: Option<f64>,
     exit_after_first_frame: bool,
     check_resources: bool,
+    window_backend: WindowBackendChoice,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowBackendChoice {
+    #[default]
+    X11,
+    Wayland,
 }
 
 #[derive(Debug, PartialEq)]
@@ -49,6 +57,7 @@ pub struct WindowRunOptions {
     pub bundle: PathBuf,
     pub lynx_core: PathBuf,
     pub icu: PathBuf,
+    pub window_backend: WindowBackendChoice,
 }
 
 pub fn run<I, W>(arguments: I, run_window: W) -> Result<(), Box<dyn Error>>
@@ -79,6 +88,7 @@ where
             bundle: paths.bundle,
             lynx_core: paths.lynx_core,
             icu: paths.icu,
+            window_backend: options.window_backend,
         })
     }
 }
@@ -116,6 +126,17 @@ fn parse_options(arguments: &[OsString]) -> io::Result<ParseOutcome> {
             options.exit_after_first_frame = true;
         } else if argument == "--check-resources" {
             options.check_resources = true;
+        } else if argument == "--window-backend" {
+            options.window_backend = match value_after("--window-backend")?.to_str() {
+                Some("x11") => WindowBackendChoice::X11,
+                Some("wayland") => WindowBackendChoice::Wayland,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--window-backend must be x11 or wayland",
+                    ));
+                }
+            };
         } else if argument == "--help" {
             return Ok(ParseOutcome::Help);
         } else {
@@ -233,6 +254,7 @@ fn print_usage(program: &OsStr) {
            --icu PATH                 icudtl.dat\n\
            --run-for SECONDS          Exit after a bounded run\n\
            --exit-after-first-frame   Exit after Lynx layout and GL present\n\
+           --window-backend BACKEND   Window backend: x11 (default) or wayland\n\
            --check-resources          Validate resources and native linkage without a window\n\
            --help                     Show this help",
         program.to_string_lossy()
@@ -272,6 +294,7 @@ mod tests {
                 run_for_seconds: Some(1.5),
                 exit_after_first_frame: true,
                 check_resources: true,
+                window_backend: WindowBackendChoice::X11,
             })
         );
     }
@@ -290,6 +313,25 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unknown option"));
+        assert!(parse_options(&arguments(&["--window-backend", "auto"]))
+            .unwrap_err()
+            .to_string()
+            .contains("x11 or wayland"));
+    }
+
+    #[test]
+    fn parses_explicit_window_backends_and_defaults_to_x11() {
+        assert_eq!(
+            parse_options(&[]).unwrap(),
+            ParseOutcome::Run(Options::default())
+        );
+        assert_eq!(
+            parse_options(&arguments(&["--window-backend", "wayland"])).unwrap(),
+            ParseOutcome::Run(Options {
+                window_backend: WindowBackendChoice::Wayland,
+                ..Options::default()
+            })
+        );
     }
 
     #[test]
@@ -343,6 +385,8 @@ mod tests {
                 OsString::from("--run-for"),
                 OsString::from("2.5"),
                 OsString::from("--exit-after-first-frame"),
+                OsString::from("--window-backend"),
+                OsString::from("wayland"),
             ],
             |options| {
                 received.replace(Some(options));
@@ -360,6 +404,7 @@ mod tests {
                 bundle: expected_bundle,
                 lynx_core: expected_core,
                 icu: expected_icu,
+                window_backend: WindowBackendChoice::Wayland,
             })
         );
         fs::remove_dir_all(directory).unwrap();

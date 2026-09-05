@@ -25,7 +25,8 @@ dependency rather than an application layer.
 pure host support behavior, directly
 uses the Rust platform interface for discovery, and verifies that its linked
 `lynx_log_init` symbol resolves to the staged `$ORIGIN/liblynx.so`. Its windowed
-path owns a popup-like pinned-GLFW X11 window, OpenGL 3.3 context, static shell
+path defaults to a popup-like pinned-GLFW X11 window and also offers an explicit
+native Wayland layer-shell/EGL backend. Both use an OpenGL 3.3 context, static shell
 frame, focus exit, bounded event loop, process-global UI runner, deadline queues,
 GLDirect renderer, restricted core-resource fetcher, builder, view, client, and
 load metadata with deterministic teardown. It loads the staged ReactLynx bundle
@@ -67,31 +68,78 @@ preloader's default lookup. `lynx-sys/`
 contains the reviewed runtime, renderer, view/resource, and weak N-API ABI,
 strict by-value view wrappers, and dynamic-loader path probe. The Rust runtime
 tracer configures the process-global UI runner once, executes absolute UI
-deadlines and relative renderer intervals through the GLFW loop, and binds the
-GLDirect callbacks. Its renderer callback userdata has a stable heap address;
+deadlines and relative renderer intervals through the selected native loop, and
+binds the GLDirect callbacks. Its renderer callback userdata has a stable heap address;
 a process registry acquires an `Arc` before state access and remains installed
 through renderer release. View, client, native-module, and fetcher userdata share
 an `Arc`-owned state that outlives SDK callbacks, while the fetcher owns one
 explicit reference consumed by its finalizer.
 
-The binary-private Rust window module keeps `RuntimeCore`, metrics, and input in
-a stable boxed userdata object. GLFW callbacks recover only a shared reference;
-short `RefCell` borrows serialize platform-thread mutation rather than creating a
-long-lived arbitrary `&mut`. Every callback contains panics, atomically latches
-failure, wakes the loop, and requests close. Input follows the USB HID and
-logical-key mappings, tracks down/repeat/up, synthesizes missing key-up and
-pointer cancel/remove events, and gates UTF-8 character events on Lynx text-input
-activation. Focus loss and normal shutdown first close a one-way input-acceptance
-gate, then cancel active state. Later GLFW cursor, pointer, key, character, and
-synthetic release callbacks return before borrowing state or dispatching, so no
-input can follow the view's background transition.
+The binary-private `host-rs/src/window/mod.rs` is the backend-neutral platform
+thread coordinator. Its single `WindowBackend` seam supplies the render target,
+graphics and desktop callback adapters, wake integration, initial metrics,
+show, event activation, normalized event draining, timed wait, close,
+text-input activation, and health operations. `RuntimeCore`, `InputState`, the
+terminal input gate, Lynx
+dispatch, metrics policy, event-loop deadlines, and shutdown ordering remain in
+the coordinator, so another backend does not need to duplicate runtime
+lifecycle policy.
 
-Before runtime userdata exists, a separate panic-contained focus callback is
-installed ahead of show/focus and the initial GLFW event pump. It latches any
-FocusOut and requests close. Formal callback registration replaces it only after
-the stable window state exists, then reconciles the latched close flag with
-GLFW's current focus attribute so an early loss backgrounds and shuts down the
-new view instead of being forgotten.
+`host-rs/src/window/glfw_x11.rs` is the default backend implementation. It owns the
+pinned GLFW runtime and X11 window, GL and clipboard/cursor adapters, XSettings
+scale lookup, EWMH setup, GLFW key translation, and its private raw FFI module.
+Its callbacks recover a stable boxed queue, contain panics, atomically latch
+failure, request close, wake the platform loop, and append only normalized
+`WindowEvent` values. The coordinator drains those values and tracks
+down/repeat/up, synthesizes missing key-up and pointer cancel/remove events, and
+gates UTF-8 character events on Lynx text-input activation. Focus loss and
+normal shutdown first close a one-way input-acceptance gate, then cancel active
+state. Events already queued after that transition are ignored before they can
+mutate input or dispatch to Lynx.
+
+Before regular event delivery is activated, the same stable backend userdata is
+installed with a separate panic-contained startup focus callback ahead of
+show/focus and the initial event pump. It latches any FocusOut and requests
+close. Regular callback registration then reconciles the latch, native close
+flag, and current focus into one normalized focus-loss event, so an early loss
+backgrounds and shuts down the new view instead of being forgotten.
+
+`host-rs/src/window/wayland.rs` is an explicit opt-in native Wayland backend. It
+uses `wayland-client`, generated wlr-layer-shell bindings, `wayland-egl`, and EGL
+OpenGL 3.3 behind the Cargo `native-wayland` feature and CMake
+`LYNX_LAUNCHER_NATIVE_WAYLAND` option; the default binary neither compiles nor
+directly links those dependencies. Its layer intent uses Fuzzel-style unanchored
+centering with the project's overlay choice:
+NULL output, no anchors, fixed 1120x760 logical size, on-demand keyboard
+interactivity, and exclusive zone -1 so the unanchored overlay is positioned
+relative to the complete output instead of avoiding other surfaces' positive
+exclusive zones. It performs the required empty initial commit and waits for
+configure/ack before creating or rendering an EGL window surface. Its `eventfd`
+and Wayland display fd are polled together with the runtime
+deadline. Core seat events become the same backend-neutral pointer motion/button,
+frame-aggregated scroll, key, text, and focus events used by X11. xkbcommon consumes
+the compositor keymap and modifier state, maps evdev keys to the existing USB HID
+contract, and drives compositor-configured repeat deadlines. Basic UTF-8 text comes
+from xkb state and cursor requests use cursor-shape-v1; clipboard selection transfer
+and IME composition are not implemented. On-demand keyboard interactivity allows a
+normal window to take focus; the resulting `wl_keyboard.leave` follows the common
+input-cancellation, background, and clean-close path. Startup focus loss is latched
+across runtime activation, and seat keyboard capability removal releases the old proxy when its protocol version
+supports `release` and reports focus loss. The host requires `wl_seat` v3 or newer;
+registry removal clears keyboard and seat proxies, reports focus loss, and permits
+a later seat global to bind. Initial `wl_surface.enter`/`leave` events establish the
+set of overlapping output identities before event delivery activates. A later enter
+of a new output identity, any later leave, output-global removal for the mapped
+surface, every later layer configure, post-startup scale changes, and resize are
+rejected with a health failure and clean shutdown rather than reusing stale EGL
+dimensions. This applies even when the old and new outputs report the same scale.
+
+The root build keeps this boundary explicit. `scripts/build.sh` always builds the
+default X11 runtime and only adds `host/build-wayland/lynx-launcher-wayland` when
+`LYNX_LAUNCHER_BUILD_WAYLAND=1`. `scripts/run.sh` accepts only
+`LYNX_LAUNCHER_WINDOW_BACKEND=x11|wayland`, selects the corresponding staged runtime,
+and passes `--window-backend wayland` only to the Wayland binary. Missing artifacts or
+invalid selectors fail without backend detection or fallback.
 
 The Rust fetcher returns only the staged core bytes for the Lynx-core resource
 type and rejects every other request. Bundle file URIs percent-encode raw Linux
@@ -114,10 +162,10 @@ lease through renderer release, registry removal, fetcher release, and a bounded
 registry, and old-generation health results are sampled before the lease is
 finished, so another host cannot activate or reset health early. If native
 callbacks cannot be proven quiescent, the lease remains draining and the window
-path forgets the runtime, window, and GLFW owners before delegating cleanup to
+path forgets the runtime and native backend owners before delegating cleanup to
 process exit. All Rust callbacks contain panics. The binary-private window
-module supplies raw GLFW, X11, and OpenGL operations and translates GLFW input
-into the reviewed Lynx pointer/key ABI.
+module supplies the backend-neutral lifecycle; the X11 adapter translates GLFW
+input into the reviewed Lynx pointer/key ABI.
 
 ### ReactLynx UI
 
@@ -157,13 +205,19 @@ shutdown ownership deterministic in E2E tests.
 
 ## Threads and ownership
 
-- The process/platform thread creates GLFW and the host, pumps GLFW events, and
-  runs the process-global Lynx UI task runner.
-- Lynx posts UI work into a mutex-protected deadline queue. `glfwPostEmptyEvent`
-  wakes the platform loop when new work arrives.
+- The process/platform thread creates the selected backend and host, pumps native
+  events, and runs the process-global Lynx UI task runner.
+- Lynx posts UI work into a mutex-protected deadline queue. The X11 backend uses
+  `glfwPostEmptyEvent`; the Wayland backend writes an `eventfd` polled beside the
+  display fd and runtime deadline.
 - Renderer work uses a separate synchronized queue. The first render thread to
   acquire the OpenGL context becomes its stable owner; callbacks reject access
-  from another render thread. Context ownership is also tracked per thread.
+  from another render thread. Context ownership is also tracked per thread. The
+  graphics adapter separately binds render-target tokens, captures and restores
+  complete current bindings (display, context, and draw/read surfaces), and
+  exposes a backend-neutral check that its render target is current. The runtime
+  treats the binding as an opaque snapshot and does not require any of its
+  identities to equal the render-target token.
 - Shutdown cancels input, closes Rust launch-work registration, and waits with a
   fixed bound for every registered async launch to settle and successfully
   delete its N-API work handle. Only then does it background/release the view and
@@ -183,7 +237,7 @@ shutdown ownership deterministic in E2E tests.
   this same path; fatal callback/context failures preserve native owners for
   process-exit cleanup rather than masking the original error.
 
-## Windowless API and XWayland
+## Windowless API and window backends
 
 The Lynx windowless C API is used because this application is an embedder, not a
 fork of Lynx Explorer. It exposes the necessary stable seams for task scheduling,
@@ -191,13 +245,16 @@ view lifecycle, graphics callbacks, input, clipboard, cursors, and resource
 fetching while allowing the launcher to own its native window and event loop.
 This also keeps application policy out of the Lynx submodule.
 
-The current host deliberately configures vendored GLFW with
+The default host deliberately configures vendored GLFW with
 `GLFW_USE_WAYLAND=OFF`. The tested GLDirect path creates an X11 OpenGL 3.3
 context, and GLFW supplies the window/input/clipboard integration expected by
 the host. On a Wayland desktop this runs through XWayland and therefore requires
-`DISPLAY`. Enabling native Wayland is more than a build switch: clipboard, text
-input/IME, cursor, scale, and context behavior must be validated before the host
-can claim that backend.
+`DISPLAY`. The separately built backend accepts `--window-backend wayland` and
+requires `WAYLAND_DISPLAY` instead; the default binary rejects that selection
+because native Wayland is not compiled in. The backend renders a real Lynx first frame,
+exercises complete EGL display/context/draw/read binding capture and restore, and
+supports launcher pointer, wheel, keyboard, repeat, UTF-8 text, and cursor behavior.
+It does not claim X11 clipboard or complete IME parity.
 
 Graphical pixel gates are observation-only. The X11 driver first attempts root
 readback; under niri/XWayland it validates compositor geometry and uses bounded
@@ -213,8 +270,11 @@ event loop is active it uses an X11 background matching the verified shell clear
 so Expose handling preserves that color without reacquiring the GL context after
 renderer startup.
 If owner-thread context rollback or detach verification fails, the Rust tracer
-marks the context stranded and exits without calling `glfwDestroyWindow` or
-`glfwTerminate`; only this fatal path delegates native cleanup to process exit,
+marks the context stranded and delegates native cleanup to process exit. The
+coordinator forgets the runtime and complete backend together; on every normal
+or recoverable-error path it first stops event delivery, completes runtime
+shutdown, and only then drops the backend. The current backend therefore exits
+without calling `glfwDestroyWindow` or `glfwTerminate` only on the fatal path,
 because the platform thread cannot safely repair another thread's GL state.
 
 At startup the host combines GLFW's X11 content scale with the XSettings
@@ -228,11 +288,11 @@ process is running.
 
 - Add operating-system discovery and launch implementations behind the Rust
   platform `cfg` boundary.
-- Add native host backends that implement the same windowless renderer, task,
-  input, and runtime-resource responsibilities. The ReactLynx bundle and N-API
-  module contract can remain unchanged.
-- Replace the GLFW/OpenGL adapter with another window and graphics backend
-  without moving application discovery into host or UI code.
+- Add a native host adapter behind `WindowBackend`, translating native input and
+  metric changes into `WindowEvent` while reusing coordinator lifecycle policy.
+  The ReactLynx bundle and N-API module contract can remain unchanged.
+- Supply another render target, `GlApi`, `DesktopApi`, and `EventWake` from that
+  adapter without moving application discovery into host or UI code.
 - Add native module methods directly in the Rust host, keeping explicit promise
   resolve/reject semantics at the N-API edge.
 - Package target-specific SDK/runtime resources through CMake without teaching

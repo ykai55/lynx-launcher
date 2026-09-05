@@ -9,6 +9,8 @@ include(CTest)
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(X11 REQUIRED)
+option(LYNX_LAUNCHER_NATIVE_WAYLAND
+       "Build the explicit native Wayland layer-shell/EGL backend" OFF)
 
 get_filename_component(LAUNCHER_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 set(LYNX_SDK_DIR "" CACHE PATH "Verified extracted Lynx Linux SDK directory")
@@ -21,7 +23,7 @@ set(GLFW_SOURCE_DIR "${LAUNCHER_ROOT}/third_party/lynx/third_party/glfw"
 set(PLATFORM_DIR "${LAUNCHER_ROOT}/platform"
     CACHE PATH "Rust platform crate directory")
 set(HOST_RS_DIR "${LAUNCHER_ROOT}/host-rs"
-    CACHE PATH "Rust host tracer crate directory")
+    CACHE PATH "Rust host crate directory")
 set(LYNX_SYS_DIR "${LAUNCHER_ROOT}/lynx-sys"
     CACHE PATH "Rust Lynx bindings crate directory")
 
@@ -69,7 +71,15 @@ target_link_libraries(lynx_sys_shim PRIVATE lynx_sdk)
 
 set(CARGO_TARGET_DIR "${CMAKE_BINARY_DIR}/cargo-target")
 set(RUST_HOST_CARGO_BINARY "${CARGO_TARGET_DIR}/release/lynx-launcher-rs")
-set(RUST_HOST_BINARY "${CMAKE_BINARY_DIR}/lynx-launcher")
+if(LYNX_LAUNCHER_NATIVE_WAYLAND)
+  set(RUST_HOST_BINARY "${CMAKE_BINARY_DIR}/lynx-launcher-wayland")
+  set(RUST_HOST_STAGE_TARGET stage_rust_wayland_tracer)
+  set(RUST_HOST_FEATURE_ARGS --features native-wayland)
+else()
+  set(RUST_HOST_BINARY "${CMAKE_BINARY_DIR}/lynx-launcher")
+  set(RUST_HOST_STAGE_TARGET stage_rust_host)
+  set(RUST_HOST_FEATURE_ARGS)
+endif()
 file(GLOB_RECURSE HOST_RS_RUST_SOURCES CONFIGURE_DEPENDS
   "${HOST_RS_DIR}/src/*.rs"
 )
@@ -85,7 +95,7 @@ add_custom_command(
            "LYNX_LAUNCHER_GLFW_ARCHIVE=$<TARGET_FILE:glfw>"
            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=${CMAKE_CXX_COMPILER}"
            cargo build --release --locked -p lynx-launcher-host
-          --bin lynx-launcher-rs
+           --bin lynx-launcher-rs ${RUST_HOST_FEATURE_ARGS}
   WORKING_DIRECTORY "${LAUNCHER_ROOT}"
   DEPENDS
     glfw
@@ -100,18 +110,18 @@ add_custom_command(
     "${LAUNCHER_ROOT}/rust-toolchain.toml"
     ${HOST_RS_RUST_SOURCES}
     ${LYNX_SYS_RUST_SOURCES}
-  COMMENT "Building the Rust host tracer"
+  COMMENT "Building the Rust host"
   VERBATIM
 )
-add_custom_target(stage_rust_host ALL
+add_custom_target(${RUST_HOST_STAGE_TARGET} ALL
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
           "${RUST_HOST_CARGO_BINARY}" "${RUST_HOST_BINARY}"
   DEPENDS "${RUST_HOST_CARGO_BINARY}"
-  COMMENT "Staging the default Rust host"
+  COMMENT "Staging the Rust host"
   VERBATIM
 )
 add_custom_target(rust_workspace ALL
-  DEPENDS stage_rust_host)
+  DEPENDS ${RUST_HOST_STAGE_TARGET})
 
 set(RUNTIME_LIBLYNX "${CMAKE_BINARY_DIR}/liblynx.so")
 set(RUNTIME_ICU "${CMAKE_BINARY_DIR}/resources/icudtl.dat")
@@ -223,6 +233,11 @@ if(BUILD_TESTING)
     COMMAND "${CMAKE_COMMAND}"
             "-DLAUNCHER=${RUST_HOST_BINARY}"
             -P "${CMAKE_CURRENT_LIST_DIR}/cmake/test_rust_requires_display.cmake")
+  add_test(NAME rust_launcher_requires_wayland_display
+    COMMAND "${CMAKE_COMMAND}"
+            "-DLAUNCHER=${RUST_HOST_BINARY}"
+            "-DNATIVE_WAYLAND_COMPILED=${LYNX_LAUNCHER_NATIVE_WAYLAND}"
+            -P "${CMAKE_CURRENT_LIST_DIR}/cmake/test_rust_requires_wayland_display.cmake")
   add_test(NAME rust_launcher_rejects_external_lynx
     COMMAND "${CMAKE_COMMAND}"
             "-DLAUNCHER=${RUST_HOST_BINARY}"
@@ -232,7 +247,12 @@ if(BUILD_TESTING)
   add_test(NAME rust_launcher_dependency_contract
     COMMAND "${CMAKE_COMMAND}"
             "-DLAUNCHER=${RUST_HOST_BINARY}"
-            -P "${CMAKE_CURRENT_LIST_DIR}/cmake/test_runtime_dependencies.cmake")
+            "-DEXPECT_NATIVE_WAYLAND=${LYNX_LAUNCHER_NATIVE_WAYLAND}"
+             -P "${CMAKE_CURRENT_LIST_DIR}/cmake/test_runtime_dependencies.cmake")
+  add_test(NAME launcher_script_selection_contract
+    COMMAND "${CMAKE_COMMAND}"
+            "-DSCRIPTS_DIR=${LAUNCHER_ROOT}/scripts"
+            -P "${CMAKE_CURRENT_LIST_DIR}/cmake/test_launcher_script_selection.cmake")
   add_test(NAME runtime_resource_refresh_older_source
     COMMAND "${CMAKE_COMMAND}"
             "-DREFRESH_SCRIPT=${REFRESH_RESOURCE_SCRIPT}"

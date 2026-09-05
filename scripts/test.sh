@@ -4,6 +4,8 @@ set -euo pipefail
 # shellcheck source=scripts/_common.sh
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 
+rm -f -- "${wayland_host_binary}"
+
 require_command cargo
 require_command cmake
 require_command ctest
@@ -15,10 +17,10 @@ printf 'Checking and testing the Rust workspace\n'
   cd -- "${repo_root}"
   cargo fmt --all -- --check
   LYNX_SDK_DIR="${verified_sdk_dir}" \
-    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    cargo clippy --workspace --all-targets --locked -- -D warnings
   LYNX_SDK_DIR="${verified_sdk_dir}" \
   LD_LIBRARY_PATH="${verified_sdk_dir}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
-    cargo test --workspace --all-targets --all-features --locked
+    cargo test --workspace --all-targets --locked
 )
 
 printf 'Testing, type-checking, and building the ReactLynx UI\n'
@@ -34,6 +36,7 @@ printf 'Building and testing the desktop host\n'
 cmake -S "${host_dir}" -B "${host_build_dir}" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DBUILD_TESTING=ON \
+  -DLYNX_LAUNCHER_NATIVE_WAYLAND=OFF \
   -DLYNX_SDK_DIR="${verified_sdk_dir}"
 cmake --build "${host_build_dir}" --parallel
 ctest --test-dir "${host_build_dir}" --build-config RelWithDebInfo --output-on-failure
